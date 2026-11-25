@@ -313,10 +313,6 @@ Remember: Think about GRAVITY, PERSPECTIVE, and MOVEMENT TYPE. Output JSON only.
   }
 
   private formatLLMContent(result: ClassificationResult): string {
-    // Use environment variables if available, fallback to relative paths
-    const templatesDir = process.env.GAME_TEMPLATES_DIR || '../../templates';
-    const docsDir = process.env.GAME_DOCS_DIR || '../../docs';
-
     return `<classification>
 Archetype: ${result.archetype}
 Reasoning: ${result.reasoning}
@@ -330,26 +326,16 @@ Physics Profile:
 <system-reminder>
 GAME TYPE CLASSIFIED: **${result.archetype}**
 
-## Next Step: Scaffold Templates (FOUR commands)
+## Next Step: Scaffold The Template
 
-Run these commands NOW:
+Call the \`CopyTemplate\` tool NOW with:
 
-\`\`\`bash
-# Step 1: Copy core template (creates src/, public/, config files)
-cp -r ${templatesDir}/core/* ./
+- \`archetype\`: "${result.archetype}"
+- \`project_name\`: (optional, short slug derived from the game idea)
 
-# Step 2: Copy module-specific code INTO src/ (ADDITIVE merge)
-cp -r ${templatesDir}/modules/${result.archetype}/src/* ./src/
+\`CopyTemplate\` copies the core template (index.html, vite.config.js, tsconfig.json, src/main.ts, src/gameConfig.json, base scenes), overlays \`modules/${result.archetype}/src/\` into \`src/\`, and copies the GDD/asset/debug docs when available.
 
-# Step 3: Copy core documentation
-mkdir -p docs/gdd
-cp ${docsDir}/gdd/core.md docs/gdd/
-cp ${docsDir}/asset_protocol.md ${docsDir}/debug_protocol.md docs/
-
-# Step 4: Copy module-specific documentation
-mkdir -p docs/modules/${result.archetype}
-cp -r ${docsDir}/modules/${result.archetype}/* docs/modules/${result.archetype}/
-\`\`\`
+Do NOT run shell copy commands (cp -r fails on Windows) and do NOT hand-write the scaffold files.
 
 ## After Scaffolding: Proceed to Phase 2 (GDD Generation)
 

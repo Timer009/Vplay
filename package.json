@@ -19,6 +19,7 @@
   },
   "scripts": {
     "start": "cross-env node scripts/start.js",
+    "remote": "node remote/server.cjs",
     "debug": "cross-env DEBUG=1 node --inspect-brk scripts/start.js",
     "generate": "node scripts/generate-git-commit-info.js",
     "build": "node scripts/build.js",
@@ -129,7 +130,7 @@
   "lint-staged": {
     "*.{js,jsx,ts,tsx}": [
       "prettier --write",
-      "eslint --fix --max-warnings 0"
+      "eslint --fix --max-warnings 0 --no-warn-ignored"
     ],
     "*.{json,md}": [
       "prettier --write"

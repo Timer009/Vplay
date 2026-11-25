@@ -22,6 +22,9 @@ import {
   InputFormat,
   uiTelemetryService,
   parseAndFormatApiError,
+  runPostVerify,
+  writeRuntimeStatus,
+  consumeQueuedPrompts,
 } from '@opengame/opengame-core';
 import type { Content, Part, PartListUnion } from '@google/genai';
 import type { CLIUserMessage, PermissionMode } from './nonInteractive/types.js';
@@ -121,6 +124,25 @@ export async function runNonInteractive(
   options: RunNonInteractiveOptions = {},
 ): Promise<void> {
   return promptIdContext.run(prompt_id, async () => {
+    const workspaceDir = config.getTargetDir();
+
+    // Remote bridge: inject prompts queued by remote/server.js, then mark the
+    // workspace as "generating" so GET /status can report progress.
+    const queuedPrompts = consumeQueuedPrompts(workspaceDir);
+    if (queuedPrompts.length > 0) {
+      input = `${input}\n\n[REMOTE INSTRUCTIONS]\n${queuedPrompts
+        .map((prompt) => `- ${prompt}`)
+        .join('\n')}`;
+      console.log(
+        `[remote] injected ${queuedPrompts.length} queued prompt(s) into this turn`,
+      );
+    }
+    writeRuntimeStatus(
+      workspaceDir,
+      'generating',
+      'Agent is generating the game',
+    );
+
     // Create output adapter based on format
     let adapter: JsonOutputAdapterInterface | undefined;
     const outputFormat = config.getOutputFormat();
@@ -462,6 +484,27 @@ export async function runNonInteractive(
       }
       handleError(error, config);
     } finally {
+      // Optional post-generation verification (default on, disable with
+      // OPENGAME_POST_VERIFY=false).
+      try {
+        const verifyResult = await runPostVerify(config);
+        if (!verifyResult.enabled) {
+          writeRuntimeStatus(
+            workspaceDir,
+            'done',
+            'Generation finished (post-verify disabled)',
+          );
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[post-verify] failed: ${message}`);
+        writeRuntimeStatus(
+          workspaceDir,
+          'done',
+          `post-verify failed: ${message}`,
+        );
+      }
+
       process.stdout.removeListener('error', stdoutErrorHandler);
       // Cleanup signal handlers
       process.removeListener('SIGINT', shutdownHandler);

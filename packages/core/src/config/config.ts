@@ -63,7 +63,8 @@ import { TodoWriteTool } from '../tools/todoWrite.js';
 import { ToolRegistry } from '../tools/tool-registry.js';
 import { GameTypeClassifierTool } from '../tools/game-type-classifier.js';
 import { GenerateGDDTool } from '../tools/generate-gdd.js';
-//import { CopyTemplateTool } from '../tools/copy-template.js';
+import { CopyTemplateTool } from '../tools/copy-template.js';
+import { PostVerifyTool } from '../tools/post-verify.js';
 import { WebFetchTool } from '../tools/web-fetch.js';
 import { WebSearchTool } from '../tools/web-search/index.js';
 import { WriteFileTool } from '../tools/write-file.js';
@@ -1430,7 +1431,8 @@ export class Config {
     registerCoreTool(GenerateGDDTool, this);
     registerCoreTool(GenerateAssetsTool, this);
     registerCoreTool(GenerateTilemapTool, this);
-    //registerCoreTool(CopyTemplateTool, this);
+    registerCoreTool(CopyTemplateTool, this);
+    registerCoreTool(PostVerifyTool, this);
 
     await registry.discoverAllTools();
     console.debug('ToolRegistry created', registry.getAllToolNames());

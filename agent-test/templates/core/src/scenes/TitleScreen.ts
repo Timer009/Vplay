@@ -1,6 +1,6 @@
 import Phaser from 'phaser';
-import { LevelManager } from '../LevelManager.js';
-import * as utils from '../utils.js';
+import { LevelManager } from '../LevelManager';
+import * as utils from '../utils';
 
 /**
  * Title Screen Scene - Game start screen

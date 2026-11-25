@@ -64,3 +64,12 @@ docs-site/content
 
 # guidance files
 guidance.md
+# Review / verification artifacts (added by Qoder review round)
+.review-artifacts/
+game-coins/
+post-verify-demo*/
+post-verify-switch-test/
+post-verify-clean-test/
+queue-check/
+smoke-test/
+*.log

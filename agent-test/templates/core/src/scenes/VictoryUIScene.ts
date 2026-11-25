@@ -1,6 +1,6 @@
 import Phaser from 'phaser';
-import * as utils from '../utils.js';
-import { LevelManager } from '../LevelManager.js';
+import * as utils from '../utils';
+import { LevelManager } from '../LevelManager';
 
 /**
  * Victory UI Scene - Level Complete Screen
