@@ -292,6 +292,9 @@ diff --git a/vector-lander/index.html b/vector-lander/index.html
 | 工作区           | 仅两项既有遗留：`QODER_REVIEW.md`（暂存，非本轮产生）、`GIT_PUSH_REPORT.md`（未跟踪） |
 | 服务进程         | 验收/验证服务均已停止；8787/8788/8791/8792/8795/8796/8805/8806/8807/8808 均无监听     |
 
+> 说明：`9d3d5f0` 是本次补证前的代码/安全提交；补证文档本身提交为 `230b8e8`
+> （仅文档，不含源码改动）。
+
 ## 14.2 Adopt Mode：已有工程导入
 
 - 入口：仅本机 `node remote/cli.cjs project import <path> --id <id> [--entry <rel>]`。
