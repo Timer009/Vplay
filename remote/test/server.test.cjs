@@ -74,7 +74,7 @@ test('control endpoints reject missing and wrong tokens', async () => {
       ['GET', '/status'],
       ['GET', '/tasks'],
       ['GET', '/artifact'],
-      ['GET', '/game/index.html'],
+      ['GET', '/projects'],
     ]) {
       const noToken = await request(server.port, method, endpoint);
       assert.equal(noToken.status, 401, `${method} ${endpoint} without token`);
@@ -149,12 +149,11 @@ test('authorised task runs end-to-end and modifies the game background', async (
       headers: jsonHeaders(TOKEN),
     });
     assert.equal(artifact.status, 200);
-    assert.equal(artifact.json.url, '/game/index.html');
-    assert.equal(artifact.json.taskId, id);
+    assert.equal(artifact.json.previewPath, '/legacy/');
+    assert.equal(artifact.json.previewPort, server.previewPort);
 
-    const page = await request(server.port, 'GET', '/game/index.html', {
-      headers: jsonHeaders(TOKEN),
-    });
+    // 预览面在独立端口，只读，且不要求登录 Cookie
+    const page = await request(server.previewPort, 'GET', '/legacy/index.html');
     assert.equal(page.status, 200);
     assert.match(page.text, /Remote Test Game/);
 
@@ -385,6 +384,44 @@ test('server restart marks in-flight tasks interrupted and never reruns them', a
     assert.equal(after.json.task.status, 'interrupted');
   } finally {
     await secondServer.stop();
+    removeWorkspace(workspace);
+  }
+});
+
+test('cross-origin writes are rejected so the preview page cannot drive the control API', async () => {
+  const workspace = makeWorkspace();
+  copyFixtureGame(workspace);
+  const server = await startServer({ workspace, token: TOKEN, env: STUB_ENV });
+  try {
+    const login = await request(server.port, 'POST', '/auth/verify', {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: TOKEN }),
+    });
+    const cookie = String([].concat(login.headers['set-cookie'])[0] || '').split(';')[0];
+
+    const evil = await request(server.port, 'POST', '/prompt', {
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: cookie,
+        Origin: `http://127.0.0.1:${server.previewPort}`,
+      },
+      body: JSON.stringify({ text: 'cross-origin task must not run' }),
+    });
+    assert.equal(evil.status, 403);
+
+    const tasks = await request(server.port, 'GET', '/tasks', {
+      headers: jsonHeaders(TOKEN),
+    });
+    assert.equal(tasks.json.tasks.length, 0);
+
+    // 预览端口没有控制接口
+    const previewPost = await request(server.previewPort, 'POST', '/prompt', {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'x' }),
+    });
+    assert.equal(previewPost.status, 405);
+  } finally {
+    await server.stop();
     removeWorkspace(workspace);
   }
 });

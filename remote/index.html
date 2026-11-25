@@ -3,400 +3,120 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#070b09">
-<title>OpenGame · 遥控台</title>
+<meta name="theme-color" content="#0a0f0c">
+<meta name="format-detection" content="telephone=no">
+<title>OPENGAME 遥控台 · Vplay</title>
 <style>
-  :root {
-    --bg: #070b09;
-    --surface: #0e1511;
-    --surface-2: #142019;
-    --line: #21332a;
-    --line-bright: #2f4a3b;
-    --ink: #e9f6ee;
-    --dim: #7ea48d;
-    --faint: #4c6a58;
-    --green: #3dff8b;
-    --green-deep: #0f3d24;
-    --amber: #ffc247;
-    --amber-deep: #3d2f0c;
-    --cyan: #54d8ff;
-    --red: #ff6b6b;
-    --red-deep: #3d1414;
-    --magenta: #ff5da2;
-    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "Courier New", monospace;
-    --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
-    --safe-b: env(safe-area-inset-bottom, 0px);
-    --safe-t: env(safe-area-inset-top, 0px);
+  :root{
+    --bg:#070b09; --surface:#0e1512; --surface-2:#121b17;
+    --line:#1e2b25; --line-bright:#2c4038;
+    --ink:#e8f5ee; --dim:#8fa79b; --faint:#5b7268;
+    --green:#3dff8b; --green-deep:#1a7f4b;
+    --amber:#ffc857; --amber-deep:#7a5a16;
+    --red:#ff6b6b; --red-deep:#7a2a2a;
+    --cyan:#5ad1ff;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-  html { height: 100%; }
-  body {
-    min-height: 100%;
-    font-family: var(--sans);
-    color: var(--ink);
-    background:
-      radial-gradient(120% 60% at 50% -10%, rgba(61, 255, 139, 0.09), transparent 60%),
-      radial-gradient(90% 50% at 100% 110%, rgba(84, 216, 255, 0.06), transparent 60%),
-      var(--bg);
-    background-attachment: fixed;
-    padding: calc(14px + var(--safe-t)) 14px calc(20px + var(--safe-b));
-    max-width: 560px;
-    margin: 0 auto;
-    position: relative;
-    overflow-x: hidden;
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0}
+  body{
+    min-height:100vh;background:
+      radial-gradient(900px 500px at 50% -10%,rgba(61,255,139,.10),transparent 65%),
+      linear-gradient(180deg,#060a08,#040706 60%,#030504);
+    color:var(--ink);font-family:var(--sans);
+    padding:18px 14px 42px;max-width:560px;margin:0 auto;
   }
-  /* CRT scanlines + grid texture */
-  body::before {
-    content: "";
-    position: fixed; inset: 0;
-    pointer-events: none;
-    background:
-      repeating-linear-gradient(0deg, rgba(255,255,255,0.022) 0 1px, transparent 1px 3px),
-      linear-gradient(rgba(61,255,139,0.03) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(61,255,139,0.03) 1px, transparent 1px);
-    background-size: auto, 28px 28px, 28px 28px;
-    z-index: 0;
-  }
-  body > * { position: relative; z-index: 1; }
+  header{margin-bottom:16px}
+  .brand{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .logo{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:13px;letter-spacing:2px;color:var(--green)}
+  .logo .dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green);animation:breathe 2.4s ease-in-out infinite}
+  .conn{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10.5px;color:var(--dim)}
+  .conn .led{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+  .conn.online .led{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .conn.offline .led{background:var(--red)}
+  h1{font-size:19px;font-weight:650;letter-spacing:.4px;margin:12px 0 4px}
+  .sub{font-size:12.5px;color:var(--dim);line-height:1.6}
+  .host{font-family:var(--mono);color:var(--faint)}
 
-  ::-webkit-scrollbar { width: 8px; height: 8px; }
-  ::-webkit-scrollbar-track { background: var(--surface); }
-  ::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 4px; }
-  ::-webkit-scrollbar-thumb:hover { background: var(--green-deep); }
-  * { scrollbar-width: thin; scrollbar-color: var(--line-bright) var(--surface); }
+  .card{background:linear-gradient(165deg,var(--surface-2),var(--surface));border:1px solid var(--line);border-radius:16px;padding:15px;margin-top:13px}
+  .card-label{display:flex;align-items:center;justify-content:space-between;font-family:var(--mono);font-size:10.5px;letter-spacing:1.6px;color:var(--faint);margin-bottom:11px}
+  .badge{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;border:1px solid var(--line-bright);font-family:var(--mono);font-size:10.5px;letter-spacing:1.2px;color:var(--dim)}
+  .badge[data-tone="ok"]{color:var(--green);border-color:var(--green-deep)}
+  .badge[data-tone="busy"]{color:var(--amber);border-color:var(--amber-deep)}
+  .badge[data-tone="err"]{color:var(--red);border-color:var(--red-deep)}
+  .badge[data-tone="info"]{color:var(--cyan);border-color:#1c3d4a}
+  .phase-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .phase-raw{font-family:var(--mono);font-size:10px;color:var(--faint)}
+  .status-msg{margin-top:11px;padding:10px 12px;border-left:2px solid var(--line-bright);background:rgba(0,0,0,.25);border-radius:0 8px 8px 0;font-size:12.5px;line-height:1.6;color:var(--dim);word-break:break-word}
+  .status-msg.empty{color:var(--faint);font-style:italic}
+  .status-meta{margin-top:9px;display:flex;justify-content:space-between;font-family:var(--mono);font-size:10px;color:var(--faint)}
 
-  /* ---------- header ---------- */
-  header {
-    display: flex; align-items: center; justify-content: space-between;
-    gap: 10px; margin-bottom: 16px;
-    animation: rise .45s ease both;
-  }
-  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-  .brand-mark {
-    width: 38px; height: 38px; flex: none;
-    border: 1px solid var(--line-bright);
-    border-radius: 10px;
-    background: linear-gradient(145deg, var(--surface-2), var(--surface));
-    display: grid; place-items: center;
-    box-shadow: 0 0 18px rgba(61,255,139,0.15), inset 0 0 10px rgba(61,255,139,0.08);
-  }
-  .brand-mark svg { display: block; }
-  .brand-text { min-width: 0; }
-  .brand-text h1 {
-    font-family: var(--mono);
-    font-size: 15px; letter-spacing: 2px; font-weight: 700;
-    color: var(--green);
-    text-shadow: 0 0 12px rgba(61,255,139,0.45);
-    white-space: nowrap;
-  }
-  .brand-text small {
-    display: block; font-size: 11px; color: var(--dim);
-    font-family: var(--mono); letter-spacing: 1px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    max-width: 46vw;
-  }
-  .conn {
-    flex: none;
-    display: flex; align-items: center; gap: 7px;
-    font-family: var(--mono); font-size: 11px; letter-spacing: 1px;
-    padding: 7px 11px;
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    background: var(--surface);
-    color: var(--dim);
-    transition: color .3s, border-color .3s;
-  }
-  .conn .led {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--faint);
-    transition: background .3s, box-shadow .3s;
-  }
-  .conn.online { color: var(--green); border-color: var(--green-deep); }
-  .conn.online .led { background: var(--green); box-shadow: 0 0 8px var(--green); animation: breathe 2.4s ease-in-out infinite; }
-  .conn.offline { color: var(--red); border-color: var(--red-deep); }
-  .conn.offline .led { background: var(--red); box-shadow: 0 0 8px var(--red); animation: blink 1s steps(2) infinite; }
+  textarea{width:100%;min-height:92px;resize:vertical;background:rgba(0,0,0,.35);border:1px solid var(--line-bright);border-radius:11px;color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.55;padding:11px 12px;outline:none}
+  textarea:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(61,255,139,.10)}
+  .chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}
+  .chip{font-size:11.5px;color:var(--dim);background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:999px;padding:6px 10px;cursor:pointer}
+  .chip:active{color:var(--green);border-color:var(--green-deep)}
+  .send-row{display:flex;align-items:center;gap:10px;margin-top:11px}
+  .btn{flex:1;min-height:48px;border:none;border-radius:11px;font-family:var(--mono);font-size:14px;font-weight:700;letter-spacing:3px;cursor:pointer;color:#05130a;background:linear-gradient(160deg,#59ffa0,var(--green) 55%,#23c96c)}
+  .btn:disabled{opacity:.35;cursor:not-allowed}
+  .btn.ghost{flex:none;min-height:40px;padding:0 14px;background:transparent;border:1px solid var(--line-bright);color:var(--dim);font-size:11.5px;letter-spacing:1px}
+  .hint{font-family:var(--mono);font-size:10px;color:var(--faint);margin-top:8px;text-align:center}
+  .send-err{display:none;margin-top:9px;font-size:12px;color:var(--red)}
+  .send-err.show{display:block}
 
-  /* ---------- cards ---------- */
-  .card {
-    background: linear-gradient(160deg, var(--surface-2), var(--surface) 55%);
-    border: 1px solid var(--line);
-    border-radius: 16px;
-    padding: 16px;
-    margin-bottom: 14px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
-    animation: rise .5s ease both;
-  }
-  .card:nth-of-type(2) { animation-delay: .06s; }
-  .card:nth-of-type(3) { animation-delay: .12s; }
-  .card-label {
-    display: flex; align-items: center; justify-content: space-between;
-    font-family: var(--mono); font-size: 11px; letter-spacing: 2.5px;
-    color: var(--dim); text-transform: uppercase;
-    margin-bottom: 12px;
-  }
-  .card-label .tick { color: var(--faint); letter-spacing: 0; font-size: 10px; }
+  .sent{display:none;margin-top:13px;padding:10px 13px;border-radius:10px;border:1px solid var(--green-deep);background:rgba(61,255,139,.07);color:var(--green);font-family:var(--mono);font-size:11.5px;letter-spacing:.5px}
+  .sent.show{display:block;animation:rise .25s ease-out}
 
-  /* ---------- status ---------- */
-  .phase-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .phase-badge {
-    display: inline-flex; align-items: center; gap: 8px;
-    font-family: var(--mono); font-size: 13px; font-weight: 700; letter-spacing: 1px;
-    padding: 8px 14px; border-radius: 10px;
-    border: 1px solid var(--line-bright);
-    background: var(--surface);
-    color: var(--dim);
-    transition: all .35s;
-  }
-  .phase-badge .dot { width: 9px; height: 9px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
-  .phase-badge[data-tone="busy"] { color: var(--amber); border-color: var(--amber-deep); background: rgba(255,194,71,0.07); }
-  .phase-badge[data-tone="busy"] .dot { animation: breathe 1.1s ease-in-out infinite; }
-  .phase-badge[data-tone="ok"] { color: var(--green); border-color: var(--green-deep); background: rgba(61,255,139,0.07); }
-  .phase-badge[data-tone="err"] { color: var(--red); border-color: var(--red-deep); background: rgba(255,107,107,0.07); }
-  .phase-badge[data-tone="err"] .dot { animation: blink .8s steps(2) infinite; }
-  .phase-badge[data-tone="info"] { color: var(--cyan); border-color: #123540; background: rgba(84,216,255,0.07); }
-  .phase-raw { font-family: var(--mono); font-size: 11px; color: var(--faint); }
-  .status-msg {
-    margin-top: 12px;
-    font-size: 14px; line-height: 1.65;
-    color: var(--ink);
-    background: rgba(0,0,0,0.25);
-    border: 1px solid var(--line);
-    border-left: 3px solid var(--line-bright);
-    border-radius: 8px;
-    padding: 11px 13px;
-    min-height: 46px;
-    word-break: break-word;
-    white-space: pre-wrap;
-    max-height: 180px;
-    overflow-y: auto;
-    transition: border-color .35s;
-  }
-  .status-msg.empty { color: var(--faint); }
-  .status-meta { margin-top: 9px; font-family: var(--mono); font-size: 10.5px; color: var(--faint); letter-spacing: .5px; display: flex; justify-content: space-between; gap: 8px; }
-  .sent-banner {
-    display: none;
-    margin-top: 12px;
-    align-items: center; gap: 8px;
-    font-size: 13px; font-weight: 600;
-    color: var(--green);
-    background: rgba(61,255,139,0.09);
-    border: 1px solid var(--green-deep);
-    border-radius: 10px;
-    padding: 10px 13px;
-  }
-  .sent-banner.show { display: flex; animation: pop .3s ease both; }
-  .sent-banner svg { flex: none; }
+  .task-list{display:flex;flex-direction:column;gap:8px;max-height:380px;overflow-y:auto}
+  .task-item{border:1px solid var(--line);border-radius:11px;padding:10px 12px;background:rgba(0,0,0,.22);cursor:pointer}
+  .task-item .row{display:flex;justify-content:space-between;gap:8px;align-items:center}
+  .task-id{font-family:var(--mono);font-size:10px;color:var(--faint);word-break:break-all}
+  .task-badge{flex:none;font-family:var(--mono);font-size:9.5px;letter-spacing:.8px;padding:3px 8px;border-radius:999px;border:1px solid var(--line-bright);color:var(--dim)}
+  .task-badge[data-s="queued"]{color:var(--cyan);border-color:#1a3a47}
+  .task-badge[data-s="running"],.task-badge[data-s="verifying"]{color:var(--amber);border-color:var(--amber-deep)}
+  .task-badge[data-s="succeeded"]{color:var(--green);border-color:var(--green-deep)}
+  .task-badge[data-s="failed"],.task-badge[data-s="interrupted"]{color:var(--red);border-color:var(--red-deep)}
+  .task-badge[data-s="unverified"]{color:var(--amber);border-color:var(--amber-deep)}
+  .task-text{font-size:12.5px;line-height:1.5;margin-top:6px;color:var(--ink);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .task-sub{font-family:var(--mono);font-size:9.5px;color:var(--faint);margin-top:5px}
+  .task-detail{display:none;margin-top:9px;padding-top:9px;border-top:1px dashed var(--line);font-family:var(--mono);font-size:10.5px;line-height:1.6;color:var(--dim);white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto}
+  .task-item.open .task-detail{display:block}
+  .task-actions{display:flex;gap:7px;margin-top:9px;flex-wrap:wrap}
+  .mini{font-family:var(--mono);font-size:10px;letter-spacing:.6px;padding:6px 9px;border-radius:7px;border:1px solid var(--line-bright);background:transparent;color:var(--dim);cursor:pointer}
+  .mini:active{color:var(--green);border-color:var(--green-deep)}
+  .mini[data-act="rollback"]{color:var(--amber);border-color:var(--amber-deep)}
+  .empty-note{color:var(--faint);font-size:12px}
 
-  /* ---------- prompt ---------- */
-  .chips { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 10px; margin-bottom: 2px; }
-  .chip {
-    flex: none;
-    font-size: 12.5px; font-family: var(--sans);
-    color: var(--cyan);
-    background: rgba(84,216,255,0.06);
-    border: 1px solid #1a3a47;
-    border-radius: 999px;
-    padding: 8px 14px;
-    cursor: pointer;
-    transition: transform .12s, background .2s;
-  }
-  .chip:nth-child(2n) { color: var(--magenta); background: rgba(255,93,162,0.06); border-color: #43202f; }
-  .chip:nth-child(3n) { color: var(--amber); background: rgba(255,194,71,0.06); border-color: #43350f; }
-  .chip:active { transform: scale(.94); }
-  textarea {
-    width: 100%;
-    font-family: var(--sans);
-    font-size: 16px; /* >=16px prevents iOS zoom-on-focus */
-    line-height: 1.55;
-    color: var(--ink);
-    background: rgba(0,0,0,0.3);
-    border: 1px solid var(--line-bright);
-    border-radius: 12px;
-    padding: 13px 14px;
-    resize: none;
-    min-height: 84px;
-    outline: none;
-    transition: border-color .25s, box-shadow .25s;
-  }
-  textarea::placeholder { color: var(--faint); }
-  textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(61,255,139,0.12); }
-  .send-row { display: flex; gap: 10px; margin-top: 12px; align-items: stretch; }
-  .btn-send {
-    flex: 1;
-    min-height: 52px;
-    font-family: var(--mono);
-    font-size: 15px; font-weight: 700; letter-spacing: 3px;
-    color: #05130a;
-    background: linear-gradient(160deg, #59ffa0, var(--green) 55%, #23c96c);
-    border: none; border-radius: 12px;
-    cursor: pointer;
-    box-shadow: 0 4px 18px rgba(61,255,139,0.3), inset 0 1px 0 rgba(255,255,255,0.35);
-    transition: transform .12s, filter .2s, opacity .2s;
-    display: flex; align-items: center; justify-content: center; gap: 8px;
-  }
-  .btn-send:active:not(:disabled) { transform: scale(.97); filter: brightness(1.1); }
-  .btn-send:disabled { opacity: .38; cursor: not-allowed; box-shadow: none; }
-  .btn-send .spinner {
-    width: 16px; height: 16px; display: none;
-    border: 2px solid rgba(5,19,10,0.3); border-top-color: #05130a;
-    border-radius: 50%;
-    animation: spin .7s linear infinite;
-  }
-  .btn-send.loading .spinner { display: block; }
-  .hint { margin-top: 9px; font-size: 11px; color: var(--faint); font-family: var(--mono); letter-spacing: .5px; }
+  .artifact-none{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--faint)}
+  .artifact-ready{display:none;margin-top:2px}
+  .artifact-ready.show{display:block}
+  .artifact-link{display:flex;align-items:center;justify-content:space-between;gap:10px;text-decoration:none;padding:11px 13px;border-radius:11px;border:1px solid var(--green-deep);background:rgba(61,255,139,.06);color:var(--green);font-family:var(--mono);font-size:11.5px}
+  .artifact-link small{display:block;color:var(--faint);font-size:9.5px;margin-top:3px;word-break:break-all}
 
-  /* ---------- artifact ---------- */
-  .artifact-none {
-    display: flex; align-items: center; gap: 12px;
-    color: var(--faint); font-size: 13.5px; line-height: 1.5;
-    padding: 6px 2px;
-  }
-  .artifact-none .ghost {
-    flex: none; width: 42px; height: 42px;
-    border: 1px dashed var(--line-bright); border-radius: 10px;
-    display: grid; place-items: center; color: var(--faint);
-  }
-  .artifact-ready { display: none; }
-  .artifact-ready.show { display: block; animation: pop .3s ease both; }
-  .artifact-info { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-  .artifact-icon {
-    flex: none; width: 46px; height: 46px;
-    border-radius: 12px;
-    background: linear-gradient(145deg, #123540, #0d1f2b);
-    border: 1px solid #1a3a47;
-    display: grid; place-items: center;
-    box-shadow: 0 0 16px rgba(84,216,255,0.18);
-  }
-  .artifact-text { min-width: 0; }
-  .artifact-text strong { display: block; font-size: 14.5px; color: var(--ink); }
-  .artifact-text span {
-    display: block; font-family: var(--mono); font-size: 11px; color: var(--dim);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .btn-open {
-    display: flex; align-items: center; justify-content: center; gap: 9px;
-    min-height: 52px; width: 100%;
-    font-family: var(--mono); font-size: 14px; font-weight: 700; letter-spacing: 2px;
-    color: var(--cyan); text-decoration: none;
-    background: rgba(84,216,255,0.08);
-    border: 1px solid #1a3a47;
-    border-radius: 12px;
-    transition: transform .12s, background .2s, box-shadow .2s;
-  }
-  .btn-open:active { transform: scale(.97); background: rgba(84,216,255,0.16); box-shadow: 0 0 18px rgba(84,216,255,0.25); }
-  .btn-refresh {
-    background: none; border: 1px solid var(--line);
-    color: var(--dim); border-radius: 8px;
-    font-family: var(--mono); font-size: 11px; letter-spacing: 1px;
-    padding: 6px 10px; cursor: pointer;
-    display: inline-flex; align-items: center; gap: 6px;
-    transition: color .2s, border-color .2s, transform .12s;
-  }
-  .btn-refresh:active { transform: scale(.94); color: var(--green); border-color: var(--green-deep); }
-  .btn-refresh.spinning svg { animation: spin .7s linear infinite; }
+  select{width:100%;min-height:42px;background:rgba(0,0,0,.35);border:1px solid var(--line-bright);border-radius:10px;color:var(--ink);font-family:var(--mono);font-size:12.5px;padding:0 10px;outline:none}
+  .project-row{display:flex;gap:8px;align-items:center}
+  .project-row select{flex:1}
 
-  footer {
-    text-align: center;
-    font-family: var(--mono); font-size: 10.5px; letter-spacing: 1.5px;
-    color: var(--faint);
-    padding: 6px 0 2px;
-    animation: rise .5s .18s ease both;
-  }
-  footer b { color: var(--dim); font-weight: 600; }
+  .gate{position:fixed;inset:0;z-index:50;display:none;place-items:center;padding:20px;background:rgba(4,8,6,.95);backdrop-filter:blur(6px)}
+  .gate.show{display:grid}
+  .gate-card{width:100%;max-width:380px;background:linear-gradient(160deg,var(--surface-2),var(--surface));border:1px solid var(--line-bright);border-radius:18px;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  .gate-card h2{font-family:var(--mono);font-size:15px;letter-spacing:2px;color:var(--green);margin:0 0 8px}
+  .gate-card p{font-size:13px;color:var(--dim);line-height:1.6;margin:0 0 14px}
+  .gate-card input{width:100%;font-family:var(--mono);font-size:16px;color:var(--ink);background:rgba(0,0,0,.35);border:1px solid var(--line-bright);border-radius:10px;padding:12px 13px;outline:none}
+  .gate-card input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(61,255,139,.12)}
+  .gate-card button{width:100%;min-height:48px;margin-top:12px;font-family:var(--mono);font-size:14px;font-weight:700;letter-spacing:3px;color:#05130a;background:linear-gradient(160deg,#59ffa0,var(--green) 55%,#23c96c);border:none;border-radius:11px;cursor:pointer}
+  .gate-card button:disabled{opacity:.4;cursor:not-allowed}
+  .gate-err{display:none;margin-top:10px;font-size:12.5px;color:var(--red)}
+  .gate-err.show{display:block}
+  .gate-note{margin-top:12px;font-family:var(--mono);font-size:10.5px;color:var(--faint);line-height:1.6}
 
-  .toast-err {
-    display: none;
-    margin-top: 10px;
-    font-size: 12.5px; color: var(--red);
-    background: rgba(255,107,107,0.08);
-    border: 1px solid var(--red-deep);
-    border-radius: 8px; padding: 9px 12px;
-  }
-  .toast-err.show { display: block; animation: pop .3s ease both; }
-
-  @keyframes rise { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
-  @keyframes pop { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: none; } }
-  @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
-  @keyframes blink { 50% { opacity: .2; } }
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  /* ---------- auth gate ---------- */
-  .gate {
-    position: fixed; inset: 0; z-index: 50;
-    display: none; place-items: center;
-    padding: 20px;
-    background: rgba(4, 8, 6, 0.94);
-    backdrop-filter: blur(6px);
-  }
-  .gate.show { display: grid; }
-  .gate-card {
-    width: 100%; max-width: 380px;
-    background: linear-gradient(160deg, var(--surface-2), var(--surface));
-    border: 1px solid var(--line-bright);
-    border-radius: 18px;
-    padding: 22px;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
-  }
-  .gate-card h2 {
-    font-family: var(--mono); font-size: 15px; letter-spacing: 2px;
-    color: var(--green); margin-bottom: 8px;
-  }
-  .gate-card p { font-size: 13px; color: var(--dim); line-height: 1.6; margin-bottom: 14px; }
-  .gate-card input {
-    width: 100%; font-family: var(--mono); font-size: 16px;
-    color: var(--ink); background: rgba(0,0,0,0.35);
-    border: 1px solid var(--line-bright); border-radius: 10px;
-    padding: 12px 13px; outline: none;
-  }
-  .gate-card input:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(61,255,139,0.12); }
-  .gate-card button {
-    width: 100%; min-height: 48px; margin-top: 12px;
-    font-family: var(--mono); font-size: 14px; font-weight: 700; letter-spacing: 3px;
-    color: #05130a; background: linear-gradient(160deg, #59ffa0, var(--green) 55%, #23c96c);
-    border: none; border-radius: 11px; cursor: pointer;
-  }
-  .gate-card button:disabled { opacity: .4; cursor: not-allowed; }
-  .gate-err { display: none; margin-top: 10px; font-size: 12.5px; color: var(--red); }
-  .gate-err.show { display: block; }
-  .gate-note { margin-top: 12px; font-family: var(--mono); font-size: 10.5px; color: var(--faint); line-height: 1.6; }
-
-  /* ---------- tasks ---------- */
-  .task-list { display: flex; flex-direction: column; gap: 8px; max-height: 340px; overflow-y: auto; }
-  .task-item {
-    border: 1px solid var(--line); border-radius: 10px;
-    padding: 10px 12px; background: rgba(0,0,0,0.22); cursor: pointer;
-  }
-  .task-item .row { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
-  .task-id { font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
-  .task-text {
-    font-size: 12.5px; color: var(--ink); margin-top: 5px; line-height: 1.45;
-    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
-  }
-  .task-badge {
-    flex: none; font-family: var(--mono); font-size: 10px; letter-spacing: 1px;
-    padding: 3px 8px; border-radius: 999px;
-    border: 1px solid var(--line-bright); color: var(--dim);
-  }
-  .task-badge[data-s="queued"] { color: var(--cyan); border-color: #1a3a47; }
-  .task-badge[data-s="running"], .task-badge[data-s="verifying"] { color: var(--amber); border-color: var(--amber-deep); }
-  .task-badge[data-s="succeeded"] { color: var(--green); border-color: var(--green-deep); }
-  .task-badge[data-s="failed"], .task-badge[data-s="interrupted"] { color: var(--red); border-color: var(--red-deep); }
-  .task-detail {
-    display: none; margin-top: 8px; padding-top: 8px;
-    border-top: 1px dashed var(--line);
-    font-family: var(--mono); font-size: 11px; color: var(--dim);
-    white-space: pre-wrap; word-break: break-word;
-    max-height: 200px; overflow: auto;
-  }
-  .task-item.open .task-detail { display: block; }
-  .empty-note { color: var(--faint); font-size: 12.5px; }
-
-  @media (max-width: 360px) {
-    body { padding-left: 10px; padding-right: 10px; }
-    .card { padding: 13px; }
-    .brand-text h1 { font-size: 13px; letter-spacing: 1px; }
-    .conn { padding: 6px 9px; font-size: 10px; }
-  }
+  footer{margin-top:22px;text-align:center;font-family:var(--mono);font-size:9.5px;letter-spacing:1.2px;color:var(--faint)}
+  footer b{color:var(--dim);font-weight:600}
+  .spinning{animation:spin .6s linear}
+  @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+  @keyframes breathe{0%,100%{opacity:1}50%{opacity:.3}}
+  @keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -414,102 +134,74 @@
 
 <header>
   <div class="brand">
-    <div class="brand-mark" aria-hidden="true">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-        <rect x="2" y="7" width="20" height="12" rx="4" stroke="#3dff8b" stroke-width="1.6"/>
-        <path d="M7 11v4M5 13h4" stroke="#3dff8b" stroke-width="1.6" stroke-linecap="round"/>
-        <circle cx="16" cy="12" r="1.3" fill="#ffc247"/>
-        <circle cx="18.5" cy="14.5" r="1.3" fill="#54d8ff"/>
-        <path d="M12 7V4.5M12 4.5h4" stroke="#3dff8b" stroke-width="1.4" stroke-linecap="round"/>
-      </svg>
-    </div>
-    <div class="brand-text">
-      <h1>OPENGAME 遥控台</h1>
-      <small id="hostLabel">--</small>
-    </div>
+    <div class="logo"><span class="dot"></span>OPENGAME · VPLAY</div>
+    <div class="conn offline" id="connBadge"><span class="led"></span><span id="connText">未连接</span></div>
   </div>
-  <div class="conn" id="connBadge"><span class="led"></span><span id="connText">连接中</span></div>
+  <h1>遥控台</h1>
+  <div class="sub">桌面端执行 · <span class="host" id="hostLabel">localhost</span></div>
 </header>
 
-<!-- 状态显示区 -->
+<!-- 项目选择（仅项目模式） -->
+<section class="card" id="projectCard" style="display:none">
+  <div class="card-label"><span>▍项目</span><span class="phase-raw" id="modeLabel"></span></div>
+  <div class="project-row">
+    <select id="projectSelect"></select>
+    <button class="btn ghost" id="projectRefreshBtn" type="button">刷新</button>
+  </div>
+</section>
+
+<!-- 状态 -->
 <section class="card" aria-live="polite">
-  <div class="card-label"><span>▍运行状态</span><span class="tick" id="pollTick">每 3s 刷新</span></div>
+  <div class="card-label"><span>▍状态</span><span class="phase-raw" id="phaseRaw">idle</span></div>
   <div class="phase-row">
-    <span class="phase-badge" id="phaseBadge" data-tone="idle"><span class="dot"></span><span id="phaseText">--</span></span>
-    <span class="phase-raw" id="phaseRaw"></span>
+    <span class="badge" id="phaseBadge" data-tone="info"><span id="phaseText">空闲</span></span>
   </div>
-  <div class="status-msg empty" id="statusMsg">等待桌面端状态…</div>
-  <div class="status-meta"><span id="statusTime">尚未同步</span><span id="queueHint"></span></div>
-  <div class="sent-banner" id="sentBanner">
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="7" stroke="#3dff8b" stroke-width="1.5"/><path d="M5 8.2l2.2 2.2L11 6" stroke="#3dff8b" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    <span id="sentText">已发送</span>
-  </div>
+  <div class="status-msg empty" id="statusMsg">（暂无消息）</div>
+  <div class="status-meta"><span id="queueHint">—</span><span id="statusTime">—</span></div>
 </section>
 
-<!-- 指令输入区 -->
+<!-- 指令 -->
 <section class="card">
-  <div class="card-label"><span>▍发送指令</span><span class="tick">POST /prompt</span></div>
+  <div class="card-label"><span>▍下发指令</span><span class="phase-raw">remote</span></div>
+  <textarea id="promptInput" placeholder="例如：把 HUD 的主色改成 #7c3aed，只改样式，不要动物理参数"></textarea>
   <div class="chips" id="chips">
-    <button class="chip" type="button">做一个贪吃蛇游戏</button>
-    <button class="chip" type="button">做一个像素风打砖块</button>
-    <button class="chip" type="button">做一个太空射击游戏</button>
-    <button class="chip" type="button">把难度调低一点</button>
+    <span class="chip">把背景改成 #7c3aed</span>
+    <span class="chip">把 HUD 文字调大一点</span>
+    <span class="chip">加一个显示帧率的角标</span>
   </div>
-  <textarea id="promptInput" rows="3" placeholder="描述你想生成的游戏，例如：做一个霓虹风格的俄罗斯方块…" enterkeyhint="send"></textarea>
   <div class="send-row">
-    <button class="btn-send" id="sendBtn" type="button" disabled>
-      <span class="spinner"></span><span id="sendLabel">发 送</span>
-    </button>
+    <button class="btn" id="sendBtn" type="button" disabled><span id="sendLabel">发 送</span></button>
   </div>
-  <div class="toast-err" id="sendErr"></div>
-  <div class="hint">指令会进入桌面端任务队列，由串行 worker 以正式用户消息执行</div>
+  <div class="send-err" id="sendErr"></div>
+  <div class="hint">指令进入任务队列，由串行 worker 以正式用户消息执行</div>
 </section>
 
-<!-- 任务记录 -->
+<div class="sent" id="sentBanner"><span id="sentText">已发送</span></div>
+
+<!-- 任务 -->
 <section class="card">
   <div class="card-label">
     <span>▍任务记录</span>
-    <button class="btn-refresh" id="tasksRefreshBtn" type="button">
-      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 1.5v3h-3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      刷新
-    </button>
+    <button class="btn ghost" id="tasksRefreshBtn" type="button" style="min-height:30px;font-size:10px;padding:0 10px">刷新</button>
   </div>
   <div class="task-list" id="taskList"><div class="empty-note">暂无任务</div></div>
 </section>
 
-<!-- 产物入口 -->
+<!-- 产物 -->
 <section class="card">
   <div class="card-label">
     <span>▍最新产物</span>
-    <button class="btn-refresh" id="refreshBtn" type="button">
-      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 1.5v3h-3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      刷新
-    </button>
+    <button class="btn ghost" id="refreshBtn" type="button" style="min-height:30px;font-size:10px;padding:0 10px">刷新</button>
   </div>
-  <div class="artifact-none" id="artifactNone">
-    <div class="ghost">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="3" stroke="currentColor" stroke-width="1.5"/><path d="M8 12h3M9.5 10.5v3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="15.5" cy="11.5" r="1" fill="currentColor"/><circle cx="17.5" cy="13.5" r="1" fill="currentColor"/></svg>
-    </div>
-    <span>还没有生成好的游戏。<br>发送一条指令，等桌面端完成后这里会出现入口。</span>
-  </div>
+  <div class="artifact-none" id="artifactNone"><span>尚无产物</span></div>
   <div class="artifact-ready" id="artifactReady">
-    <div class="artifact-info">
-      <div class="artifact-icon">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="2" y="7" width="20" height="12" rx="4" stroke="#54d8ff" stroke-width="1.6"/><path d="M7 11v4M5 13h4" stroke="#54d8ff" stroke-width="1.6" stroke-linecap="round"/><circle cx="16" cy="12" r="1.3" fill="#ffc247"/><circle cx="18.5" cy="14.5" r="1.3" fill="#ff5da2"/></svg>
-      </div>
-      <div class="artifact-text">
-        <strong>最新生成的游戏</strong>
-        <span id="artifactUrlText">--</span>
-      </div>
-    </div>
-    <a class="btn-open" id="artifactLink" href="#" target="_blank" rel="noopener">
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M6 3.5L11 8l-5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      打开游戏
+    <a class="artifact-link" id="artifactLink" href="#" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">
+      <span>打开游戏预览</span><small id="artifactUrlText"></small>
     </a>
   </div>
 </section>
 
-<footer>REMOTE BRIDGE · <b>Token 鉴权</b> · 仅限本机或可信网络</footer>
+<footer>REMOTE BRIDGE · <b>Token 鉴权</b> · 预览独立源 · 仅限可信网络</footer>
 
 <script>
 'use strict';
@@ -523,42 +215,31 @@
   var input = $('promptInput'), sendBtn = $('sendBtn'), sendLabel = $('sendLabel'), sendErr = $('sendErr');
   var artifactNone = $('artifactNone'), artifactReady = $('artifactReady');
   var artifactLink = $('artifactLink'), artifactUrlText = $('artifactUrlText');
-  var refreshBtn = $('refreshBtn');
+  var refreshBtn = $('refreshBtn'), tasksRefreshBtn = $('tasksRefreshBtn');
   var gate = $('gate'), tokenInput = $('tokenInput'), loginBtn = $('loginBtn');
   var gateErr = $('gateErr'), gateNote = $('gateNote');
-  var taskList = $('taskList'), tasksRefreshBtn = $('tasksRefreshBtn');
+  var taskList = $('taskList');
+  var projectCard = $('projectCard'), projectSelect = $('projectSelect');
+  var projectRefreshBtn = $('projectRefreshBtn'), modeLabel = $('modeLabel');
 
   $('hostLabel').textContent = location.host || 'localhost';
 
   var PHASES = {
-    idle:       { label: '空闲',   tone: 'idle' },
-    queued:     { label: '排队中', tone: 'info' },
-    planning:   { label: '规划中', tone: 'busy' },
+    idle: { label: '空闲', tone: 'info' },
+    queued: { label: '排队中', tone: 'info' },
     generating: { label: '生成中', tone: 'busy' },
-    verifying:  { label: '校验中', tone: 'busy' },
-    coding:     { label: '编码中', tone: 'busy' },
-    building:   { label: '构建中', tone: 'busy' },
-    running:    { label: '运行中', tone: 'busy' },
-    testing:    { label: '测试中', tone: 'busy' },
-    debugging:  { label: '调试中', tone: 'busy' },
-    done:       { label: '已完成', tone: 'ok' },
-    ready:      { label: '就绪',   tone: 'ok' },
-    success:    { label: '成功',   tone: 'ok' },
-    error:      { label: '出错',   tone: 'err' },
-    failed:     { label: '失败',   tone: 'err' }
+    verifying: { label: '校验中', tone: 'busy' },
+    done: { label: '已完成', tone: 'ok' },
+    failed: { label: '失败', tone: 'err' }
   };
 
-  var polling = false;
-  var sentTimer = null;
-  var timer = null;
-  var authed = false;
-  var openTaskId = null;
+  var state = { authed: false, mode: 'workspace', previewPort: null, projects: [], selected: null };
+  var polling = false, timer = null, sentTimer = null, openTaskId = null;
 
   function setConn(online) {
     connBadge.className = 'conn ' + (online ? 'online' : 'offline');
     connText.textContent = online ? '已连接' : '未连接';
   }
-
   function fetchJson(url, opts) {
     return fetch(url, Object.assign({ credentials: 'same-origin' }, opts || {})).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
@@ -566,48 +247,37 @@
       });
     });
   }
-
   function fetchText(url) {
     return fetch(url, { credentials: 'same-origin' }).then(function (res) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       return res.text();
     });
   }
-
-  function esc(value) {
-    return String(value == null ? '' : value).replace(/[&<>"']/g, function (ch) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+  function esc(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
-
   function clock(iso) {
-    try { return new Date(iso).toLocaleTimeString('zh-CN', { hour12: false }); }
-    catch (e) { return ''; }
+    try { return new Date(iso).toLocaleTimeString('zh-CN', { hour12: false }); } catch (e) { return ''; }
   }
 
   function showGate(message) {
-    authed = false;
+    state.authed = false;
     gate.classList.add('show');
     stopPolling();
     setConn(false);
-    connText.textContent = '未登录';
-    if (message) {
-      gateErr.textContent = message;
-      gateErr.classList.add('show');
-    }
+    if (message) { gateErr.textContent = message; gateErr.classList.add('show'); }
   }
-
   function hideGate() {
+    state.authed = true;
     gate.classList.remove('show');
     gateErr.classList.remove('show');
-    authed = true;
   }
 
-  // ---- 状态区 ----
   function renderStatus(data) {
     var phase = String(data.phase || 'idle').toLowerCase();
     var meta = PHASES[phase] || { label: data.phase || phase, tone: 'info' };
-    // "done" also covers the last task failing; surface that as an error.
     if (phase === 'done' && /\b(failed|interrupted)\b/.test(String(data.message || ''))) {
       meta = { label: '失败', tone: 'err' };
     }
@@ -618,21 +288,21 @@
     statusMsg.textContent = msg || '（暂无消息）';
     statusMsg.classList.toggle('empty', !msg);
     statusMsg.style.borderLeftColor =
-      meta.tone === 'ok' ? 'var(--green)' :
-      meta.tone === 'err' ? 'var(--red)' :
+      meta.tone === 'ok' ? 'var(--green)' : meta.tone === 'err' ? 'var(--red)' :
       meta.tone === 'busy' ? 'var(--amber)' : 'var(--line-bright)';
     statusTime.textContent = '同步于 ' + clock(new Date());
   }
 
-  function renderArtifact(result) {
-    if (result.ok && result.data && result.data.ok) {
-      var href = result.data.url || '/game/index.html';
-      try {
-        var u = new URL(href, location.href);
-        u.protocol = location.protocol;
-        u.host = location.host;
-        href = u.toString();
-      } catch (e) { href = location.origin + '/game/index.html'; }
+  function previewHref(previewPath) {
+    if (!previewPath) return null;
+    var port = state.previewPort;
+    if (!port) return location.origin + previewPath;
+    return location.protocol + '//' + location.hostname + ':' + port + previewPath;
+  }
+
+  function renderArtifact(payload) {
+    if (payload && payload.ok && payload.previewPath) {
+      var href = previewHref(payload.previewPath);
       artifactLink.href = href;
       artifactUrlText.textContent = href;
       artifactNone.style.display = 'none';
@@ -643,13 +313,17 @@
     }
   }
 
-  // ---- 任务列表 ----
+  function taskActions(task) {
+    if (!task.snapshotSeq || !task.projectId) return '';
+    return '<div class="task-actions">' +
+      '<button class="mini" data-act="diff" data-id="' + esc(task.id) + '" data-project="' + esc(task.projectId) + '" data-seq="' + task.snapshotSeq + '">查看差异</button>' +
+      '<button class="mini" data-act="rollback" data-id="' + esc(task.id) + '" data-project="' + esc(task.projectId) + '" data-seq="' + task.snapshotSeq + '">回退到本次之前</button>' +
+    '</div>';
+  }
+
   function renderTasks(payload) {
     var tasks = (payload && payload.tasks) || [];
-    if (!tasks.length) {
-      taskList.innerHTML = '<div class="empty-note">暂无任务</div>';
-      return;
-    }
+    if (!tasks.length) { taskList.innerHTML = '<div class="empty-note">暂无任务</div>'; return; }
     taskList.innerHTML = tasks.map(function (task) {
       var open = task.id === openTaskId ? ' open' : '';
       var detail = '';
@@ -659,46 +333,79 @@
       }
       if (task.result && task.result.postVerify) {
         var p = task.result.postVerify;
-        if (detail) detail += '\n';
-        detail += 'post-verify: imports=' + p.checkedImports +
-          ' assets=' + p.checkedAssets + ' fixed=' + p.fixedCount +
-          ' issues=' + p.issues;
+        detail += (detail ? '\n' : '') + 'post-verify: imports=' + p.checkedImports +
+          ' assets=' + p.checkedAssets + ' fixed=' + p.fixedCount + ' issues=' + p.issues;
       }
-      if (task.result && task.result.artifactIndexHtml) {
-        detail += (detail ? '\n' : '') + '产物: ' + task.result.artifactIndexHtml;
+      if (task.result && task.result.changedFiles) {
+        var c = task.result.changedFiles;
+        detail += (detail ? '\n' : '') + '变更: +' + c.added + ' ~' + c.modified + ' -' + c.removed;
       }
-      if (!detail) {
-        detail = '创建于 ' + clock(task.createdAt) +
-          (task.finishedAt ? ' · 完成于 ' + clock(task.finishedAt) : '');
+      if (task.result && task.result.verification) {
+        detail += (detail ? '\n' : '') + '验证: ' + (task.result.verified ? '通过' : '未通过') +
+          '（入口 ' + (task.result.verification.entryExists ? '存在' : '缺失') +
+          '，预览 ' + (task.result.verification.previewReady ? '就绪' : '未就绪') + '）';
       }
+      if (!detail) detail = '创建于 ' + clock(task.createdAt);
+      var badge = task.status;
+      if (task.status === 'succeeded' && task.result && task.result.verified === false) badge = 'unverified';
       return '<div class="task-item' + open + '" data-id="' + esc(task.id) + '">' +
         '<div class="row"><span class="task-id">' + esc(task.id) + '</span>' +
-        '<span class="task-badge" data-s="' + esc(task.status) + '">' + esc(task.status) + '</span></div>' +
+        '<span class="task-badge" data-s="' + esc(badge) + '">' + esc(badge) + '</span></div>' +
         '<div class="task-text">' + esc(task.text) + '</div>' +
+        '<div class="task-sub">' + esc(task.projectId || 'default') + ' · ' + clock(task.createdAt) + '</div>' +
         '<div class="task-detail">' + esc(detail) + '</div>' +
+        taskActions(task) +
         '</div>';
     }).join('');
   }
 
   function loadTasks() {
-    if (!authed) return Promise.resolve();
+    if (!state.authed) return Promise.resolve();
     return fetchJson('/tasks?limit=20').then(function (r) {
       if (r.status === 401) { showGate('登录已失效，请重新输入令牌'); return; }
       if (r.ok) renderTasks(r.data);
     }).catch(function () {});
   }
-
   function loadLog(taskId, element) {
     if (!element) return;
     fetchText('/tasks/' + encodeURIComponent(taskId) + '/log').then(function (text) {
       element.textContent += '\n--- log tail ---\n' + text.slice(-3000);
-    }).catch(function (e) {
-      element.textContent += '\n(log unavailable: ' + e.message + ')';
-    });
+    }).catch(function (e) { element.textContent += '\n(log unavailable: ' + e.message + ')'; });
+  }
+
+  function loadArtifact() {
+    if (!state.authed) return Promise.resolve();
+    var query = state.selected ? '?projectId=' + encodeURIComponent(state.selected) : '';
+    return fetchJson('/artifact' + query).then(function (r) {
+      if (r.ok) renderArtifact(r.data);
+    }).catch(function () {});
+  }
+
+  function loadProjects() {
+    return fetchJson('/projects').then(function (r) {
+      if (!r.ok || !r.data || r.data.mode !== 'projects') {
+        projectCard.style.display = 'none';
+        state.mode = 'workspace';
+        return;
+      }
+      state.mode = 'projects';
+      state.projects = r.data.projects || [];
+      state.previewPort = r.data.projects.length ? r.data.projects[0].previewPort : state.previewPort;
+      projectCard.style.display = 'block';
+      modeLabel.textContent = state.projects.length + ' 个项目';
+      if (!state.selected && state.projects.length) state.selected = state.projects[0].id;
+      if (state.selected && !state.projects.some(function (p) { return p.id === state.selected; })) {
+        state.selected = state.projects.length ? state.projects[0].id : null;
+      }
+      projectSelect.innerHTML = state.projects.map(function (p) {
+        return '<option value="' + esc(p.id) + '"' + (p.id === state.selected ? ' selected' : '') + '>' +
+          esc(p.name || p.id) + ' · ' + esc(p.kind) + '</option>';
+      }).join('') || '<option value="">（无项目）</option>';
+    }).catch(function () {});
   }
 
   function poll() {
-    if (polling || !authed) return;
+    if (polling || !state.authed) return;
     polling = true;
     Promise.all([
       fetchJson('/status').then(function (r) {
@@ -707,35 +414,21 @@
         setConn(true);
         renderStatus(r.data);
       }),
-      fetchJson('/artifact').then(renderArtifact).catch(function () {}),
+      loadArtifact(),
       loadTasks()
     ]).catch(function () {
-      if (authed) setConn(false);
-    }).then(function () {
-      polling = false;
-    });
+      if (state.authed) setConn(false);
+    }).then(function () { polling = false; });
   }
-
-  function startPolling() {
-    if (timer) return;
-    poll();
-    timer = setInterval(poll, POLL_MS);
-  }
-  function stopPolling() {
-    if (timer) { clearInterval(timer); timer = null; }
-  }
+  function startPolling() { if (timer) return; poll(); timer = setInterval(poll, POLL_MS); }
+  function stopPolling() { if (timer) { clearInterval(timer); timer = null; } }
   document.addEventListener('visibilitychange', function () {
-    if (document.hidden) stopPolling(); else if (authed) startPolling();
+    if (document.hidden) stopPolling(); else if (state.authed) startPolling();
   });
 
-  // ---- 登录 ----
   function login() {
     var token = tokenInput.value.trim();
-    if (!token) {
-      gateErr.textContent = '请输入 REMOTE_TOKEN';
-      gateErr.classList.add('show');
-      return;
-    }
+    if (!token) { gateErr.textContent = '请输入 REMOTE_TOKEN'; gateErr.classList.add('show'); return; }
     loginBtn.disabled = true;
     loginBtn.textContent = '验证中…';
     fetchJson('/auth/verify', {
@@ -745,15 +438,14 @@
     }).then(function (r) {
       if (r.ok && r.data.ok) {
         tokenInput.value = '';
-        gateErr.classList.remove('show');
         hideGate();
-        startPolling();
-      } else {
-        gateErr.textContent = r.status === 503
-          ? '桌面端未配置 REMOTE_TOKEN，远程控制已禁用'
-          : (r.status === 429 ? '尝试过于频繁，请稍后再试' : '令牌无效');
-        gateErr.classList.add('show');
+        return loadProjects().then(function () { startPolling(); });
       }
+      gateErr.textContent = r.status === 503 ? '桌面端未配置 REMOTE_TOKEN，远程控制已禁用'
+        : r.status === 429 ? '尝试过于频繁，请稍后再试'
+        : r.status === 403 ? '请求来源被拒绝（Origin 校验）'
+        : '令牌无效';
+      gateErr.classList.add('show');
     }).catch(function () {
       gateErr.textContent = '无法连接桌面端服务';
       gateErr.classList.add('show');
@@ -763,24 +455,18 @@
     });
   }
   loginBtn.addEventListener('click', login);
-  tokenInput.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') { e.preventDefault(); login(); }
-  });
+  tokenInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); login(); } });
 
-  // ---- “已发送” 提示 ----
   function showSent(text) {
     sentText.textContent = text || '已发送';
     sentBanner.classList.add('show');
     if (sentTimer) clearTimeout(sentTimer);
     sentTimer = setTimeout(function () { sentBanner.classList.remove('show'); }, 5000);
   }
-
-  // ---- 发送指令 ----
   function updateSendState() {
-    sendBtn.disabled = !authed || sendBtn.classList.contains('loading') || !input.value.trim();
+    sendBtn.disabled = !state.authed || sendBtn.classList.contains('loading') || !input.value.trim();
   }
   input.addEventListener('input', updateSendState);
-
   function showSendErr(msg) {
     sendErr.textContent = msg;
     sendErr.classList.add('show');
@@ -789,14 +475,16 @@
 
   function send() {
     var text = input.value.trim();
-    if (!text || !authed || sendBtn.classList.contains('loading')) return;
+    if (!text || !state.authed || sendBtn.classList.contains('loading')) return;
     sendBtn.classList.add('loading');
     sendLabel.textContent = '发送中…';
     updateSendState();
+    var payload = { text: text };
+    if (state.selected) payload.projectId = state.selected;
     fetchJson('/prompt', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text })
+      body: JSON.stringify(payload)
     }).then(function (r) {
       if ((r.ok && r.data.ok) || r.status === 202) {
         input.value = '';
@@ -827,7 +515,6 @@
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
   });
 
-  // ---- 快捷指令 ----
   $('chips').addEventListener('click', function (e) {
     var chip = e.target.closest('.chip');
     if (!chip) return;
@@ -836,8 +523,49 @@
     input.focus();
   });
 
-  // ---- 任务展开 ----
+  function loadDiff(taskId, projectId, seq) {
+    var item = taskList.querySelector('.task-item[data-id="' + taskId + '"]');
+    if (!item) return;
+    var detail = item.querySelector('.task-detail');
+    detail.textContent += '\n--- diff ---\n加载中…';
+    fetchJson('/projects/' + encodeURIComponent(projectId) + '/diff?from=' + seq + '&to=current')
+      .then(function (r) {
+        detail.textContent = detail.textContent.replace('\n--- diff ---\n加载中…', '');
+        if (!r.ok) { detail.textContent += '\n(diff 获取失败: ' + (r.data.error || r.status) + ')'; return; }
+        detail.textContent += '\n--- diff ---\n' +
+          'added=' + r.data.counts.added + ' modified=' + r.data.counts.modified +
+          ' removed=' + r.data.counts.removed + (r.data.truncated ? ' (truncated)' : '') +
+          '\n' + (r.data.patch || '(无文本差异)');
+      })
+      .catch(function (e) { detail.textContent += '\n(diff 获取失败: ' + e.message + ')'; });
+  }
+
+  function doRollback(taskId, projectId, seq) {
+    var ok = window.confirm('回退到任务 ' + taskId + ' 执行前的快照 #' + seq + '？\n系统会先备份当前状态。');
+    if (!ok) return;
+    fetchJson('/projects/' + encodeURIComponent(projectId) + '/rollback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ seq: Number(seq) })
+    }).then(function (r) {
+      if (r.ok) {
+        showSent('已回退，备份快照 #' + r.data.backupSeq + (r.data.verified ? '，哈希校验通过' : ''));
+        loadTasks(); loadArtifact();
+      } else {
+        showSendErr('回退失败：' + ((r.data && r.data.error) || ('HTTP ' + r.status)));
+      }
+    }).catch(function () { showSendErr('回退失败：无法连接桌面端服务'); });
+  }
+
   taskList.addEventListener('click', function (e) {
+    var actionBtn = e.target.closest('[data-act]');
+    if (actionBtn) {
+      e.stopPropagation();
+      var act = actionBtn.getAttribute('data-act');
+      if (act === 'diff') loadDiff(actionBtn.getAttribute('data-id'), actionBtn.getAttribute('data-project'), actionBtn.getAttribute('data-seq'));
+      if (act === 'rollback') doRollback(actionBtn.getAttribute('data-id'), actionBtn.getAttribute('data-project'), actionBtn.getAttribute('data-seq'));
+      return;
+    }
     var item = e.target.closest('.task-item');
     if (!item) return;
     var id = item.getAttribute('data-id');
@@ -848,22 +576,22 @@
       loadLog(id, reopened);
     });
   });
+
   tasksRefreshBtn.addEventListener('click', function () {
     tasksRefreshBtn.classList.add('spinning');
-    loadTasks().then(function () {
-      setTimeout(function () { tasksRefreshBtn.classList.remove('spinning'); }, 400);
-    });
+    loadTasks().then(function () { setTimeout(function () { tasksRefreshBtn.classList.remove('spinning'); }, 400); });
   });
-
-  // ---- 手动刷新产物 ----
   refreshBtn.addEventListener('click', function () {
     refreshBtn.classList.add('spinning');
-    fetchJson('/artifact').then(renderArtifact).catch(function () {}).then(function () {
-      setTimeout(function () { refreshBtn.classList.remove('spinning'); }, 400);
-    });
+    loadArtifact().then(function () { setTimeout(function () { refreshBtn.classList.remove('spinning'); }, 400); });
   });
+  projectSelect.addEventListener('change', function () {
+    state.selected = projectSelect.value || null;
+    loadArtifact();
+    loadTasks();
+  });
+  projectRefreshBtn.addEventListener('click', function () { loadProjects(); });
 
-  // ---- 启动 ----
   function bootstrap() {
     fetchJson('/health').then(function (r) {
       var data = r.data || {};
@@ -875,20 +603,18 @@
         updateSendState();
         return;
       }
+      state.previewPort = data.previewPort || null;
+      state.mode = data.mode || 'workspace';
       return fetchJson('/status').then(function (s) {
         if (s.ok) {
           hideGate();
-          startPolling();
-        } else {
-          showGate();
+          return loadProjects().then(function () { startPolling(); });
         }
+        showGate();
         updateSendState();
       });
-    }).catch(function () {
-      showGate('无法连接桌面端服务');
-    });
+    }).catch(function () { showGate('无法连接桌面端服务'); });
   }
-
   bootstrap();
 })();
 </script>

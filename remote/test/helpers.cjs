@@ -43,9 +43,11 @@ function freePort() {
 async function startServer(options) {
   const workspace = options.workspace;
   const port = options.port || (await freePort());
+  const previewPort = options.previewPort || (await freePort());
   const env = {
     ...process.env,
     REMOTE_PORT: String(port),
+    PREVIEW_PORT: String(previewPort),
     REMOTE_HOST: '127.0.0.1',
     OPENGAME_WORKSPACE: workspace,
     REMOTE_RATE_LIMIT: '1000',
@@ -53,7 +55,9 @@ async function startServer(options) {
     ...(options.env || {}),
   };
   delete env.REMOTE_TOKEN;
+  delete env.VPLAY_HOME;
   if (options.token) env.REMOTE_TOKEN = options.token;
+  if (options.home) env.VPLAY_HOME = options.home;
 
   const child = spawn(process.execPath, [SERVER, '--port', String(port)], {
     env,
@@ -67,15 +71,19 @@ async function startServer(options) {
       () => reject(new Error(`server did not start:\n${output}`)),
       15000,
     );
-    child.stdout.on('data', (chunk) => {
-      output += chunk.toString();
-      if (output.includes('listening on')) {
+    const check = () => {
+      if (output.includes('listening on') && output.includes('game preview on')) {
         clearTimeout(timeout);
         resolve();
       }
+    };
+    child.stdout.on('data', (chunk) => {
+      output += chunk.toString();
+      check();
     });
     child.stderr.on('data', (chunk) => {
       output += chunk.toString();
+      check();
     });
     child.on('exit', (code) => {
       clearTimeout(timeout);
@@ -87,6 +95,7 @@ async function startServer(options) {
 
   return {
     port,
+    previewPort,
     workspace,
     child,
     output: () => output,

@@ -1,3 +1,4 @@
+/* global document, getComputedStyle */
 'use strict';
 
 /**
@@ -30,6 +31,93 @@ function loadPlaywright() {
     return null;
   }
 }
+
+test('mobile viewport: projects mode selects a project and opens the isolated preview', async (t) => {
+  const playwright = loadPlaywright();
+  if (!playwright) return t.skip('playwright-core is not installed');
+
+  let browser;
+  try {
+    browser = await playwright.chromium.launch({ channel: 'msedge', headless: true });
+  } catch (error) {
+    return t.skip(`headless Edge unavailable: ${error.message}`);
+  }
+
+  const root = makeWorkspace('vplay-mobile-projects-');
+  const home = path.join(root, 'home');
+  const workspace = path.join(root, 'workspace');
+  fs.mkdirSync(workspace, { recursive: true });
+
+  const source = path.join(root, 'source');
+  fs.mkdirSync(source, { recursive: true });
+  fs.writeFileSync(
+    path.join(source, 'index.html'),
+    '<style>:root{--bg: #101014}</style><h1>Projects Mode Game</h1>',
+    'utf-8',
+  );
+
+  const { createProjectRegistry } = require('../lib/projects.cjs');
+  createProjectRegistry({ home }).importProject({ sourceDir: source, id: 'demo-game', name: 'Demo Game' });
+
+  const server = await startServer({
+    workspace,
+    home,
+    token: TOKEN,
+    env: { REMOTE_EXECUTOR_CMD: EXECUTOR },
+  });
+
+  try {
+    const context = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      deviceScaleFactor: 3,
+      isMobile: true,
+      hasTouch: true,
+    });
+    const page = await context.newPage();
+    await page.goto(`http://127.0.0.1:${server.port}/console`, { waitUntil: 'domcontentloaded' });
+
+    await page.waitForSelector('#gate.show', { timeout: 15000 });
+    await page.fill('#tokenInput', TOKEN);
+    await page.click('#loginBtn');
+    await page.waitForSelector('#gate.show', { state: 'hidden', timeout: 15000 });
+
+    // 项目选择器可见，且只有导入的那个项目
+    await page.waitForSelector('#projectCard', { state: 'visible', timeout: 15000 });
+    const options = await page.$$eval('#projectSelect option', (nodes) =>
+      nodes.map((n) => ({ value: n.value, text: n.textContent })),
+    );
+    assert.equal(options.length, 1);
+    assert.equal(options[0].value, 'demo-game');
+
+    await page.fill('#promptInput', 'BACKGROUND mobile project task');
+    await page.waitForFunction(() => !document.getElementById('sendBtn')?.disabled);
+    await page.click('#sendBtn');
+
+    await page.waitForSelector('.task-badge[data-s="succeeded"]', { timeout: 30000 });
+    await page.click('.task-item');
+    const detail = await page.textContent('.task-detail');
+    assert.match(detail, /demo-game/);
+
+    await page.waitForSelector('#artifactReady.show', { timeout: 15000 });
+    const href = await page.getAttribute('#artifactLink', 'href');
+    assert.match(href, new RegExp(`:${server.previewPort}/p/demo-game/$`));
+
+    const game = await page.goto(`http://127.0.0.1:${server.previewPort}/p/demo-game/`, {
+      waitUntil: 'domcontentloaded',
+    });
+    assert.equal(game.status(), 200);
+    const bg = await page.evaluate(() =>
+      getComputedStyle(document.documentElement).getPropertyValue('--bg').trim(),
+    );
+    assert.equal(bg, '#7c3aed');
+
+    await context.close();
+  } finally {
+    await server.stop();
+    await browser.close();
+    removeWorkspace(root);
+  }
+});
 
 test('mobile viewport: login, send a task, see progress and result', async (t) => {
   const playwright = loadPlaywright();
@@ -111,16 +199,16 @@ test('mobile viewport: login, send a task, see progress and result', async (t) =
     await page.waitForSelector('.task-badge[data-s="succeeded"]', { timeout: 30000 });
     await page.click('.task-item');
     const detail = await page.textContent('.task-detail');
-    assert.match(detail, /post-verify|产物/);
+    assert.match(detail, /验证: (通过|未通过)/);
 
-    // 6. The artifact card must be visible with a same-origin link.
+    // 6. The artifact card must be visible and point at the preview origin.
     await page.waitForSelector('#artifactReady.show', { timeout: 15000 });
     const href = await page.getAttribute('#artifactLink', 'href');
-    assert.match(href, /\/game\/index\.html$/);
+    assert.match(href, new RegExp(`:${server.previewPort}/legacy/$`));
     await page.screenshot({ path: path.join(SHOTS, '02-done.png'), fullPage: true });
 
-    // 7. The generated game is reachable with the session cookie.
-    const game = await page.goto(`http://127.0.0.1:${server.port}/game/index.html`, {
+    // 7. The generated game is reachable on the isolated preview origin.
+    const game = await page.goto(`http://127.0.0.1:${server.previewPort}/legacy/index.html`, {
       waitUntil: 'domcontentloaded',
     });
     assert.equal(game.status(), 200);

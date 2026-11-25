@@ -166,6 +166,10 @@ function createTaskStore(options) {
     const idempotencyKey = normalizeIdempotencyKey(
       input && input.idempotencyKey,
     );
+    const projectId =
+      typeof (input && input.projectId) === 'string' && input.projectId
+        ? input.projectId
+        : 'default';
 
     if (idempotencyKey) {
       const byKey = tasks.find(
@@ -178,6 +182,7 @@ function createTaskStore(options) {
     const sameText = tasks.find(
       (task) =>
         (task.status === 'queued' || task.status === 'running') &&
+        (task.projectId || 'default') === projectId &&
         compactText(task.text || '') === fingerprint,
     );
     if (sameText) throw new DuplicateTaskError(sameText);
@@ -186,6 +191,7 @@ function createTaskStore(options) {
     const id = newTaskId();
     const task = {
       id,
+      projectId,
       text,
       idempotencyKey,
       source: (input && input.source) || 'remote',

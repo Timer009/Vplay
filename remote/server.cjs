@@ -2,36 +2,36 @@
 'use strict';
 
 /**
- * Vplay remote bridge.
+ * Vplay Studio 远程控制面（Sprint 02）。
  *
- * Security model
- * --------------
- * - Authentication happens ONLY at the HTTP layer (REMOTE_TOKEN).
- *   No text inside a prompt can ever grant trust.
- * - If REMOTE_TOKEN is not configured, every control endpoint is disabled (503).
- * - The token is read from the environment (or REMOTE_TOKEN_FILE) and is never
- *   logged, never written to disk by this process, and never committed.
- * - Listens on 127.0.0.1 by default. REMOTE_HOST=0.0.0.0 must be explicit.
+ * 安全模型
+ * --------
+ * - 鉴权只在 HTTP 层（REMOTE_TOKEN）；未配置时控制接口全部 503。
+ * - 写接口额外做 Origin 校验：跨源页面（例如 8788 端口的游戏预览）无法借
+ *   同站 Cookie 调用管理 API。
+ * - 游戏预览在独立端口 + 独立进程，只读静态文件，不含任何管理接口。
+ * - 所有项目只能用 projectId 引用；HTTP 不接受系统路径。
  *
- * Task model
- * ----------
- * POST /prompt creates a durable task. A serial worker spawns
- * `dist/cli.js -p "<text>" --yolo` — i.e. the task arrives as a normal user
- * message, not as injected "[REMOTE INSTRUCTIONS]" text.
+ * 两种模式
+ * --------
+ * - 单工作区模式（默认）：沿用 Sprint 01，任务写入 OPENGAME_WORKSPACE。
+ * - 项目模式（设置 VPLAY_HOME）：Adopt Mode，任务按 projectId 映射到受控工作区，
+ *   每次执行前自动快照，可查看差异 / 回退。
  *
- * Endpoints
- * ---------
- *   GET  /health              public   service status
- *   GET  /console             public   mobile console (remote/index.html)
- *   POST /auth/verify         public   exchange token for a session cookie
- *   POST /auth/logout         public   clear the session cookie
- *   GET  /status              auth     { phase, message, activeTaskId }
- *   GET  /tasks               auth     recent tasks
- *   GET  /tasks/:id           auth     one task
- *   GET  /tasks/:id/log       auth     captured CLI log (tail)
- *   POST /prompt              auth     enqueue { text, idempotencyKey? }
- *   GET  /artifact            auth     latest game entry point
- *   GET  /game/*              auth     static files of the game workspace
+ * 端点
+ * ----
+ *   GET  /health                     公开
+ *   GET  /console                    公开（页面本身）
+ *   POST /auth/verify                公开（Origin 校验）
+ *   POST /auth/logout                公开
+ *   GET  /status                     鉴权
+ *   GET  /tasks, /tasks/:id, /tasks/:id/log
+ *   POST /prompt                     鉴权 + Origin 校验
+ *   GET  /artifact                   鉴权
+ *   GET  /projects, /projects/:id    鉴权
+ *   GET  /projects/:id/diff          鉴权
+ *   POST /projects/:id/rollback      鉴权 + Origin 校验
+ *   POST /projects/import            明确禁止（导入只能走本地 CLI）
  */
 
 const http = require('http');
@@ -41,31 +41,13 @@ const crypto = require('crypto');
 
 const { createTaskStore, ValidationError, DuplicateTaskError } = require('./lib/tasks.cjs');
 const { createWorker } = require('./lib/worker.cjs');
+const { createProjectRegistry, ProjectError } = require('./lib/projects.cjs');
+const { createPreviewServer } = require('./lib/preview.cjs');
+const { recoverStaleLeases } = require('./lib/leases.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
 const COOKIE_NAME = 'vplay_remote';
-
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.mjs': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.webp': 'image/webp',
-  '.gif': 'image/gif',
-  '.svg': 'image/svg+xml',
-  '.mp3': 'audio/mpeg',
-  '.ogg': 'audio/ogg',
-  '.wav': 'audio/wav',
-  '.ico': 'image/x-icon',
-  '.map': 'application/json; charset=utf-8',
-  '.glb': 'model/gltf-binary',
-  '.gltf': 'model/gltf+json',
-};
 
 function readFlag(argv, name) {
   const index = argv.indexOf(`--${name}`);
@@ -74,7 +56,6 @@ function readFlag(argv, name) {
 
 function resolveToken() {
   if (process.argv.slice(2).includes('--token')) {
-    // A token on the command line leaks via the process list.
     throw new Error('Do not pass --token on the command line. Use REMOTE_TOKEN.');
   }
   const direct = (process.env.REMOTE_TOKEN || '').trim();
@@ -97,25 +78,45 @@ const HOST = readFlag(argv, 'host') || process.env.REMOTE_HOST || '127.0.0.1';
 const WORKSPACE = path.resolve(
   readFlag(argv, 'workspace') || process.env.OPENGAME_WORKSPACE || process.cwd(),
 );
-const RUNTIME_DIR = path.join(WORKSPACE, '.opengame');
-const AUTHORUN = process.env.REMOTE_AUTORUN !== '0';
-const TASK_TIMEOUT_MS = Number(
-  process.env.REMOTE_TASK_TIMEOUT_MS || 15 * 60 * 1000,
+const PREVIEW_PORT = Number(
+  process.env.PREVIEW_PORT || (PORT === 0 ? 8788 : PORT + 1),
 );
+const PUBLIC_MODE = process.env.VPLAY_PUBLIC_MODE === '1';
+const AUTHORUN = process.env.REMOTE_AUTORUN !== '0';
+const TASK_TIMEOUT_MS = Number(process.env.REMOTE_TASK_TIMEOUT_MS || 15 * 60 * 1000);
 const RATE_LIMIT = Number(process.env.REMOTE_RATE_LIMIT || 10);
 const RATE_WINDOW_MS = 60 * 1000;
 
 const { token: TOKEN, source: TOKEN_SOURCE } = resolveToken();
 const REMOTE_ENABLED = Boolean(TOKEN);
 
-const store = createTaskStore({ runtimeDir: RUNTIME_DIR, workspaceDir: WORKSPACE });
+const projects = process.env.VPLAY_HOME
+  ? createProjectRegistry({ home: process.env.VPLAY_HOME })
+  : null;
+const RUNTIME_ROOT = projects ? projects.home : WORKSPACE;
+const RUNTIME_DIR = projects
+  ? path.join(projects.home, '.opengame')
+  : path.join(WORKSPACE, '.opengame');
+
+const store = createTaskStore({ runtimeDir: RUNTIME_DIR, workspaceDir: RUNTIME_ROOT });
 
 const worker = createWorker({
   store,
+  projects,
   workspaceDir: WORKSPACE,
+  runtimeDir: RUNTIME_DIR,
   cliPath: CLI_PATH,
   executorScript: process.env.REMOTE_EXECUTOR_CMD || null,
   timeoutMs: TASK_TIMEOUT_MS,
+  publicMode: PUBLIC_MODE,
+  allowYolo: process.env.VPLAY_ALLOW_YOLO !== '0',
+  logger: (line) => console.log(line),
+});
+
+const previewServer = createPreviewServer({
+  projects,
+  // 项目模式只暴露受控项目；绝不把仓库根目录当成 legacy 预览根
+  legacyRoot: projects ? null : WORKSPACE,
   logger: (line) => console.log(line),
 });
 
@@ -152,12 +153,28 @@ function credentialFrom(req) {
   }
   const header = req.headers['x-remote-token'];
   if (typeof header === 'string' && header.trim()) return header.trim();
-  const cookies = parseCookies(req);
-  return cookies[COOKIE_NAME] || '';
+  return parseCookies(req)[COOKIE_NAME] || '';
 }
 
 function isAuthed(req) {
   return tokenMatches(credentialFrom(req));
+}
+
+/**
+ * Origin 校验：有 Origin 头时必须与控制面同源。
+ * 这样 8788 端口的游戏页即使同站带 Cookie，也无法调用管理 API。
+ */
+function originAllowed(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // curl / 脚本调用
+  const host = req.headers.host;
+  if (!host) return false;
+  try {
+    const parsed = new URL(origin);
+    return parsed.host === host;
+  } catch {
+    return false;
+  }
 }
 
 function commonHeaders(extra) {
@@ -199,12 +216,10 @@ function deny(res, req) {
     sendJson(res, 503, {
       ok: false,
       error: 'remote control is disabled',
-      detail:
-        'REMOTE_TOKEN is not configured. Set it in the environment and restart the server.',
+      detail: 'REMOTE_TOKEN is not configured. Set it in the environment and restart the server.',
     });
     return;
   }
-  // Do not leak whether the token was missing, wrong, or malformed.
   console.warn(`[remote] unauthorized ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
   sendJson(res, 401, { ok: false, error: 'unauthorized' });
 }
@@ -258,58 +273,82 @@ function computeStatus() {
       phase: active.status === 'verifying' ? 'verifying' : 'generating',
       message: `[${active.id}] ${active.text.slice(0, 160)}`,
       activeTaskId: active.id,
+      projectId: active.projectId || null,
       updatedAt: active.updatedAt,
     };
   }
   const tasks = store.list();
   const last = tasks[tasks.length - 1];
-  if (last && (last.status === 'succeeded' || last.status === 'failed' || last.status === 'interrupted')) {
+  if (
+    last &&
+    (last.status === 'succeeded' || last.status === 'failed' || last.status === 'interrupted')
+  ) {
     const detail = last.error ? `: ${last.error.message}` : '';
     return {
       phase: 'done',
       message: `${last.id} ${last.status}${detail}`,
       lastTaskId: last.id,
+      projectId: last.projectId || null,
       updatedAt: last.updatedAt,
     };
   }
-  return { phase: 'idle', message: 'no generation started yet' };
+  return { phase: 'idle', message: 'no generation started yet', projectId: null };
 }
 
-function latestArtifact() {
-  const tasks = store.list().reverse();
-  for (const task of tasks) {
-    if (task.status === 'succeeded' && task.result?.artifactIndexHtml) {
-      return { indexHtml: task.result.artifactIndexHtml, taskId: task.id };
-    }
-  }
-  const fallback = path.join(WORKSPACE, 'index.html');
-  if (fs.existsSync(fallback)) return { indexHtml: fallback, taskId: null };
-  return null;
+function publicTask(task) {
+  return {
+    id: task.id,
+    projectId: task.projectId || 'default',
+    status: task.status,
+    text: task.text,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    startedAt: task.startedAt,
+    finishedAt: task.finishedAt,
+    snapshotSeq: task.snapshotSeq ?? null,
+    error: task.error,
+    result: task.result
+      ? {
+          exitCode: task.result.exitCode,
+          artifactIndexHtml: task.result.artifactIndexHtml,
+          postVerify: task.result.postVerify,
+          verified: task.result.verified,
+          verification: task.result.verification,
+          changedFiles: task.result.changedFiles,
+          diffSummary: task.result.diffSummary,
+        }
+      : null,
+  };
 }
 
-function serveGameFile(req, res, urlPath) {
-  const relative = decodeURIComponent(urlPath.replace(/^\/game\/?/, '') || 'index.html');
-  const normalized = path.normalize(relative).replace(/^([/\\])+/, '');
-  const target = path.resolve(WORKSPACE, normalized);
-  if (!target.startsWith(path.resolve(WORKSPACE))) {
-    sendJson(res, 403, { ok: false, error: 'forbidden' });
-    return;
+function previewLink(req, projectId) {
+  const hostname = String(req.headers.host || 'localhost').split(':')[0];
+  const previewPath = projectId ? `/p/${projectId}/` : '/legacy/';
+  return {
+    previewPath,
+    previewPort: PREVIEW_PORT,
+    previewUrl: `http://${hostname}:${PREVIEW_PORT}${previewPath}`,
+  };
+}
+
+function projectExists(id) {
+  if (!projects) return id === 'default';
+  try {
+    projects.get(id);
+    return true;
+  } catch {
+    return false;
   }
-  fs.readFile(target, (error, data) => {
-    if (error) {
-      sendJson(res, 404, { ok: false, error: 'not found', path: normalized });
-      return;
-    }
-    res.writeHead(
-      200,
-      commonHeaders({
-        'Content-Type': MIME[path.extname(target).toLowerCase()] || 'application/octet-stream',
-        'Content-Length': data.length,
-        'Cache-Control': 'no-store',
-      }),
-    );
-    res.end(data);
-  });
+}
+
+function resolveRequestedProject(payloadProjectId) {
+  if (projects) {
+    if (payloadProjectId) return String(payloadProjectId);
+    const all = projects.list();
+    if (all.length === 1) return all[0].id;
+    return null;
+  }
+  return 'default';
 }
 
 function serveConsole(res) {
@@ -331,26 +370,6 @@ function serveConsole(res) {
   });
 }
 
-function publicTask(task) {
-  return {
-    id: task.id,
-    status: task.status,
-    text: task.text,
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-    startedAt: task.startedAt,
-    finishedAt: task.finishedAt,
-    error: task.error,
-    result: task.result
-      ? {
-          exitCode: task.result.exitCode,
-          artifactIndexHtml: task.result.artifactIndexHtml,
-          postVerify: task.result.postVerify,
-        }
-      : null,
-  };
-}
-
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname.replace(/\/+$/, '') || '/';
@@ -361,9 +380,12 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, {
         ok: true,
         service: 'vplay-remote',
+        version: 2,
         remoteEnabled: REMOTE_ENABLED,
         authRequired: true,
-        workspace: WORKSPACE,
+        mode: projects ? 'projects' : 'workspace',
+        workspace: projects ? projects.home : WORKSPACE,
+        previewPort: PREVIEW_PORT,
         autorun: AUTHORUN,
         tokenSource: TOKEN_SOURCE,
       });
@@ -372,6 +394,13 @@ const server = http.createServer(async (req, res) => {
 
     if (method === 'GET' && pathname === '/console') {
       serveConsole(res);
+      return;
+    }
+
+    const mutating = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+    if (mutating && !originAllowed(req)) {
+      console.warn(`[remote] origin rejected ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
+      sendJson(res, 403, { ok: false, error: 'cross-origin request rejected' });
       return;
     }
 
@@ -390,7 +419,6 @@ const server = http.createServer(async (req, res) => {
       }
       if (!tokenMatches(candidate)) {
         console.warn(`[remote] failed console login from ${req.socket.remoteAddress}`);
-        // Throttle brute force using the same bucket as /prompt.
         rateLimited(req.socket.remoteAddress || 'unknown');
         sendJson(res, 401, { ok: false, error: 'invalid token' });
         return;
@@ -428,7 +456,10 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/tasks' && method === 'GET') {
       if (!requireAuth(req, res)) return;
       const limit = Math.min(Number(url.searchParams.get('limit') || 20), 50);
-      const tasks = store.list().slice(-limit).reverse().map(publicTask);
+      const projectFilter = url.searchParams.get('projectId');
+      let tasks = store.list();
+      if (projectFilter) tasks = tasks.filter((t) => (t.projectId || 'default') === projectFilter);
+      tasks = tasks.slice(-limit).reverse().map(publicTask);
       sendJson(res, 200, { ok: true, tasks });
       return;
     }
@@ -467,10 +498,7 @@ const server = http.createServer(async (req, res) => {
       }
       const contentType = String(req.headers['content-type'] || '');
       if (!contentType.toLowerCase().includes('application/json')) {
-        sendJson(res, 415, {
-          ok: false,
-          error: 'Content-Type must be application/json',
-        });
+        sendJson(res, 415, { ok: false, error: 'Content-Type must be application/json' });
         return;
       }
       const raw = await readBody(req);
@@ -482,14 +510,29 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 400, { ok: false, error: 'body must be valid JSON' });
         return;
       }
+
+      const projectId = resolveRequestedProject(payload.projectId);
+      if (!projectId) {
+        sendJson(res, 400, {
+          ok: false,
+          error: 'projectId is required when multiple projects exist',
+        });
+        return;
+      }
+      if (!projectExists(projectId)) {
+        sendJson(res, 404, { ok: false, error: `unknown projectId: ${projectId}` });
+        return;
+      }
+
       try {
         const { task, duplicate } = store.create({
           text: payload.text,
           idempotencyKey: payload.idempotencyKey,
           source: 'remote',
+          projectId,
         });
         console.log(
-          `[remote] task ${task.id} ${duplicate ? 'already exists (idempotent)' : 'queued'}`,
+          `[remote] task ${task.id} ${duplicate ? 'already exists (idempotent)' : 'queued'} project=${projectId}`,
         );
         sendJson(res, duplicate ? 200 : 202, {
           ok: true,
@@ -518,28 +561,141 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/artifact' && method === 'GET') {
       if (!requireAuth(req, res)) return;
-      const artifact = latestArtifact();
-      if (!artifact) {
-        sendJson(res, 404, { ok: false, error: 'no generated index.html yet' });
+      const projectId = url.searchParams.get('projectId') || (projects ? null : 'default');
+      if (projects && !projectId) {
+        const all = projects.list();
+        sendJson(res, 200, {
+          ok: true,
+          mode: 'projects',
+          projects: all.map((item) => ({ id: item.id, ...previewLink(req, item.id) })),
+        });
         return;
       }
+      if (projectId && !projectExists(projectId)) {
+        sendJson(res, 404, { ok: false, error: 'unknown projectId' });
+        return;
+      }
+      const link = previewLink(req, projects ? projectId : null);
       sendJson(res, 200, {
         ok: true,
-        workspace: WORKSPACE,
-        indexHtml: artifact.indexHtml,
-        taskId: artifact.taskId,
-        url: '/game/index.html',
+        projectId,
+        workspace: projects ? null : WORKSPACE,
+        ...link,
       });
       return;
     }
 
-    if (pathname === '/game' || pathname.startsWith('/game/')) {
-      if (method !== 'GET' && method !== 'HEAD') {
-        sendJson(res, 405, { ok: false, error: 'method not allowed' });
+    if (pathname === '/projects/import') {
+      sendJson(res, 403, {
+        ok: false,
+        error: 'import is disabled over HTTP',
+        detail: '使用本地命令：node remote/cli.cjs project import <path> --id <id>',
+      });
+      return;
+    }
+
+    if (pathname === '/projects' && method === 'GET') {
+      if (!requireAuth(req, res)) return;
+      if (!projects) {
+        sendJson(res, 200, { ok: true, mode: 'workspace', projects: [] });
         return;
       }
+      const items = projects.list().map((item) => ({
+        id: item.id,
+        name: item.name,
+        kind: item.kind,
+        framework: item.framework,
+        entry: item.entry,
+        createdAt: item.createdAt,
+        locked: item.locked,
+        rounds: projects.memory(item.id).rounds.length,
+        ...previewLink(req, item.id),
+      }));
+      sendJson(res, 200, { ok: true, mode: 'projects', projects: items });
+      return;
+    }
+
+    if (pathname.startsWith('/projects/') && method === 'GET') {
       if (!requireAuth(req, res)) return;
-      serveGameFile(req, res, pathname);
+      if (!projects) {
+        sendJson(res, 404, { ok: false, error: 'projects mode is not enabled' });
+        return;
+      }
+      const rest = pathname.slice('/projects/'.length).split('/');
+      const projectId = rest[0];
+      try {
+        const detail = projects.get(projectId);
+        if (rest[1] === 'diff') {
+          const from = Number(url.searchParams.get('from'));
+          const toParam = url.searchParams.get('to');
+          const to = !toParam || toParam === 'current' ? 'current' : Number(toParam);
+          if (!Number.isFinite(from) || from <= 0) {
+            sendJson(res, 400, { ok: false, error: 'from must be a snapshot seq' });
+            return;
+          }
+          sendJson(res, 200, { ok: true, ...projects.diff(projectId, from, to) });
+          return;
+        }
+        if (rest[1]) {
+          sendJson(res, 404, { ok: false, error: 'unknown project action' });
+          return;
+        }
+        sendJson(res, 200, {
+          ok: true,
+          project: {
+            ...detail,
+            ...previewLink(req, projectId),
+          },
+        });
+      } catch (error) {
+        if (error instanceof ProjectError) {
+          sendJson(res, error.statusCode, { ok: false, error: error.message, code: error.code });
+          return;
+        }
+        throw error;
+      }
+      return;
+    }
+
+    if (pathname.startsWith('/projects/') && pathname.endsWith('/rollback') && method === 'POST') {
+      if (!requireAuth(req, res)) return;
+      if (!projects) {
+        sendJson(res, 404, { ok: false, error: 'projects mode is not enabled' });
+        return;
+      }
+      const projectId = pathname.split('/')[2];
+      const active = store.activeTask();
+      if (active && (active.projectId || 'default') === projectId) {
+        sendJson(res, 409, {
+          ok: false,
+          error: 'task is running for this project; rollback is not allowed',
+          taskId: active.id,
+        });
+        return;
+      }
+      const raw = await readBody(req);
+      if (raw === null) return;
+      let seq;
+      try {
+        seq = Number(JSON.parse(raw || '{}').seq);
+      } catch {
+        seq = NaN;
+      }
+      if (!Number.isFinite(seq) || seq <= 0) {
+        sendJson(res, 400, { ok: false, error: 'body must be { "seq": <snapshot number> }' });
+        return;
+      }
+      try {
+        const result = projects.rollback(projectId, seq);
+        console.log(`[remote] project ${projectId} rolled back to #${seq} (backup #${result.backupSeq})`);
+        sendJson(res, 200, { ok: true, ...result });
+      } catch (error) {
+        if (error instanceof ProjectError) {
+          sendJson(res, error.statusCode, { ok: false, error: error.message, code: error.code });
+          return;
+        }
+        throw error;
+      }
       return;
     }
 
@@ -550,17 +706,29 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ---- 启动 ----
 const recovered = store.recoverOnStartup();
 if (recovered.length > 0) {
   console.log(
     `[remote] marked ${recovered.length} interrupted task(s) from a previous run: ${recovered.join(', ')}`,
   );
 }
+const leaseActions = recoverStaleLeases({
+  leasesDir: path.join(RUNTIME_DIR, 'leases'),
+  maxAgeMs: Number(process.env.VPLAY_LEASE_MAX_AGE_MS || 15000),
+  logger: (line) => console.log(line),
+});
+const killed = leaseActions.filter((item) => item.action.startsWith('killed'));
+if (killed.length > 0) {
+  console.log(`[remote] reaped ${killed.length} orphan process(es) from a previous run`);
+}
 
 server.listen(PORT, HOST, () => {
   console.log(`[remote] Vplay remote bridge listening on http://${HOST}:${PORT}`);
-  console.log(`[remote] workspace: ${WORKSPACE}`);
+  console.log(`[remote] mode: ${projects ? `projects (${projects.home})` : 'workspace'}`);
+  console.log(`[remote] workspace: ${projects ? projects.home : WORKSPACE}`);
   console.log(`[remote] cli: ${CLI_PATH}`);
+  console.log(`[remote] public mode: ${PUBLIC_MODE ? 'yes (yolo disabled)' : 'no'}`);
   if (!REMOTE_ENABLED) {
     console.warn(
       '[remote] REMOTE_TOKEN is not set — remote control is DISABLED (all control endpoints return 503).',
@@ -569,22 +737,28 @@ server.listen(PORT, HOST, () => {
     console.log(`[remote] authentication enabled (token source: ${TOKEN_SOURCE})`);
   }
   if (HOST === '0.0.0.0' || HOST === '::') {
-    console.warn(
-      '[remote] WARNING: bound to all interfaces. Only do this on a trusted network.',
-    );
+    console.warn('[remote] WARNING: bound to all interfaces. Only do this on a trusted network.');
   }
   if (AUTHORUN) {
     console.log(`[remote] serial worker enabled (timeout ${TASK_TIMEOUT_MS}ms)`);
   } else {
     console.log('[remote] serial worker disabled (REMOTE_AUTORUN=0)');
   }
-  console.log('[remote] GET /console | /status | /tasks | /artifact | POST /prompt');
   if (AUTHORUN) worker.start();
+
+  previewServer.listen(PREVIEW_PORT, HOST, () => {
+    console.log(`[preview] game preview on http://${HOST}:${PREVIEW_PORT} (read-only, no control API)`);
+  });
 });
 
 function shutdown(signal) {
   console.log(`[remote] ${signal} received, shutting down`);
   worker.stop();
+  try {
+    previewServer.close();
+  } catch {
+    // 忽略
+  }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
 }

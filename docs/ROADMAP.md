@@ -1,40 +1,43 @@
 # Vplay Studio · 路线图
 
 目标：NVIDIA DGX Spark「最佳 AI 原生游戏创作工具」。
-排序原则：优先做**不需要图像/视频 Key** 也能提升体验的部分。
+排序原则：优先做不需要图像/视频 Key 也能提升体验的部分。
 
-## Sprint 01（当前）— 安全远程任务通道
+## Sprint 01（已完成，真机 13/13）
 
-- [x] 项目接管、分支与文档基线
-- [x] 诊断远程任务阻塞的四类原因并留证据
-- [x] `REMOTE_TOKEN` 鉴权；未配置即禁用远程控制
-- [x] 任务 ID / 状态机 / 参数校验 / 去重 / 串行 / 持久化
-- [x] 重启不重放历史任务（running → interrupted）
-- [x] 移动端控制台适配鉴权与任务状态
-- [x] 本机 HTTP + 移动端视口模拟验收（非真机）
-- [ ] 真机局域网验收（阻塞：用户不在家，需人工执行）
+- [x] 远程任务通道：Token 鉴权、任务 ID/状态机/去重/串行/持久化
+- [x] 删除 `[REMOTE INSTRUCTIONS]` 文本注入，改走正式 `-p` 用户消息入口
+- [x] iPhone Safari + OPPO Android 真机验收（2026-11-26）
+- [x] 独立安全审计启动（进行中）
 
-## Sprint 02（建议）— 生成质量与可解释性
+## Sprint 02（当前）— Project Adoption & Continuity
 
-- 生成过程结构化事件（planning → coding → verifying），供手机端逐步展示
-- 失败任务的自动重试策略（仅对可重试错误，例如网络 5xx）
-- PostVerify 规则扩充：`assets/` 目录约定、`gameConfig.json` schema 校验
-- 生成产物截图（无图像 Key 时用 Canvas 占位渲染）
+- [x] 基线归档：tag `sprint-01-accepted`，Sprint 01 真机结论入档
+- [x] 孤儿 CLI 进程收敛（runner 看门狗 + 租约回收）
+- [x] 项目锁，防止旧任务与新任务同写一个工作区
+- [x] 工作区隔离：游戏工作区 / Vplay 源码 / 系统目录
+- [x] 预览硬化：点文件、路径穿越、symlink/junction 逃逸
+- [x] 预览面与控制面分源，写接口 Origin 校验
+- [x] 禁止公开模式无约束 `--yolo`
+- [x] Adopt Mode：导入静态 / 子目录入口 / Vite 工程，禁止 HTTP 传路径
+- [x] 快照 / 差异 / 回退（回退前备份，不碰 git reset --hard）
+- [x] 项目画像、项目记忆、连续多轮
+- [x] Spacer 实战：两轮真实修改 + 两轮回退 + 哈希还原
+- [x] Vite 最小工程：真实构建 + dist 预览
+- [ ] Sprint 02 真机验收（待产品负责人执行，步骤见报告）
+- [ ] 独立安全审计结论合并（Qoder，进行中）
 
-## Sprint 03（建议）— 模板与 Skill 生态
+## Sprint 03（建议）
 
-- 模板库扩充（平台跳跃、塔防、解谜），每个模板附最小可玩 demo
-- Debug Skill 规则库与 PostVerify 共用一份 `protocol.json`
-- Game Skill 的自动评测：可玩性/帧率/输入响应
-
-## Sprint 04（建议）— 跨互联网协同（评估为主）
-
-- 评估成熟安全组网（Tailscale / Cloudflare Tunnel / WireGuard）作为传输层
-- 传输层可替换：远程通道只依赖「带 Bearer Token 的 HTTP」，不绑定局域网
-- **不在仓库内自建公网 Relay，不修改防火墙/代理**
+1. **生成过程结构化事件**：把 planning / coding / verifying 作为事件流推给手机端。
+2. **Vite 构建托管**：在受控沙箱内执行 `npm run build`，避免在用户工程直接跑脚本。
+3. **多模态接入**：图像/音频 Key 就绪后接回素材生成（其他 Agent 独立研究）。
+4. **扩散式回退**：支持按文件回退，而不只是整快照回退。
+5. **跨互联网**：接入成熟组网方案（Tailscale / Cloudflare Tunnel），本仓库不自建 Relay。
 
 ## 非目标
 
 - 不做多租户 SaaS
 - 不内置公网暴露
-- 不伪造图像/音频能力
+- 不伪造图像 / 音频能力
+- 不在用户工程里执行 `git reset --hard` / `git clean -fd`
