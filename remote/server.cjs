@@ -40,14 +40,18 @@ const path = require('path');
 const crypto = require('crypto');
 
 const { createTaskStore, ValidationError, DuplicateTaskError } = require('./lib/tasks.cjs');
-const { createWorker } = require('./lib/worker.cjs');
+const { createWorker, resolveExecutorScript } = require('./lib/worker.cjs');
 const { createProjectRegistry, ProjectError } = require('./lib/projects.cjs');
 const { createPreviewServer } = require('./lib/preview.cjs');
 const { recoverStaleLeases } = require('./lib/leases.cjs');
+const { copyPreviewTree } = require('./lib/paths.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
-const COOKIE_NAME = 'vplay_remote';
+const COOKIE_NAME = 'vplay_session';
+const SESSION_TTL_MS = 4 * 60 * 60 * 1000;
+const SESSION_IDLE_MS = 2 * 60 * 60 * 1000;
+const MAX_SESSIONS = 20;
 
 function readFlag(argv, name) {
   const index = argv.indexOf(`--${name}`);
@@ -81,10 +85,12 @@ const WORKSPACE = path.resolve(
 const PREVIEW_PORT = Number(
   process.env.PREVIEW_PORT || (PORT === 0 ? 8788 : PORT + 1),
 );
-const PUBLIC_MODE = process.env.VPLAY_PUBLIC_MODE === '1';
+const PUBLIC_MODE =
+  process.env.VPLAY_PUBLIC_MODE === '1' || HOST === '0.0.0.0' || HOST === '::';
 const AUTHORUN = process.env.REMOTE_AUTORUN !== '0';
 const TASK_TIMEOUT_MS = Number(process.env.REMOTE_TASK_TIMEOUT_MS || 15 * 60 * 1000);
-const RATE_LIMIT = Number(process.env.REMOTE_RATE_LIMIT || 10);
+const PROMPT_RATE_LIMIT = Number(process.env.REMOTE_RATE_LIMIT || 10);
+const LOGIN_RATE_LIMIT = Number(process.env.REMOTE_LOGIN_RATE_LIMIT || 10);
 const RATE_WINDOW_MS = 60 * 1000;
 
 const { token: TOKEN, source: TOKEN_SOURCE } = resolveToken();
@@ -98,7 +104,11 @@ const RUNTIME_DIR = projects
   ? path.join(projects.home, '.opengame')
   : path.join(WORKSPACE, '.opengame');
 
-const store = createTaskStore({ runtimeDir: RUNTIME_DIR, workspaceDir: RUNTIME_ROOT });
+const store = createTaskStore({
+  runtimeDir: RUNTIME_DIR,
+  workspaceDir: RUNTIME_ROOT,
+  redactSecrets: TOKEN ? [TOKEN] : [],
+});
 
 const worker = createWorker({
   store,
@@ -106,17 +116,41 @@ const worker = createWorker({
   workspaceDir: WORKSPACE,
   runtimeDir: RUNTIME_DIR,
   cliPath: CLI_PATH,
-  executorScript: process.env.REMOTE_EXECUTOR_CMD || null,
+  executorScript: resolveExecutorScript(process.env),
   timeoutMs: TASK_TIMEOUT_MS,
   publicMode: PUBLIC_MODE,
   allowYolo: process.env.VPLAY_ALLOW_YOLO !== '0',
+  secrets: TOKEN ? [TOKEN] : [],
+  onFinished: ({ projectId }) => {
+    try {
+      if (projects) projects.buildPreview(projectId);
+      else rebuildLegacyPreview();
+    } catch {
+      // 预览重建失败不影响任务结果
+    }
+  },
   logger: (line) => console.log(line),
 });
 
+// 单工作区模式：预览只读「独立产物目录」，不直读工作区
+const LEGACY_PREVIEW_DIR = path.join(RUNTIME_DIR, '.preview-legacy');
+
+function rebuildLegacyPreview() {
+  if (projects) return null;
+  try {
+    copyPreviewTree(WORKSPACE, LEGACY_PREVIEW_DIR);
+    return fs.existsSync(path.join(LEGACY_PREVIEW_DIR, 'index.html'))
+      ? LEGACY_PREVIEW_DIR
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 const previewServer = createPreviewServer({
   projects,
-  // 项目模式只暴露受控项目；绝不把仓库根目录当成 legacy 预览根
-  legacyRoot: projects ? null : WORKSPACE,
+  // 单工作区模式也只暴露独立预览产物目录；项目模式只暴露 .preview
+  legacyRoot: projects ? null : LEGACY_PREVIEW_DIR,
   logger: (line) => console.log(line),
 });
 
@@ -128,6 +162,81 @@ function tokenMatches(candidate) {
   if (!REMOTE_ENABLED || typeof candidate !== 'string' || !candidate) return false;
   try {
     return crypto.timingSafeEqual(digest(candidate), digest(TOKEN));
+  } catch {
+    return false;
+  }
+}
+
+// ---- 短期 Session（P1-2）：服务端可吊销，Cookie 值不等于主 Token ----
+const sessions = new Map();
+
+function sessionKey(sessionId) {
+  return crypto.createHash('sha256').update(sessionId).digest('hex');
+}
+
+function pruneSessions() {
+  const now = Date.now();
+  for (const [key, session] of sessions) {
+    if (now - session.createdAt > SESSION_TTL_MS || now - session.lastSeen > SESSION_IDLE_MS) {
+      sessions.delete(key);
+    }
+  }
+  if (sessions.size > MAX_SESSIONS) {
+    const oldest = [...sessions.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+    for (let i = 0; i < sessions.size - MAX_SESSIONS; i += 1) {
+      sessions.delete(oldest[i][0]);
+    }
+  }
+}
+
+function createSession() {
+  pruneSessions();
+  const sessionId = crypto.randomBytes(24).toString('base64url');
+  const now = Date.now();
+  sessions.set(sessionKey(sessionId), { createdAt: now, lastSeen: now });
+  return sessionId;
+}
+
+function validSession(sessionId) {
+  if (!sessionId) return false;
+  const key = sessionKey(sessionId);
+  const session = sessions.get(key);
+  if (!session) return false;
+  const now = Date.now();
+  if (now - session.createdAt > SESSION_TTL_MS || now - session.lastSeen > SESSION_IDLE_MS) {
+    sessions.delete(key);
+    return false;
+  }
+  session.lastSeen = now;
+  return true;
+}
+
+function dropSession(sessionId) {
+  if (sessionId) sessions.delete(sessionKey(sessionId));
+}
+
+// ---- Host / Origin 白名单（P1-3）----
+const ALLOWED_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+if (HOST && HOST !== '0.0.0.0' && HOST !== '::') ALLOWED_HOSTS.add(String(HOST).toLowerCase());
+for (const entry of String(process.env.REMOTE_ALLOWED_HOSTS || '').split(',')) {
+  const value = entry.trim().toLowerCase();
+  if (value) ALLOWED_HOSTS.add(value);
+}
+
+function hostAllowed(req) {
+  const raw = String(req.headers.host || '');
+  const hostname = raw.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
+  return Boolean(hostname) && ALLOWED_HOSTS.has(hostname);
+}
+
+function originAllowed(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // curl / 脚本调用
+  const host = req.headers.host;
+  if (!host) return false;
+  try {
+    const parsed = new URL(origin);
+    return parsed.host === host;
   } catch {
     return false;
   }
@@ -145,7 +254,7 @@ function parseCookies(req) {
   return out;
 }
 
-function credentialFrom(req) {
+function bearerFrom(req) {
   const auth = req.headers.authorization;
   if (typeof auth === 'string') {
     const match = /^Bearer\s+(.+)$/i.exec(auth.trim());
@@ -153,28 +262,22 @@ function credentialFrom(req) {
   }
   const header = req.headers['x-remote-token'];
   if (typeof header === 'string' && header.trim()) return header.trim();
+  return '';
+}
+
+function sessionFrom(req) {
   return parseCookies(req)[COOKIE_NAME] || '';
 }
 
-function isAuthed(req) {
-  return tokenMatches(credentialFrom(req));
+/** 鉴权来源：主 Token（Bearer）或短期 Session（Cookie）。 */
+function authVia(req) {
+  if (tokenMatches(bearerFrom(req))) return 'token';
+  if (validSession(sessionFrom(req))) return 'session';
+  return null;
 }
 
-/**
- * Origin 校验：有 Origin 头时必须与控制面同源。
- * 这样 8788 端口的游戏页即使同站带 Cookie，也无法调用管理 API。
- */
-function originAllowed(req) {
-  const origin = req.headers.origin;
-  if (!origin) return true; // curl / 脚本调用
-  const host = req.headers.host;
-  if (!host) return false;
-  try {
-    const parsed = new URL(origin);
-    return parsed.host === host;
-  } catch {
-    return false;
-  }
+function isAuthed(req) {
+  return Boolean(authVia(req));
 }
 
 function commonHeaders(extra) {
@@ -252,18 +355,25 @@ function readBody(req, res, limit = 64 * 1024) {
   });
 }
 
-const rateBuckets = new Map();
+// P1-1：登录与任务使用独立限流桶，避免暴力破解与正常任务互相影响
+const promptBuckets = new Map();
+const loginBuckets = new Map();
 
-function rateLimited(ip) {
-  if (!Number.isFinite(RATE_LIMIT) || RATE_LIMIT <= 0) return false;
+function bucketLimited(buckets, ip, limit) {
+  if (!Number.isFinite(limit) || limit <= 0) return false;
   const now = Date.now();
-  const bucket = rateBuckets.get(ip);
+  if (buckets.size > 5000) {
+    for (const [key, bucket] of buckets) {
+      if (now > bucket.resetAt) buckets.delete(key);
+    }
+  }
+  const bucket = buckets.get(ip);
   if (!bucket || now > bucket.resetAt) {
-    rateBuckets.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
+    buckets.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS });
     return false;
   }
   bucket.count += 1;
-  return bucket.count > RATE_LIMIT;
+  return bucket.count > limit;
 }
 
 function computeStatus() {
@@ -310,9 +420,11 @@ function publicTask(task) {
     result: task.result
       ? {
           exitCode: task.result.exitCode,
-          artifactIndexHtml: task.result.artifactIndexHtml,
+          artifactPath: task.result.artifactPath,
           postVerify: task.result.postVerify,
           verified: task.result.verified,
+          outcome: task.result.outcome,
+          noChanges: task.result.noChanges,
           verification: task.result.verification,
           changedFiles: task.result.changedFiles,
           diffSummary: task.result.diffSummary,
@@ -363,7 +475,9 @@ function serveConsole(res) {
         'Content-Type': 'text/html; charset=utf-8',
         'Content-Length': data.length,
         'Cache-Control': 'no-store',
-        'X-Frame-Options': 'SAMEORIGIN',
+        'X-Frame-Options': 'DENY',
+        'Content-Security-Policy':
+          "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
       }),
     );
     res.end(data);
@@ -376,18 +490,19 @@ const server = http.createServer(async (req, res) => {
   const method = req.method || 'GET';
 
   try {
+    // P1-3：Host 白名单，防 DNS rebinding
+    if (!hostAllowed(req)) {
+      sendJson(res, 400, { ok: false, error: 'host not allowed' });
+      return;
+    }
+
     if (method === 'GET' && pathname === '/health') {
+      // P2-1：公开端点只返回最小信息
       sendJson(res, 200, {
         ok: true,
         service: 'vplay-remote',
         version: 2,
         remoteEnabled: REMOTE_ENABLED,
-        authRequired: true,
-        mode: projects ? 'projects' : 'workspace',
-        workspace: projects ? projects.home : WORKSPACE,
-        previewPort: PREVIEW_PORT,
-        autorun: AUTHORUN,
-        tokenSource: TOKEN_SOURCE,
       });
       return;
     }
@@ -409,6 +524,15 @@ const server = http.createServer(async (req, res) => {
         deny(res, req);
         return;
       }
+      const ip = req.socket.remoteAddress || 'unknown';
+      // P1-1：先判后记，登录与任务桶分离
+      if (bucketLimited(loginBuckets, ip, LOGIN_RATE_LIMIT)) {
+        sendJson(res, 429, {
+          ok: false,
+          error: 'too many login attempts, slow down',
+        });
+        return;
+      }
       const raw = await readBody(req);
       if (raw === null) return;
       let candidate = '';
@@ -418,29 +542,49 @@ const server = http.createServer(async (req, res) => {
         candidate = '';
       }
       if (!tokenMatches(candidate)) {
-        console.warn(`[remote] failed console login from ${req.socket.remoteAddress}`);
-        rateLimited(req.socket.remoteAddress || 'unknown');
+        console.warn(`[remote] failed console login from ${ip}`);
         sendJson(res, 401, { ok: false, error: 'invalid token' });
         return;
       }
+      // P1-2：下发短期 Session，而不是把主 Token 写进 Cookie
+      const sessionId = createSession();
+      const secure = req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https';
+      const cookie = [
+        `${COOKIE_NAME}=${encodeURIComponent(sessionId)}`,
+        'HttpOnly',
+        'SameSite=Strict',
+        'Path=/',
+        `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+        ...(secure ? ['Secure'] : []),
+      ].join('; ');
       res.writeHead(
         200,
         commonHeaders({
           'Content-Type': 'application/json; charset=utf-8',
-          'Set-Cookie': `${COOKIE_NAME}=${encodeURIComponent(TOKEN)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`,
+          'Set-Cookie': cookie,
           'Cache-Control': 'no-store',
         }),
       );
-      res.end(JSON.stringify({ ok: true }));
+      res.end(JSON.stringify({ ok: true, expiresIn: SESSION_TTL_MS / 1000 }));
       return;
     }
 
     if (method === 'POST' && pathname === '/auth/logout') {
+      // P1-3：登出同样需要鉴权，避免任意网页把用户登出
+      if (!requireAuth(req, res)) return;
+      dropSession(sessionFrom(req));
+      const cookie = [
+        `${COOKIE_NAME}=`,
+        'HttpOnly',
+        'SameSite=Strict',
+        'Path=/',
+        'Max-Age=0',
+      ].join('; ');
       res.writeHead(
         200,
         commonHeaders({
           'Content-Type': 'application/json; charset=utf-8',
-          'Set-Cookie': `${COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`,
+          'Set-Cookie': cookie,
         }),
       );
       res.end(JSON.stringify({ ok: true }));
@@ -492,7 +636,7 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/prompt' && method === 'POST') {
       if (!requireAuth(req, res)) return;
-      if (rateLimited(req.socket.remoteAddress || 'unknown')) {
+      if (bucketLimited(promptBuckets, req.socket.remoteAddress || 'unknown', PROMPT_RATE_LIMIT)) {
         sendJson(res, 429, { ok: false, error: 'too many requests, slow down' });
         return;
       }
@@ -579,7 +723,6 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, {
         ok: true,
         projectId,
-        workspace: projects ? null : WORKSPACE,
         ...link,
       });
       return;
@@ -707,6 +850,59 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---- 启动 ----
+// P1-6：单工作区互斥锁，防止两个实例同时写同一工作区
+const SERVER_LOCK = path.join(RUNTIME_DIR, 'server.lock');
+
+function acquireServerLock() {
+  try {
+    fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+  } catch {
+    return false;
+  }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = fs.openSync(SERVER_LOCK, 'wx');
+      fs.writeSync(
+        fd,
+        JSON.stringify({ pid: process.pid, port: PORT, startedAt: new Date().toISOString() }),
+      );
+      fs.closeSync(fd);
+      return true;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      let holder = null;
+      try {
+        holder = JSON.parse(fs.readFileSync(SERVER_LOCK, 'utf-8'));
+      } catch {
+        holder = null;
+      }
+      let alive = false;
+      if (holder && holder.pid) {
+        try {
+          process.kill(holder.pid, 0);
+          alive = true;
+        } catch {
+          alive = false;
+        }
+      }
+      if (alive) {
+        console.error(
+          `[remote] another server is already using this workspace (pid=${holder.pid}, port=${holder.port}). Refusing to start.`,
+        );
+        return false;
+      }
+      fs.rmSync(SERVER_LOCK, { force: true });
+    }
+  }
+  return false;
+}
+
+if (!acquireServerLock()) {
+  process.exit(1);
+}
+
+rebuildLegacyPreview();
+
 const recovered = store.recoverOnStartup();
 if (recovered.length > 0) {
   console.log(
@@ -754,6 +950,11 @@ server.listen(PORT, HOST, () => {
 function shutdown(signal) {
   console.log(`[remote] ${signal} received, shutting down`);
   worker.stop();
+  try {
+    fs.rmSync(SERVER_LOCK, { force: true });
+  } catch {
+    // 忽略
+  }
   try {
     previewServer.close();
   } catch {

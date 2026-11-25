@@ -152,3 +152,34 @@
   同时把最近 3 轮摘要写入任务上下文，避免会话不可用时丢失连续性。
 - 理由：不同项目的 cwd 不同，会话天然按项目隔离，不会串扰。
 - 后果：会话损坏时仍能靠记忆上下文继续；成功率更高但多一次上下文开销。
+
+## ADR-018 子进程最小环境变量 + 日志脱敏（P0-4）
+
+- 日期：Sprint 02 安全加固
+- 状态：已采纳
+- 决策：CLI 子进程环境变量改为白名单放行；`REMOTE_TOKEN`、`REMOTE_TOKEN_FILE`、
+  `REMOTE_EXECUTOR_CMD`、`VPLAY_*` 一律不继承。日志写入前对 Token、`sk-*`、
+  `*_API_KEY=`、`vplay_session=` 脱敏，单任务上限 5 MB。
+- 理由：审计实测「Token 进环境 → 进日志 → 被 `/game` 读走」可直达主机 RCE。
+- 后果：模型 Key 仍在 CLI 进程中（调用模型必需），完整隔离需要凭据代理 + OS 沙箱，
+  本轮未建立；因此禁止公网执行。
+
+## ADR-019 短期 Session + Host/Origin 校验（P1-1/2/3）
+
+- 日期：Sprint 02 安全加固
+- 状态：已采纳
+- 决策：登录下发随机 Session（服务端 `Map<sha256(id)>`，TTL 4h / 空闲 2h，可吊销）；
+  Cookie 值不再等于主 Token；登录与任务使用独立限流桶；Host 白名单 + 写接口 Origin 同源；
+  登出要求鉴权。
+- 后果：泄露 Cookie 不再等于泄露主密钥；HTTP 下无法加 `Secure`，需 HTTPS 前置。
+
+## ADR-020 独立预览产物目录 + 扩展名白名单（P0-1/2/3）
+
+- 日期：Sprint 02 安全加固
+- 状态：已采纳
+- 决策：预览只读 `<project>/.preview`（单工作区为 `<runtime>/.preview-legacy`），由
+  `copyPreviewTree` 生成：跳过点文件 / node_modules / 链接，只复制扩展名白名单。
+  预览在独立端口且无管理接口，写接口再加 Origin 校验。
+- 理由：既隔离敏感文件，又不影响游戏运行；**不使用 CSP `sandbox`**，避免破坏
+  localStorage / 关卡解锁 / 触控 / 横屏。
+- 后果：Vite 项目需先构建 dist；每次任务与回退后需重建预览（已自动化）。

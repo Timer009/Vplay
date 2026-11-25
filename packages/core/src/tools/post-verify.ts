@@ -428,6 +428,8 @@ export async function runPostVerify(config: Config): Promise<PostVerifyResult> {
       JSON.stringify(
         {
           generatedAt: new Date().toISOString(),
+          // 供远程 worker 校验「本次任务」的结果，拒绝陈旧报告（P1-4）
+          taskId: process.env['OPENGAME_REMOTE_TASK_ID'] ?? null,
           workspace: workspaceDir,
           checkedImports: imports.checked,
           checkedAssets: assets.checked,

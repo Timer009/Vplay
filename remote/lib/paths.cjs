@@ -44,7 +44,7 @@ function realpathSafe(target) {
  * 把静态 URL 解析成 rootDir 内的真实文件。
  * 返回 { ok, status, file | error }。
  */
-function resolveStaticFile(rootDir, urlPath) {
+function resolveStaticFile(rootDir, urlPath, options = {}) {
   let decoded;
   try {
     decoded = decodeURIComponent(String(urlPath || '').split('?')[0]);
@@ -92,6 +92,10 @@ function resolveStaticFile(rootDir, urlPath) {
     return { ok: false, status: 404, error: 'not found' };
   }
   if (!stat.isFile()) return { ok: false, status: 404, error: 'not found' };
+  // 扩展名白名单：只放行游戏确实需要的静态类型
+  if (options.whitelist !== false && !isPreviewable(targetReal)) {
+    return { ok: false, status: 403, error: 'file type is not previewable' };
+  }
   return { ok: true, status: 200, file: targetReal };
 }
 
@@ -191,6 +195,23 @@ const TEXT_EXTENSIONS = new Set([
   '.html', '.htm', '.css', '.js', '.mjs', '.cjs', '.json', '.ts', '.tsx',
   '.jsx', '.md', '.txt', '.svg', '.yml', '.yaml', '.map', '.xml', '.csv',
 ]);
+
+/**
+ * 预览产物允许的扩展名白名单（P0-1）。
+ * 未列入的类型一律 403，避免 .pem / .key / .sh / .bat 等被静态预览读走。
+ */
+const PREVIEW_EXTENSIONS = new Set([
+  '.html', '.htm', '.js', '.mjs', '.cjs', '.css', '.json', '.map',
+  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.ico', '.avif',
+  '.mp3', '.ogg', '.wav', '.m4a', '.aac', '.mp4', '.webm',
+  '.glb', '.gltf', '.bin', '.wasm', '.data',
+  '.woff', '.woff2', '.ttf', '.otf', '.eot',
+  '.txt', '.xml', '.csv', '.atlas', '.fnt', '.dds', '.ktx2', '.hdr', '.exr',
+]);
+
+function isPreviewable(relPath) {
+  return PREVIEW_EXTENSIONS.has(path.extname(relPath).toLowerCase());
+}
 
 function looksTextual(relPath) {
   return TEXT_EXTENSIONS.has(path.extname(relPath).toLowerCase());
@@ -299,8 +320,76 @@ function unifiedDiff(aDir, bDir, files, options = {}) {
   };
 }
 
+/**
+ * 复制「可预览」文件到独立预览目录（P0-1 / P0-3）：
+ * - 跳过任何以 "." 开头的目录/文件（.env/.git/.opengame）
+ * - 只复制扩展名白名单内的文件
+ * - 保留相对目录结构，便于 ../assets 这类相对引用
+ */
+function copyPreviewTree(sourceDir, targetDir, options = {}) {
+  const root = path.resolve(sourceDir);
+  const dest = path.resolve(targetDir);
+  const maxFiles = options.maxFiles || 5000;
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(dest, { recursive: true });
+
+  let copied = 0;
+  let skipped = 0;
+
+  function walk(current) {
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) {
+        skipped += 1;
+        continue;
+      }
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules') {
+          skipped += 1;
+          continue;
+        }
+        walk(full);
+        continue;
+      }
+      if (!entry.isFile()) {
+        // symlink / junction：不跟随
+        skipped += 1;
+        continue;
+      }
+      if (!isPreviewable(entry.name)) {
+        skipped += 1;
+        continue;
+      }
+      if (copied >= maxFiles) {
+        skipped += 1;
+        continue;
+      }
+      const rel = path.relative(root, full);
+      const target = path.join(dest, rel);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      try {
+        fs.copyFileSync(full, target);
+        copied += 1;
+      } catch {
+        skipped += 1;
+      }
+    }
+  }
+
+  walk(root);
+  return { copied, skipped };
+}
+
 module.exports = {
   DEFAULT_EXCLUDES,
+  PREVIEW_EXTENSIONS,
+  isPreviewable,
   isInside,
   realpathSafe,
   resolveStaticFile,
@@ -309,6 +398,7 @@ module.exports = {
   hashTree,
   compareManifests,
   copyTree,
+  copyPreviewTree,
   emptyTree,
   unifiedDiff,
   looksTextual,

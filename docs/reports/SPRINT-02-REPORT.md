@@ -222,6 +222,7 @@ diff --git a/vector-lander/index.html b/vector-lander/index.html
 
 1. **Sprint 02 真机未验收**：只提供地址与步骤，未做真机结论。
 2. **独立安全审计未完成**（Qoder），本报告不宣称审计通过。
+   审计发现项的修复记录见 `docs/reports/SPRINT-02-SECURITY-FIX.md`（P0 全部关闭）。
 3. Vite 项目需已有 `dist/`；系统不会在用户工程里自动执行构建。
 4. 回退只覆盖源码（不含 `dist`/`node_modules`）；Vite 回退后需重新构建预览。
 5. 单独大文件（182 KB HTML）的 diff 依赖 `git`；无 git 时降级为文件清单（当前机器有 git）。

@@ -78,7 +78,7 @@ test('preview: dotfiles, traversal and junctions are blocked; no control API', a
 
     if (junctionCreated) {
       const viaJunction = await request(server.previewPort, 'GET', '/legacy/escape-link/secret.txt');
-      assert.equal(viaJunction.status, 403);
+      assert.ok([403, 404].includes(viaJunction.status));
       assert.doesNotMatch(viaJunction.text, /OUTSIDE-SECRET/);
     }
 

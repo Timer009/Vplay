@@ -28,6 +28,7 @@ const {
   hashTree,
   compareManifests,
   copyTree,
+  copyPreviewTree,
   emptyTree,
   unifiedDiff,
   walkFiles,
@@ -377,17 +378,56 @@ function createProjectRegistry(options = {}) {
     };
   }
 
-  function previewRoot(id) {
-    const record = requireProject(id);
-    const kind = record.kind;
-    if (kind === 'vite') {
+  function previewSourceDir(record) {
+    if (record.kind === 'vite') {
       const dist = path.join(record.srcDir, 'dist');
-      if (fs.existsSync(path.join(dist, 'index.html'))) return dist;
+      return fs.existsSync(path.join(dist, 'index.html')) ? dist : null;
+    }
+    return record.srcDir;
+  }
+
+  function previewDirOf(id) {
+    return path.join(projectDirOf(id), '.preview');
+  }
+
+  function previewRootPath(record, dest) {
+    if (record.kind === 'vite') return dest;
+    const entryDir = path.dirname(record.entry || 'index.html');
+    return entryDir === '.' ? dest : path.join(dest, entryDir);
+  }
+
+  /**
+   * 生成独立预览产物目录（P0-1/P0-3）：
+   * 只复制可预览类型、跳过点文件与 node_modules，预览面只读这里，
+   * 永远不直接读 src。
+   */
+  function buildPreview(id) {
+    const record = requireProject(id);
+    const dest = previewDirOf(id);
+    const source = previewSourceDir(record);
+    if (!source) {
+      fs.rmSync(dest, { recursive: true, force: true });
       return null;
     }
-    const entryDir = path.dirname(record.entry || 'index.html');
-    const root = entryDir === '.' ? record.srcDir : path.join(record.srcDir, entryDir);
-    return fs.existsSync(root) ? root : null;
+    try {
+      copyPreviewTree(source, dest);
+    } catch {
+      return null;
+    }
+    const entryRel = record.kind === 'vite' ? 'index.html' : record.entry || 'index.html';
+    if (!fs.existsSync(path.join(dest, entryRel))) return null;
+    return previewRootPath(record, dest);
+  }
+
+  function previewRoot(id) {
+    const record = requireProject(id);
+    const dest = previewDirOf(id);
+    const entryRel = record.kind === 'vite' ? 'index.html' : record.entry || 'index.html';
+    if (!fs.existsSync(path.join(dest, entryRel))) {
+      buildPreview(id);
+    }
+    if (!fs.existsSync(path.join(dest, entryRel))) return null;
+    return previewRootPath(record, dest);
   }
 
   function listSnapshots(id) {
@@ -527,6 +567,14 @@ function createProjectRegistry(options = {}) {
     const restored = hashTree(record.srcDir);
     const verified = digestManifest(restored) === digestManifest(targetManifest);
 
+    // 回退后刷新独立预览产物（预览面永远不直读 src）
+    let preview = null;
+    try {
+      preview = buildPreview(id);
+    } catch {
+      preview = null;
+    }
+
     return {
       projectId: id,
       restoredSeq: Number(seq),
@@ -536,6 +584,7 @@ function createProjectRegistry(options = {}) {
         restored: compared.added.concat(compared.modified),
       },
       verified,
+      previewReady: Boolean(preview),
       digest: digestManifest(restored),
     };
   }
@@ -623,6 +672,8 @@ function createProjectRegistry(options = {}) {
     diff,
     rollback,
     previewRoot,
+    previewDir: previewDirOf,
+    buildPreview,
     memory: (id) => readJson(memoryPath(id), { rounds: [] }),
     appendRound,
     acquireLock,

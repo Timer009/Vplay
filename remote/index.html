@@ -302,6 +302,7 @@
 
   function renderArtifact(payload) {
     if (payload && payload.ok && payload.previewPath) {
+      if (payload.previewPort) state.previewPort = payload.previewPort;
       var href = previewHref(payload.previewPath);
       artifactLink.href = href;
       artifactUrlText.textContent = href;
@@ -343,7 +344,12 @@
       if (task.result && task.result.verification) {
         detail += (detail ? '\n' : '') + '验证: ' + (task.result.verified ? '通过' : '未通过') +
           '（入口 ' + (task.result.verification.entryExists ? '存在' : '缺失') +
-          '，预览 ' + (task.result.verification.previewReady ? '就绪' : '未就绪') + '）';
+          '，预览 ' + (task.result.verification.previewReady ? '就绪' : '未就绪') +
+          (task.result.verification.postVerifyStale ? '，post-verify 结果陈旧' : '') + '）';
+      }
+      if (task.result && task.result.outcome) {
+        detail += (detail ? '\n' : '') + '结果: ' + task.result.outcome +
+          (task.result.noChanges ? '（未检测到文件变更）' : '');
       }
       if (!detail) detail = '创建于 ' + clock(task.createdAt);
       var badge = task.status;

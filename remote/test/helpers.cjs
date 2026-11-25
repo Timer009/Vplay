@@ -51,6 +51,8 @@ async function startServer(options) {
     REMOTE_HOST: '127.0.0.1',
     OPENGAME_WORKSPACE: workspace,
     REMOTE_RATE_LIMIT: '1000',
+    REMOTE_LOGIN_RATE_LIMIT: '1000',
+    REMOTE_ALLOW_TEST_SEAM: '1',
     REMOTE_AUTORUN: options.autorun === false ? '0' : '1',
     ...(options.env || {}),
   };

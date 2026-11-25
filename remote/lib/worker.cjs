@@ -20,8 +20,41 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+const { hashTree, compareManifests } = require('./paths.cjs');
+
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const STATUS_POLL_MS = 1000;
+
+/** 允许传给 CLI 子进程的环境变量（P0-4：默认拒绝，显式放行）。 */
+const ENV_PASSTHROUGH = new Set([
+  'PATH', 'Path', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'windir', 'ComSpec',
+  'TEMP', 'TMP', 'TMPDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA',
+  'NODE_OPTIONS', 'NODE_ENV', 'LANG', 'LC_ALL', 'TZ', 'SHELL', 'TERM',
+  'OPENGAME_POST_VERIFY', 'OPENGAME_TEMPLATES_DIR', 'OPENGAME_DEBUG_PROTOCOL',
+]);
+const ENV_PREFIXES = ['OPENAI_', 'OPENGAME_REASONING_', 'GEMINI_', 'QWEN_', 'DASHSCOPE_'];
+
+/** 只传「模型调用必需 + 系统运行必需」的变量；REMOTE_* / VPLAY_* 一律不传。 */
+function buildChildEnv(taskId, source = process.env) {
+  const env = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (key.startsWith('REMOTE_') || key.startsWith('VPLAY_')) continue;
+    const allowed =
+      ENV_PASSTHROUGH.has(key) || ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+    if (allowed) env[key] = value;
+  }
+  env.OPENGAME_REMOTE_TASK_ID = taskId;
+  return env;
+}
+
+/** 测试后门（REMOTE_EXECUTOR_CMD）必须显式开启，避免生产环境任意脚本执行（P2-5）。 */
+function resolveExecutorScript(env = process.env) {
+  if (env.NODE_ENV === 'test' || env.REMOTE_ALLOW_TEST_SEAM === '1') {
+    return env.REMOTE_EXECUTOR_CMD || null;
+  }
+  return null;
+}
+
 
 function readRuntimePhase(dir) {
   try {
@@ -33,18 +66,28 @@ function readRuntimePhase(dir) {
   }
 }
 
-function readPostVerify(dir) {
+function readPostVerify(dir, task, startedAtMs) {
   try {
     const file = path.join(dir, '.opengame', 'post-verify.json');
+    const stat = fs.statSync(file);
     const parsed = JSON.parse(fs.readFileSync(file, 'utf-8').replace(/^\uFEFF/, ''));
+    // P1-4：只接受本次任务写入的结果，拒绝陈旧 post-verify
+    const taskMatches = !parsed.taskId || parsed.taskId === task.id;
+    const fresh = stat.mtimeMs >= (startedAtMs || 0) - 1000;
+    if (!taskMatches || !fresh) {
+      return { summary: null, stale: true };
+    }
     return {
-      checkedImports: parsed.checkedImports ?? 0,
-      checkedAssets: parsed.checkedAssets ?? 0,
-      fixedCount: parsed.fixedCount ?? 0,
-      issues: Array.isArray(parsed.issues) ? parsed.issues.length : 0,
+      stale: false,
+      summary: {
+        checkedImports: parsed.checkedImports ?? 0,
+        checkedAssets: parsed.checkedAssets ?? 0,
+        fixedCount: parsed.fixedCount ?? 0,
+        issues: Array.isArray(parsed.issues) ? parsed.issues.length : 0,
+      },
     };
   } catch {
-    return null;
+    return { summary: null, stale: false };
   }
 }
 
@@ -129,10 +172,22 @@ function createWorker(options) {
   const publicMode = Boolean(options.publicMode);
   const allowYolo = options.allowYolo !== false;
   const log = options.logger || ((line) => console.log(line));
+  const secrets = (options.secrets || []).filter((secret) => typeof secret === 'string' && secret.length >= 6);
+  const onFinished = typeof options.onFinished === 'function' ? options.onFinished : null;
 
   let current = null;
+  let currentChild = null;
   let loopTimer = null;
   let stopped = false;
+
+  /** 回传前脱敏：绝对路径与凭据都不进错误信息（P2-8）。 */
+  function scrub(text, dir) {
+    let out = String(text || '');
+    for (const secret of secrets) out = out.split(secret).join('***');
+    out = out.split(path.resolve(dir)).join('<workspace>');
+    out = out.split(path.resolve(legacyWorkspace)).join('<workspace>');
+    return out;
+  }
 
   function resolveTarget(task) {
     if (!projects) return { project: null, dir: legacyWorkspace, projectId: 'default' };
@@ -163,7 +218,7 @@ function createWorker(options) {
   function spawnExecutor(task, dir) {
     return spawn(process.execPath, [executorScript, task.text], {
       cwd: dir,
-      env: { ...process.env, OPENGAME_REMOTE_TASK_ID: task.id },
+      env: buildChildEnv(task.id),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -193,14 +248,14 @@ function createWorker(options) {
     }
     return spawn(process.execPath, args, {
       cwd: dir,
-      env: { ...process.env, OPENGAME_REMOTE_TASK_ID: task.id },
+      env: buildChildEnv(task.id),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
   }
 
-  function verify(project, dir) {
-    const postVerify = readPostVerify(dir);
+  function verify(project, dir, task, startedAtMs) {
+    const post = readPostVerify(dir, task, startedAtMs);
     let entryExists = false;
     let previewReady = false;
     let entryPath = null;
@@ -208,11 +263,7 @@ function createWorker(options) {
     if (project) {
       entryPath = path.join(project.srcDir, project.entry || 'index.html');
       entryExists = fs.existsSync(entryPath);
-      if (project.kind === 'vite') {
-        previewReady = fs.existsSync(path.join(project.srcDir, 'dist', 'index.html'));
-      } else {
-        previewReady = entryExists;
-      }
+      previewReady = projects.previewRoot(project.id) !== null;
     } else {
       entryPath = path.join(dir, 'index.html');
       entryExists = fs.existsSync(entryPath);
@@ -222,9 +273,14 @@ function createWorker(options) {
     return {
       entryExists,
       previewReady,
-      postVerify,
-      verified: entryExists && previewReady && (!postVerify || postVerify.issues === 0),
+      postVerify: post.summary,
+      postVerifyStale: post.stale,
       entryPath,
+      verified:
+        entryExists &&
+        previewReady &&
+        !post.stale &&
+        (!post.summary || post.summary.issues === 0),
     };
   }
 
@@ -295,6 +351,9 @@ function createWorker(options) {
       Boolean(project) &&
       (projects.memory(projectId).rounds || []).length > 0 &&
       process.env.VPLAY_CONTINUE_SESSION !== '0';
+    const startedAtMs = Date.now();
+    // 单工作区模式没有快照，用前后哈希判断是否真的改了文件（P1-4）
+    const beforeManifest = project ? null : hashTree(dir);
 
     store.appendLog(
       task.id,
@@ -321,6 +380,7 @@ function createWorker(options) {
       projectId,
       snapshotSeq,
     });
+    currentChild = child;
 
     let stderrBuffer = '';
     child.stdout.on('data', (chunk) => store.appendLog(task.id, chunk));
@@ -354,42 +414,72 @@ function createWorker(options) {
       clearInterval(poll);
       clearTimeout(timeout);
 
-      const verification = verify(project, dir);
-      const enriched = { ...patch };
-      if (enriched.result) {
-        enriched.result = {
-          ...enriched.result,
-          verified: verification.verified,
-          verification,
-        };
-      } else {
-        enriched.result = {
-          exitCode: null,
-          verified: verification.verified,
-          verification,
-        };
+      const verification = verify(project, dir, task, startedAtMs);
+      let changes = null;
+      let diff = null;
+      try {
+        if (project && snapshotSeq) {
+          diff = projects.diff(projectId, snapshotSeq, 'current');
+          changes = diff.counts;
+        } else if (beforeManifest) {
+          const compared = compareManifests(beforeManifest, hashTree(dir));
+          changes = {
+            added: compared.added.length,
+            removed: compared.removed.length,
+            modified: compared.modified.length,
+          };
+        }
+      } catch (error) {
+        store.appendLog(task.id, `[remote] change detection failed: ${error.message}\n`);
       }
+      const totalChanges = changes ? changes.added + changes.modified + changes.removed : null;
+      const noChanges = totalChanges === 0;
+      const verified = verification.verified && !noChanges;
+      const outcome = noChanges ? 'no_changes' : verified ? 'verified' : 'unverified';
+
+      const enriched = { ...patch };
+      const baseResult = enriched.result || { exitCode: null };
+      enriched.result = {
+        ...baseResult,
+        artifactPath: project ? project.entry || 'index.html' : 'index.html',
+        postVerify: verification.postVerify,
+        verified,
+        outcome,
+        noChanges,
+        changedFiles: changes,
+        diffSummary:
+          diff && diff.files.length > 0
+            ? diff.files.slice(0, 20).map((f) => `${f.status}: ${f.path}`)
+            : [],
+        verification: {
+          entryExists: verification.entryExists,
+          previewReady: verification.previewReady,
+          postVerifyStale: verification.postVerifyStale,
+        },
+      };
 
       if (project) {
         try {
-          const diff = snapshotSeq ? projects.diff(projectId, snapshotSeq, 'current') : null;
-          if (enriched.result) {
-            enriched.result.changedFiles = diff ? diff.counts : null;
-            enriched.result.diffSummary = diff
-              ? diff.files.slice(0, 20).map((f) => `${f.status}: ${f.path}`)
-              : [];
-          }
           projects.appendRound(projectId, {
             taskId: task.id,
             prompt: task.text.slice(0, 200),
-            changedFiles: diff ? diff.files.length : 0,
-            verified: verification ? verification.verified : false,
+            changedFiles: totalChanges ?? 0,
+            verified,
             status,
           });
         } catch (error) {
           store.appendLog(task.id, `[remote] post-run bookkeeping failed: ${error.message}\n`);
         }
         projects.releaseLock(projectId);
+      }
+
+      currentChild = null;
+      if (onFinished) {
+        try {
+          onFinished({ taskId: task.id, projectId, status, verified });
+        } catch (error) {
+          log(`[remote] onFinished failed: ${error.message}`);
+        }
       }
 
       finish(task.id, status, enriched);
@@ -400,7 +490,9 @@ function createWorker(options) {
     };
 
     child.on('error', (error) => {
-      settle('failed', { error: { code: 'SPAWN_FAILED', message: error.message } });
+      settle('failed', {
+        error: { code: 'SPAWN_FAILED', message: scrub(error.message, dir) },
+      });
     });
 
     child.on('close', (code, signal) => {
@@ -411,18 +503,8 @@ function createWorker(options) {
         return;
       }
 
-      const verification = verify(project, dir);
-
       if (code === 0) {
-        settle('succeeded', {
-          pid: null,
-          error: null,
-          result: {
-            exitCode: 0,
-            artifactIndexHtml: verification.entryExists ? verification.entryPath : null,
-            postVerify: verification.postVerify,
-          },
-        });
+        settle('succeeded', { pid: null, error: null, result: { exitCode: 0 } });
         return;
       }
 
@@ -431,13 +513,9 @@ function createWorker(options) {
         error: {
           code: 'EXIT_CODE',
           message: `CLI exited with code ${code}${signal ? ` (signal ${signal})` : ''}`,
-          detail: tail(stderrBuffer, 20),
+          detail: scrub(tail(stderrBuffer, 20), dir),
         },
-        result: {
-          exitCode: code,
-          postVerify: verification.postVerify,
-          artifactIndexHtml: verification.entryExists ? verification.entryPath : null,
-        },
+        result: { exitCode: code },
       });
     });
   }
@@ -460,6 +538,11 @@ function createWorker(options) {
       clearInterval(loopTimer);
       loopTimer = null;
     }
+    // P1-5：停止时杀掉正在运行的 CLI 进程树，避免留下孤儿
+    if (currentChild) {
+      killTree(currentChild);
+      currentChild = null;
+    }
   }
 
   return {
@@ -474,5 +557,7 @@ function createWorker(options) {
 module.exports = {
   createWorker,
   composePrompt,
+  buildChildEnv,
+  resolveExecutorScript,
   DEFAULT_TIMEOUT_MS,
 };

@@ -108,8 +108,35 @@ function createTaskStore(options) {
     .relative(runtimeDir, logsDir)
     .split(path.sep)
     .join('/');
+  const redactSecrets = (options.redactSecrets || []).filter(
+    (secret) => typeof secret === 'string' && secret.length >= 6,
+  );
+  const maxLogBytes = Number(options.maxLogBytes || 5 * 1024 * 1024);
+  const logSizes = new Map();
+  const truncated = new Set();
 
   fs.mkdirSync(logsDir, { recursive: true });
+
+  /** 日志脱敏（P0-4）：Token / API Key / Session 一律替换为 ***。 */
+  function redact(text) {
+    let out = String(text);
+    for (const secret of redactSecrets) {
+      out = out.split(secret).join('***');
+      try {
+        out = out.split(encodeURIComponent(secret)).join('***');
+      } catch {
+        // 非法编码忽略
+      }
+    }
+    out = out.replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-***');
+    out = out.replace(
+      /((?:OPENAI|GEMINI|QWEN|DASHSCOPE|ANTHROPIC)_API_KEY\s*[=:]\s*)\S+/gi,
+      '$1***',
+    );
+    out = out.replace(/(REMOTE_TOKEN(?:_FILE)?\s*[=:]\s*)\S+/gi, '$1***');
+    out = out.replace(/vplay_session=[^;\s"']+/g, 'vplay_session=***');
+    return out;
+  }
 
   let tasks = load();
 
@@ -266,7 +293,29 @@ function createTaskStore(options) {
     const file = path.resolve(options.workspaceDir, task.logPath);
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.appendFileSync(file, chunk, 'utf-8');
+      let size = logSizes.get(id);
+      if (size === undefined) {
+        try {
+          size = fs.statSync(file).size;
+        } catch {
+          size = 0;
+        }
+      }
+      if (size >= maxLogBytes) {
+        if (!truncated.has(id)) {
+          truncated.add(id);
+          fs.appendFileSync(file, '\n[remote] log limit reached (5 MB), further output dropped\n');
+        }
+        return;
+      }
+      let text = redact(chunk);
+      const remaining = maxLogBytes - size;
+      if (Buffer.byteLength(text, 'utf-8') > remaining) {
+        text = `${text.slice(0, Math.max(0, remaining))}\n[remote] log truncated at 5 MB\n`;
+        truncated.add(id);
+      }
+      fs.appendFileSync(file, text, 'utf-8');
+      logSizes.set(id, size + Buffer.byteLength(text, 'utf-8'));
     } catch {
       // Logging must never break task execution.
     }
@@ -277,8 +326,19 @@ function createTaskStore(options) {
     if (!task) return null;
     const file = path.resolve(options.workspaceDir, task.logPath);
     try {
-      const raw = fs.readFileSync(file, 'utf-8');
-      return raw.length > maxBytes ? raw.slice(-maxBytes) : raw;
+      const stat = fs.statSync(file);
+      if (stat.size <= maxBytes) {
+        return fs.readFileSync(file, 'utf-8');
+      }
+      // 只读尾部，避免把 5 MB 日志整块读进内存
+      const fd = fs.openSync(file, 'r');
+      try {
+        const buffer = Buffer.alloc(maxBytes);
+        fs.readSync(fd, buffer, 0, maxBytes, stat.size - maxBytes);
+        return buffer.toString('utf-8');
+      } finally {
+        fs.closeSync(fd);
+      }
     } catch {
       return '';
     }
