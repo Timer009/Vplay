@@ -20,6 +20,7 @@
   "scripts": {
     "start": "cross-env node scripts/start.js",
     "remote": "node remote/server.cjs",
+    "test:remote": "node --test remote/test/tasks.test.cjs remote/test/server.test.cjs remote/test/mobile-console.test.cjs remote/test/e2e-agent.test.cjs",
     "debug": "cross-env DEBUG=1 node --inspect-brk scripts/start.js",
     "generate": "node scripts/generate-git-commit-info.js",
     "build": "node scripts/build.js",
@@ -103,6 +104,7 @@
     "mock-fs": "^5.5.0",
     "msw": "^2.10.4",
     "npm-run-all": "^4.1.5",
+    "playwright-core": "^1.65.1",
     "prettier": "^3.5.3",
     "react-devtools-core": "^7.0.1",
     "semver": "^7.7.2",

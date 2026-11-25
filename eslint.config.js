@@ -30,6 +30,17 @@ export default tseslint.config(
       // template-skills, test cases) — vendored runtime fixtures rather
       // than maintained OpenGame source, so we don't lint them.
       'agent-test/**',
+      // Local game-generation artifacts produced by earlier runs. They are
+      // not OpenGame source (most are gitignored) and would otherwise flood
+      // the report with browser-global errors.
+      '.review-artifacts/**',
+      'game-coins/**',
+      'hello/**',
+      'post-verify-demo*/**',
+      'post-verify-switch-test/**',
+      'post-verify-clean-test/**',
+      'queue-check/**',
+      'smoke-test/**',
     ],
   },
   eslint.configs.recommended,
@@ -223,6 +234,27 @@ export default tseslint.config(
     rules: {
       'no-restricted-syntax': 'off',
       '@typescript-eslint/no-require-imports': 'off',
+    },
+  },
+  // The remote bridge and its tests are plain CommonJS run by Node directly
+  // (the root package is ESM, hence .cjs files).
+  {
+    files: ['remote/**/*.cjs'],
+    languageOptions: {
+      globals: {
+        ...globals.node,
+      },
+    },
+    rules: {
+      '@typescript-eslint/no-require-imports': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        {
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_',
+        },
+      ],
     },
   },
   // Prettier config must be last

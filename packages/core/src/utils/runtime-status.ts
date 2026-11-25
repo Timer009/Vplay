@@ -12,7 +12,6 @@ export interface RuntimeStatus {
 
 export const OPENGAME_RUNTIME_DIR = '.opengame';
 export const RUNTIME_STATUS_FILE = 'runtime-status.json';
-export const PROMPT_QUEUE_FILE = 'queue.json';
 
 function runtimeDir(workspaceDir: string): string {
   return path.join(workspaceDir, OPENGAME_RUNTIME_DIR);
@@ -59,31 +58,5 @@ export function readRuntimeStatus(workspaceDir: string): RuntimeStatus | null {
     ) as RuntimeStatus;
   } catch {
     return null;
-  }
-}
-
-interface QueuedPrompt {
-  text: string;
-  createdAt?: string;
-}
-
-/**
- * Drain prompts queued by the remote server (POST /prompt).
- * Returns their texts and clears the queue file.
- */
-export function consumeQueuedPrompts(workspaceDir: string): string[] {
-  const queuePath = path.join(runtimeDir(workspaceDir), PROMPT_QUEUE_FILE);
-  try {
-    if (!fs.existsSync(queuePath)) {
-      return [];
-    }
-    const parsed = readJsonFile(queuePath);
-    const items: QueuedPrompt[] = Array.isArray(parsed) ? parsed : [];
-    fs.writeFileSync(queuePath, '[]', 'utf-8');
-    return items
-      .map((item) => (typeof item?.text === 'string' ? item.text.trim() : ''))
-      .filter((text) => text.length > 0);
-  } catch {
-    return [];
   }
 }

@@ -24,7 +24,6 @@ import {
   parseAndFormatApiError,
   runPostVerify,
   writeRuntimeStatus,
-  consumeQueuedPrompts,
 } from '@opengame/opengame-core';
 import type { Content, Part, PartListUnion } from '@google/genai';
 import type { CLIUserMessage, PermissionMode } from './nonInteractive/types.js';
@@ -126,17 +125,10 @@ export async function runNonInteractive(
   return promptIdContext.run(prompt_id, async () => {
     const workspaceDir = config.getTargetDir();
 
-    // Remote bridge: inject prompts queued by remote/server.js, then mark the
-    // workspace as "generating" so GET /status can report progress.
-    const queuedPrompts = consumeQueuedPrompts(workspaceDir);
-    if (queuedPrompts.length > 0) {
-      input = `${input}\n\n[REMOTE INSTRUCTIONS]\n${queuedPrompts
-        .map((prompt) => `- ${prompt}`)
-        .join('\n')}`;
-      console.log(
-        `[remote] injected ${queuedPrompts.length} queued prompt(s) into this turn`,
-      );
-    }
+    // Remote tasks are NOT injected into this turn as text. The remote bridge
+    // (remote/server.cjs) runs each task as a separate CLI invocation, so the
+    // prompt arrives here as a normal user message. Text can never be used to
+    // grant trust; only the HTTP token gate does that.
     writeRuntimeStatus(
       workspaceDir,
       'generating',

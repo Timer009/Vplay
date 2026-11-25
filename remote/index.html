@@ -320,6 +320,77 @@
   @keyframes blink { 50% { opacity: .2; } }
   @keyframes spin { to { transform: rotate(360deg); } }
 
+  /* ---------- auth gate ---------- */
+  .gate {
+    position: fixed; inset: 0; z-index: 50;
+    display: none; place-items: center;
+    padding: 20px;
+    background: rgba(4, 8, 6, 0.94);
+    backdrop-filter: blur(6px);
+  }
+  .gate.show { display: grid; }
+  .gate-card {
+    width: 100%; max-width: 380px;
+    background: linear-gradient(160deg, var(--surface-2), var(--surface));
+    border: 1px solid var(--line-bright);
+    border-radius: 18px;
+    padding: 22px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+  }
+  .gate-card h2 {
+    font-family: var(--mono); font-size: 15px; letter-spacing: 2px;
+    color: var(--green); margin-bottom: 8px;
+  }
+  .gate-card p { font-size: 13px; color: var(--dim); line-height: 1.6; margin-bottom: 14px; }
+  .gate-card input {
+    width: 100%; font-family: var(--mono); font-size: 16px;
+    color: var(--ink); background: rgba(0,0,0,0.35);
+    border: 1px solid var(--line-bright); border-radius: 10px;
+    padding: 12px 13px; outline: none;
+  }
+  .gate-card input:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(61,255,139,0.12); }
+  .gate-card button {
+    width: 100%; min-height: 48px; margin-top: 12px;
+    font-family: var(--mono); font-size: 14px; font-weight: 700; letter-spacing: 3px;
+    color: #05130a; background: linear-gradient(160deg, #59ffa0, var(--green) 55%, #23c96c);
+    border: none; border-radius: 11px; cursor: pointer;
+  }
+  .gate-card button:disabled { opacity: .4; cursor: not-allowed; }
+  .gate-err { display: none; margin-top: 10px; font-size: 12.5px; color: var(--red); }
+  .gate-err.show { display: block; }
+  .gate-note { margin-top: 12px; font-family: var(--mono); font-size: 10.5px; color: var(--faint); line-height: 1.6; }
+
+  /* ---------- tasks ---------- */
+  .task-list { display: flex; flex-direction: column; gap: 8px; max-height: 340px; overflow-y: auto; }
+  .task-item {
+    border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px; background: rgba(0,0,0,0.22); cursor: pointer;
+  }
+  .task-item .row { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+  .task-id { font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
+  .task-text {
+    font-size: 12.5px; color: var(--ink); margin-top: 5px; line-height: 1.45;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .task-badge {
+    flex: none; font-family: var(--mono); font-size: 10px; letter-spacing: 1px;
+    padding: 3px 8px; border-radius: 999px;
+    border: 1px solid var(--line-bright); color: var(--dim);
+  }
+  .task-badge[data-s="queued"] { color: var(--cyan); border-color: #1a3a47; }
+  .task-badge[data-s="running"], .task-badge[data-s="verifying"] { color: var(--amber); border-color: var(--amber-deep); }
+  .task-badge[data-s="succeeded"] { color: var(--green); border-color: var(--green-deep); }
+  .task-badge[data-s="failed"], .task-badge[data-s="interrupted"] { color: var(--red); border-color: var(--red-deep); }
+  .task-detail {
+    display: none; margin-top: 8px; padding-top: 8px;
+    border-top: 1px dashed var(--line);
+    font-family: var(--mono); font-size: 11px; color: var(--dim);
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 200px; overflow: auto;
+  }
+  .task-item.open .task-detail { display: block; }
+  .empty-note { color: var(--faint); font-size: 12.5px; }
+
   @media (max-width: 360px) {
     body { padding-left: 10px; padding-right: 10px; }
     .card { padding: 13px; }
@@ -329,6 +400,17 @@
 </style>
 </head>
 <body>
+
+<div class="gate" id="gate">
+  <div class="gate-card">
+    <h2>需要访问令牌</h2>
+    <p>输入桌面端配置的 <b>REMOTE_TOKEN</b> 后才能查看状态或发送指令。</p>
+    <input id="tokenInput" type="password" autocomplete="current-password" placeholder="REMOTE_TOKEN">
+    <button id="loginBtn" type="button">解 锁</button>
+    <div class="gate-err" id="gateErr"></div>
+    <div class="gate-note" id="gateNote">令牌仅用于本机鉴权，登录后以 HttpOnly Cookie 保存，不会出现在网址中。</div>
+  </div>
+</div>
 
 <header>
   <div class="brand">
@@ -380,7 +462,19 @@
     </button>
   </div>
   <div class="toast-err" id="sendErr"></div>
-  <div class="hint">指令会写入桌面端队列，由 OpenGame 生成流程消费</div>
+  <div class="hint">指令会进入桌面端任务队列，由串行 worker 以正式用户消息执行</div>
+</section>
+
+<!-- 任务记录 -->
+<section class="card">
+  <div class="card-label">
+    <span>▍任务记录</span>
+    <button class="btn-refresh" id="tasksRefreshBtn" type="button">
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 1.5v3h-3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      刷新
+    </button>
+  </div>
+  <div class="task-list" id="taskList"><div class="empty-note">暂无任务</div></div>
 </section>
 
 <!-- 产物入口 -->
@@ -415,7 +509,7 @@
   </div>
 </section>
 
-<footer>REMOTE BRIDGE · <b>同一局域网直连</b> · 无需登录</footer>
+<footer>REMOTE BRIDGE · <b>Token 鉴权</b> · 仅限本机或可信网络</footer>
 
 <script>
 'use strict';
@@ -430,15 +524,18 @@
   var artifactNone = $('artifactNone'), artifactReady = $('artifactReady');
   var artifactLink = $('artifactLink'), artifactUrlText = $('artifactUrlText');
   var refreshBtn = $('refreshBtn');
+  var gate = $('gate'), tokenInput = $('tokenInput'), loginBtn = $('loginBtn');
+  var gateErr = $('gateErr'), gateNote = $('gateNote');
+  var taskList = $('taskList'), tasksRefreshBtn = $('tasksRefreshBtn');
 
   $('hostLabel').textContent = location.host || 'localhost';
 
-  // ---- phase -> 中文 + 色调 ----
   var PHASES = {
     idle:       { label: '空闲',   tone: 'idle' },
     queued:     { label: '排队中', tone: 'info' },
     planning:   { label: '规划中', tone: 'busy' },
     generating: { label: '生成中', tone: 'busy' },
+    verifying:  { label: '校验中', tone: 'busy' },
     coding:     { label: '编码中', tone: 'busy' },
     building:   { label: '构建中', tone: 'busy' },
     running:    { label: '运行中', tone: 'busy' },
@@ -454,6 +551,8 @@
   var polling = false;
   var sentTimer = null;
   var timer = null;
+  var authed = false;
+  var openTaskId = null;
 
   function setConn(online) {
     connBadge.className = 'conn ' + (online ? 'online' : 'offline');
@@ -461,17 +560,57 @@
   }
 
   function fetchJson(url, opts) {
-    return fetch(url, opts).then(function (res) {
+    return fetch(url, Object.assign({ credentials: 'same-origin' }, opts || {})).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
         return { ok: res.ok, status: res.status, data: data };
       });
     });
   }
 
+  function fetchText(url) {
+    return fetch(url, { credentials: 'same-origin' }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.text();
+    });
+  }
+
+  function esc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function (ch) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+    });
+  }
+
+  function clock(iso) {
+    try { return new Date(iso).toLocaleTimeString('zh-CN', { hour12: false }); }
+    catch (e) { return ''; }
+  }
+
+  function showGate(message) {
+    authed = false;
+    gate.classList.add('show');
+    stopPolling();
+    setConn(false);
+    connText.textContent = '未登录';
+    if (message) {
+      gateErr.textContent = message;
+      gateErr.classList.add('show');
+    }
+  }
+
+  function hideGate() {
+    gate.classList.remove('show');
+    gateErr.classList.remove('show');
+    authed = true;
+  }
+
   // ---- 状态区 ----
   function renderStatus(data) {
     var phase = String(data.phase || 'idle').toLowerCase();
     var meta = PHASES[phase] || { label: data.phase || phase, tone: 'info' };
+    // "done" also covers the last task failing; surface that as an error.
+    if (phase === 'done' && /\b(failed|interrupted)\b/.test(String(data.message || ''))) {
+      meta = { label: '失败', tone: 'err' };
+    }
     phaseBadge.setAttribute('data-tone', meta.tone);
     phaseText.textContent = meta.label;
     phaseRaw.textContent = phase;
@@ -482,19 +621,18 @@
       meta.tone === 'ok' ? 'var(--green)' :
       meta.tone === 'err' ? 'var(--red)' :
       meta.tone === 'busy' ? 'var(--amber)' : 'var(--line-bright)';
-    statusTime.textContent = '同步于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    statusTime.textContent = '同步于 ' + clock(new Date());
   }
 
   function renderArtifact(result) {
     if (result.ok && result.data && result.data.ok) {
-      // 服务端可能返回 localhost 链接 —— 重写为当前访问的主机，手机才能打开
-      var href = result.data.url || '/';
+      var href = result.data.url || '/game/index.html';
       try {
         var u = new URL(href, location.href);
         u.protocol = location.protocol;
         u.host = location.host;
         href = u.toString();
-      } catch (e) { href = location.origin + '/'; }
+      } catch (e) { href = location.origin + '/game/index.html'; }
       artifactLink.href = href;
       artifactUrlText.textContent = href;
       artifactNone.style.display = 'none';
@@ -505,18 +643,74 @@
     }
   }
 
+  // ---- 任务列表 ----
+  function renderTasks(payload) {
+    var tasks = (payload && payload.tasks) || [];
+    if (!tasks.length) {
+      taskList.innerHTML = '<div class="empty-note">暂无任务</div>';
+      return;
+    }
+    taskList.innerHTML = tasks.map(function (task) {
+      var open = task.id === openTaskId ? ' open' : '';
+      var detail = '';
+      if (task.error) {
+        detail += '错误 ' + (task.error.code || '') + ': ' + (task.error.message || '');
+        if (task.error.detail) detail += '\n' + task.error.detail;
+      }
+      if (task.result && task.result.postVerify) {
+        var p = task.result.postVerify;
+        if (detail) detail += '\n';
+        detail += 'post-verify: imports=' + p.checkedImports +
+          ' assets=' + p.checkedAssets + ' fixed=' + p.fixedCount +
+          ' issues=' + p.issues;
+      }
+      if (task.result && task.result.artifactIndexHtml) {
+        detail += (detail ? '\n' : '') + '产物: ' + task.result.artifactIndexHtml;
+      }
+      if (!detail) {
+        detail = '创建于 ' + clock(task.createdAt) +
+          (task.finishedAt ? ' · 完成于 ' + clock(task.finishedAt) : '');
+      }
+      return '<div class="task-item' + open + '" data-id="' + esc(task.id) + '">' +
+        '<div class="row"><span class="task-id">' + esc(task.id) + '</span>' +
+        '<span class="task-badge" data-s="' + esc(task.status) + '">' + esc(task.status) + '</span></div>' +
+        '<div class="task-text">' + esc(task.text) + '</div>' +
+        '<div class="task-detail">' + esc(detail) + '</div>' +
+        '</div>';
+    }).join('');
+  }
+
+  function loadTasks() {
+    if (!authed) return Promise.resolve();
+    return fetchJson('/tasks?limit=20').then(function (r) {
+      if (r.status === 401) { showGate('登录已失效，请重新输入令牌'); return; }
+      if (r.ok) renderTasks(r.data);
+    }).catch(function () {});
+  }
+
+  function loadLog(taskId, element) {
+    if (!element) return;
+    fetchText('/tasks/' + encodeURIComponent(taskId) + '/log').then(function (text) {
+      element.textContent += '\n--- log tail ---\n' + text.slice(-3000);
+    }).catch(function (e) {
+      element.textContent += '\n(log unavailable: ' + e.message + ')';
+    });
+  }
+
   function poll() {
-    if (polling) return;
+    if (polling || !authed) return;
     polling = true;
     Promise.all([
       fetchJson('/status').then(function (r) {
+        if (r.status === 401) { showGate('登录已失效，请重新输入令牌'); throw new Error('unauthorized'); }
         if (!r.ok) throw new Error('status ' + r.status);
         setConn(true);
         renderStatus(r.data);
       }),
-      fetchJson('/artifact').then(renderArtifact).catch(function () {})
+      fetchJson('/artifact').then(renderArtifact).catch(function () {}),
+      loadTasks()
     ]).catch(function () {
-      setConn(false);
+      if (authed) setConn(false);
     }).then(function () {
       polling = false;
     });
@@ -531,7 +725,46 @@
     if (timer) { clearInterval(timer); timer = null; }
   }
   document.addEventListener('visibilitychange', function () {
-    if (document.hidden) stopPolling(); else startPolling();
+    if (document.hidden) stopPolling(); else if (authed) startPolling();
+  });
+
+  // ---- 登录 ----
+  function login() {
+    var token = tokenInput.value.trim();
+    if (!token) {
+      gateErr.textContent = '请输入 REMOTE_TOKEN';
+      gateErr.classList.add('show');
+      return;
+    }
+    loginBtn.disabled = true;
+    loginBtn.textContent = '验证中…';
+    fetchJson('/auth/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token })
+    }).then(function (r) {
+      if (r.ok && r.data.ok) {
+        tokenInput.value = '';
+        gateErr.classList.remove('show');
+        hideGate();
+        startPolling();
+      } else {
+        gateErr.textContent = r.status === 503
+          ? '桌面端未配置 REMOTE_TOKEN，远程控制已禁用'
+          : (r.status === 429 ? '尝试过于频繁，请稍后再试' : '令牌无效');
+        gateErr.classList.add('show');
+      }
+    }).catch(function () {
+      gateErr.textContent = '无法连接桌面端服务';
+      gateErr.classList.add('show');
+    }).then(function () {
+      loginBtn.disabled = false;
+      loginBtn.textContent = '解 锁';
+    });
+  }
+  loginBtn.addEventListener('click', login);
+  tokenInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); login(); }
   });
 
   // ---- “已发送” 提示 ----
@@ -544,19 +777,19 @@
 
   // ---- 发送指令 ----
   function updateSendState() {
-    sendBtn.disabled = sendBtn.classList.contains('loading') || !input.value.trim();
+    sendBtn.disabled = !authed || sendBtn.classList.contains('loading') || !input.value.trim();
   }
   input.addEventListener('input', updateSendState);
 
   function showSendErr(msg) {
     sendErr.textContent = msg;
     sendErr.classList.add('show');
-    setTimeout(function () { sendErr.classList.remove('show'); }, 4000);
+    setTimeout(function () { sendErr.classList.remove('show'); }, 6000);
   }
 
   function send() {
     var text = input.value.trim();
-    if (!text || sendBtn.classList.contains('loading')) return;
+    if (!text || !authed || sendBtn.classList.contains('loading')) return;
     sendBtn.classList.add('loading');
     sendLabel.textContent = '发送中…';
     updateSendState();
@@ -565,13 +798,20 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: text })
     }).then(function (r) {
-      if (r.ok && r.data.ok) {
-        input.value = '';           // 清空输入框
-        showSent('已发送');          // 状态区提示
-        queueHint.textContent = '队列 ' + (r.data.queued || 1) + ' 条待处理';
-        poll();                     // 立即同步一次状态
+      if ((r.ok && r.data.ok) || r.status === 202) {
+        input.value = '';
+        showSent(r.data.duplicate ? '相同任务已存在' : '已加入队列');
+        queueHint.textContent = '队列 ' + (r.data.queued || 0) + ' 条待处理';
+        poll();
+      } else if (r.status === 401) {
+        showGate('登录已失效，请重新输入令牌');
+      } else if (r.status === 409) {
+        var existing = (r.data && r.data.existingTask && r.data.existingTask.id) || '';
+        showSendErr('相同指令已在队列或执行中' + (existing ? '（' + existing + '）' : '') + '，未重复提交');
+      } else if (r.status === 429) {
+        showSendErr('发送过于频繁，请稍后再试');
       } else {
-        showSendErr('发送失败：' + (r.data.error || ('HTTP ' + r.status)));
+        showSendErr('发送失败：' + ((r.data && r.data.error) || ('HTTP ' + r.status)));
       }
     }).catch(function () {
       setConn(false);
@@ -596,6 +836,25 @@
     input.focus();
   });
 
+  // ---- 任务展开 ----
+  taskList.addEventListener('click', function (e) {
+    var item = e.target.closest('.task-item');
+    if (!item) return;
+    var id = item.getAttribute('data-id');
+    openTaskId = openTaskId === id ? null : id;
+    loadTasks().then(function () {
+      if (openTaskId !== id) return;
+      var reopened = taskList.querySelector('.task-item[data-id="' + id + '"] .task-detail');
+      loadLog(id, reopened);
+    });
+  });
+  tasksRefreshBtn.addEventListener('click', function () {
+    tasksRefreshBtn.classList.add('spinning');
+    loadTasks().then(function () {
+      setTimeout(function () { tasksRefreshBtn.classList.remove('spinning'); }, 400);
+    });
+  });
+
   // ---- 手动刷新产物 ----
   refreshBtn.addEventListener('click', function () {
     refreshBtn.classList.add('spinning');
@@ -604,7 +863,33 @@
     });
   });
 
-  startPolling();
+  // ---- 启动 ----
+  function bootstrap() {
+    fetchJson('/health').then(function (r) {
+      var data = r.data || {};
+      if (data.remoteEnabled === false) {
+        showGate('远程控制已禁用：桌面端未设置 REMOTE_TOKEN');
+        gateNote.textContent = '请在桌面端设置 REMOTE_TOKEN 后重启 npm run remote。';
+        tokenInput.disabled = true;
+        loginBtn.disabled = true;
+        updateSendState();
+        return;
+      }
+      return fetchJson('/status').then(function (s) {
+        if (s.ok) {
+          hideGate();
+          startPolling();
+        } else {
+          showGate();
+        }
+        updateSendState();
+      });
+    }).catch(function () {
+      showGate('无法连接桌面端服务');
+    });
+  }
+
+  bootstrap();
 })();
 </script>
 </body>

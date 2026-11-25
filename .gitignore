@@ -64,6 +64,11 @@ docs-site/content
 
 # guidance files
 guidance.md
+# Vplay remote bridge runtime state (task queue, logs, token files)
+.opengame/
+remote/.remote-token
+remote/.token
+
 # Review / verification artifacts (added by Qoder review round)
 .review-artifacts/
 game-coins/

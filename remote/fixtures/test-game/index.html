@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote Test Game</title>
+<style>
+  :root {
+    --bg: #101014;
+    --fg: #ffffff;
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, sans-serif;
+    display: grid;
+    place-items: center;
+  }
+  .card { text-align: center; }
+  .dot { width: 96px; height: 96px; border-radius: 50%; background: #3dff8b; margin: 0 auto 18px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="dot"></div>
+    <h1>Remote Test Game</h1>
+    <p>这个页面的背景色由 <code>--bg</code> 控制，用于验证远程指令是否真的修改了游戏。</p>
+  </div>
+</body>
+</html>
