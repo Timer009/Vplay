@@ -303,6 +303,6 @@ Sprint 范围测试（`npm run test:remote`）全部通过，见第 6 节。
 
 ## 12. 提交
 
-- 实现提交：`<!-- COMMIT_SHA -->`
+- 实现提交：`cfec53c`（分支 `sprint-01-remote-runtime`；本文件所在提交可能还包含随后的文档格式更新）
 - 分支：`sprint-01-remote-runtime`（已推送；未合并 main，未 force push）
 - 基线：`a016895`
