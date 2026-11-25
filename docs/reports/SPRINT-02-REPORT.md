@@ -263,6 +263,6 @@ diff --git a/vector-lander/index.html b/vector-lander/index.html
 
 ## 13. 提交
 
-- 实现提交：`<!-- COMMIT_SHA -->`（分支 `sprint-02-project-adoption`）
+- 实现提交：`02206de`（分支 `sprint-02-project-adoption`；本文件所在提交可能还包含随后的文档格式更新）
 - 基线：`sprint-01-accepted` @ `8058e67`
 - 未合并 main，未 force push，未提交任何密钥。
