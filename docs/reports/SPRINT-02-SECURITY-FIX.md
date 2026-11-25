@@ -160,6 +160,6 @@
 
 ## 9. 提交
 
-- 安全修复提交：`<!-- COMMIT_SHA -->`
+- 安全修复提交：`90842ce`（分支 `sprint-02-project-adoption`；本文件所在提交可能还包含随后的文档格式更新）
 - 分支：`sprint-02-project-adoption`（推送，不合并 main，不 force push）
 - 未使用真实密钥做探针，未开放公网远程控制。
