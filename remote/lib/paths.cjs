@@ -46,8 +46,9 @@ const CONFIG_NAME_PATTERNS = [
   /^(credentials?|creds|secrets?|tokens?|api[-_]?keys?|auth[-_]?keys?)(\.[a-z0-9]+)?$/i,
   /^(credentials?|secrets?|tokens?)[-_](config|settings)\.(json|ya?ml|js|ts)$/i,
   /(service[-_]?account|firebase[-_]?config|google[-_]?services)/i,
-  /^id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i,
 ];
+/** NEW-C05-01：无扩展名 / `.pub` 私钥必须在扩展名门禁之前判定。 */
+const PRIVATE_KEY_NAME = /^id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i;
 const SECRET_CONTENT_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /\bAKIA[0-9A-Z]{16}\b/,
@@ -62,6 +63,8 @@ const SECRET_CONTENT_PATTERNS = [
 function isSensitivePath(relPath) {
   const base = path.basename(relPath);
   if (base.startsWith('.')) return true;
+  // 无扩展名私钥（id_rsa / id_ed25519…）不受配置扩展名门禁约束
+  if (PRIVATE_KEY_NAME.test(base)) return true;
   const ext = path.extname(base).toLowerCase();
   if (SENSITIVE_EXTENSIONS.has(ext)) return true;
   // 资产扩展名（png/mp3/woff2/glb…）不做名字级判定

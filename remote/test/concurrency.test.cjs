@@ -319,3 +319,66 @@ test('OBS-C04-01: failed startup recovery keeps journal and evidence, retry succ
     removeWorkspace(root);
   }
 });
+
+test('NEW-C05-01: extensionless private keys never reach workspace, snapshots or preview', async () => {
+  const root = makeWorkspace('vplay-c05-keys-');
+  const home = path.join(root, 'home');
+  const source = makeGame(path.join(root, 'source'));
+  const fakeKey = '-----BEGIN OPENSSH PRIVATE KEY-----\nnot-a-real-key\n';
+  write(path.join(source, 'keys', 'id_rsa'), fakeKey);
+  write(path.join(source, 'keys', 'id_ed25519'), fakeKey);
+  write(path.join(source, 'keys', 'id_ecdsa'), fakeKey);
+  write(path.join(source, 'keys', 'id_dsa'), fakeKey);
+  write(path.join(source, 'keys', 'id_rsa.pub'), 'ssh-rsa AAAAB3NzaC1yc2E fake');
+  write(path.join(source, 'assets', 'token.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 9]));
+  write(path.join(source, 'data', 'credentials-ui.json'), '{"layout":"auth"}');
+  write(
+    path.join(source, 'data', 'app-config.json'),
+    '{"private_key":"-----BEGIN PRIVATE KEY-----\\nfake\\n"}',
+  );
+
+  const registry = createProjectRegistry({ home });
+  const imported = registry.importProject({ sourceDir: source, id: 'demo' });
+  const src = imported.project.srcDir;
+
+  for (const rel of [
+    'keys/id_rsa',
+    'keys/id_ed25519',
+    'keys/id_ecdsa',
+    'keys/id_dsa',
+    'keys/id_rsa.pub',
+  ]) {
+    assert.equal(fs.existsSync(path.join(src, rel)), false, `${rel} must not be copied`);
+  }
+  for (const rel of ['assets/token.png', 'data/credentials-ui.json']) {
+    assert.ok(fs.existsSync(path.join(src, rel)), `${rel} must be kept`);
+  }
+
+  const entry = registry.get('demo').snapshots[0];
+  const manifestPath = path.join(home, 'projects', 'demo', '.snapshots', `${entry.uid}.manifest.json`);
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+  for (const key of Object.keys(manifest)) {
+    assert.doesNotMatch(key, /id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i, `snapshot leaked ${key}`);
+  }
+
+  const server = await startServer({
+    workspace: path.join(root, 'workspace'),
+    home,
+    token: TOKEN,
+    env: { REMOTE_AUTORUN: '0' },
+  });
+  try {
+    for (const rel of ['keys/id_rsa', 'keys/id_ed25519', 'keys/id_rsa.pub']) {
+      assert.equal((await request(server.previewPort, 'GET', `/p/demo/${rel}`)).status, 404);
+    }
+    assert.equal(
+      (await request(server.previewPort, 'GET', '/p/demo/data/app-config.json')).status,
+      404,
+      'content-level secret must stay out of previews',
+    );
+    assert.equal((await request(server.previewPort, 'GET', '/p/demo/assets/token.png')).status, 200);
+  } finally {
+    await server.stop();
+    removeWorkspace(root);
+  }
+});
