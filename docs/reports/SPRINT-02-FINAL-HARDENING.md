@@ -142,7 +142,7 @@ node --test remote/test/hardening.test.cjs       # 六项专项
 现场复验 NEW-01（需先启动一个测试实例）：
 
 ```powershell
-$env:REMOTE_TOKEN='host-probe-token'; $env:REMOTE_AUTORUN='0'
+$env:REMOTE_TOKEN='<虚拟探针令牌>'   # 本机临时值，非真实密钥
 $env:REMOTE_HOST='127.0.0.1'; $env:REMOTE_PORT='8891'; $env:PREVIEW_PORT='8892'
 $env:OPENGAME_WORKSPACE='<临时游戏目录>'
 node $repo\remote\server.cjs
