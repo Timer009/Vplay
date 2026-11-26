@@ -171,6 +171,6 @@ node C:\Users\54167\Documents\Trae-CN\default\vplay-verification\host-probe.cjs
 
 ## 7. 提交
 
-- 最终完整 SHA：`<!-- FINAL_SHA -->`
+- 最终完整 SHA：`79460c77a2e1fec2c153a71ccd78219704066e45`（本文件所在提交可能包含随后的文档格式更新）
 - 分支：`sprint-02-project-adoption`（推送，不合并 main，不 force push）
 - 未使用真实密钥，未开放公网。
