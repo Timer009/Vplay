@@ -114,8 +114,16 @@ test('NEW-02: corrupted snapshot registry or content is rejected before touching
     assert.equal(digestOf(project.srcDir), before, 'workspace must be untouched');
     assert.ok(fs.existsSync(path.join(project.srcDir, 'index.html')));
 
-    // B. 清单缺失
-    const manifestPath = path.join(home, 'projects', 'demo', '.snapshots', '001.manifest.json');
+    // B. 清单缺失（清单按 uid 命名）
+    const stateB = JSON.parse(fs.readFileSync(snapshotsPath, 'utf-8'));
+    const firstEntry = stateB.snapshots.find((item) => Number(item.seq) === 1) || stateB.snapshots[0];
+    const manifestPath = path.join(
+      home,
+      'projects',
+      'demo',
+      '.snapshots',
+      `${firstEntry.uid}.manifest.json`,
+    );
     const manifest = fs.readFileSync(manifestPath, 'utf-8');
     fs.rmSync(manifestPath, { force: true });
     const missing = await rollback(1);

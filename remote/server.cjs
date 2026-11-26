@@ -938,6 +938,10 @@ rebuildLegacyPreview();
 // NEW-02：上次回退中途崩溃时，用 journal 指向的备份还原工作区
 if (projects) {
   try {
+    const quarantined = projects.recoverOrphanSnapshots();
+    if (quarantined.length > 0) {
+      console.log(`[remote] orphan snapshots quarantined: ${JSON.stringify(quarantined)}`);
+    }
     const recoveredRollbacks = projects.recoverInterruptedRollbacks();
     if (recoveredRollbacks.length > 0) {
       console.log(
@@ -945,7 +949,7 @@ if (projects) {
       );
     }
   } catch (error) {
-    console.error(`[remote] rollback recovery failed: ${error.message}`);
+    console.error(`[remote] recovery failed: ${error.message}`);
   }
 }
 

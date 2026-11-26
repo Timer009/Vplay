@@ -37,9 +37,10 @@ const {
 
 const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const SNAPSHOT_DIR_PATTERN = /^\d{3,}-[a-z0-9-]+$/;
-const MAX_SNAPSHOTS = 50;
-const LOCK_TIMEOUT_MS = 10000;
-const LOCK_STALE_MS = 30000;
+const MAX_SNAPSHOTS = 200;
+const LOCK_TIMEOUT_MS = 20000;
+const LOCK_RETRY_MS = 15;
+const LOCK_HARD_TTL_MS = 5 * 60 * 1000;
 
 function sleepSync(ms) {
   const buffer = new SharedArrayBuffer(4);
@@ -58,6 +59,144 @@ function removeLinkOnly(target) {
     }
   } catch {
     // 不存在或已被删除
+  }
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readLockInfo(file) {
+  try {
+    const raw = fs.readFileSync(file, 'utf-8');
+    if (!raw.trim()) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 跨进程互斥（NEW-C04-02）。
+ * 同一 VPLAY_HOME 下的所有写入方（CLI / server / 脚本）都走这里。
+ */
+function withHomeLock(home, fn, options = {}) {
+  const timeoutMs = Number(options.timeoutMs || LOCK_TIMEOUT_MS);
+  const dir = path.join(home, '.opengame');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'registry.lock');
+  const token = `${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
+  const payload = JSON.stringify({ pid: process.pid, token, at: Date.now() });
+  const deadline = Date.now() + timeoutMs;
+
+  for (;;) {
+    try {
+      const fd = fs.openSync(file, 'wx');
+      try {
+        fs.writeSync(fd, payload);
+      } finally {
+        fs.closeSync(fd);
+      }
+      break;
+    } catch (error) {
+      // Windows 并发删除/改名锁文件会抛 EPERM/EACCES，一律按竞争处理
+      if (!['EEXIST', 'EPERM', 'EACCES', 'ENOENT', 'EBUSY'].includes(error.code)) {
+        throw error;
+      }
+
+      // 连续两次读取：用于识别「读到了半写入内容」
+      const first = readLockInfo(file);
+      sleepSync(20);
+      const second = readLockInfo(file);
+      const info = second || first;
+      const age = info ? Date.now() - Number(info.at || 0) : Infinity;
+      let fileAge = Infinity;
+      if (!info) {
+        try {
+          fileAge = Date.now() - fs.statSync(file).mtimeMs;
+        } catch {
+          fileAge = Infinity;
+        }
+      }
+      let stale = false;
+      if (!info) {
+        // 只有「明显的空文件残留」才回收：刚创建未落盘的文件必须等待
+        stale = fileAge > 5000;
+      } else if (!pidAlive(Number(info.pid))) {
+        stale = true; // 持有者已退出（含 SIGKILL）
+      } else if (age > LOCK_HARD_TTL_MS) {
+        stale = true; // 唯一允许的「活进程超时」回收：5 分钟硬上限
+      }
+      // 注意：绝不因「读到的内容发生变化」而回收——那正是活锁被误删的来源
+      if (process.env.VPLAY_LOCK_DEBUG === '1') {
+        try {
+          fs.appendFileSync(
+            path.join(dir, 'lock-debug.log'),
+            `${JSON.stringify({ at: Date.now(), pid: process.pid, first, second, fileAge, stale, code: error.code })}\n`,
+          );
+        } catch {
+          // 忽略
+        }
+      }
+
+      if (stale) {
+        // 原子抢占：rename 到唯一 stale 名，再校验是否误抢活锁
+        const trash = `${file}.stale-${token}-${Math.random().toString(36).slice(2, 8)}`;
+        try {
+          fs.renameSync(file, trash);
+        } catch (renameError) {
+          if (!['ENOENT', 'EPERM', 'EACCES'].includes(renameError.code)) throw renameError;
+        }
+        const moved = readLockInfo(trash);
+        if (
+          moved &&
+          pidAlive(Number(moved.pid)) &&
+          Date.now() - Number(moved.at || 0) <= LOCK_HARD_TTL_MS
+        ) {
+          // 误抢了活锁：尽量放回，绝不删除
+          try {
+            if (!fs.existsSync(file)) fs.renameSync(trash, file);
+          } catch {
+            // 放回失败时保留 trash 文件，交给对方/人工处理
+          }
+        } else {
+          try {
+            fs.rmSync(trash, { force: true });
+          } catch {
+            // 忽略
+          }
+        }
+        continue;
+      }
+
+      if (Date.now() > deadline) {
+        throw new ProjectError('registry is busy', 409, 'REGISTRY_LOCKED');
+      }
+      sleepSync(LOCK_RETRY_MS + Math.floor(Math.random() * 15));
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    // 只释放自己持有的锁；被他人回收/替换时绝不删除
+    const info = readLockInfo(file);
+    if (info && info.token === token) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          fs.rmSync(file, { force: true });
+          break;
+        } catch (error) {
+          if (!['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) break;
+          sleepSync(10 + Math.floor(Math.random() * 15));
+        }
+      }
+    }
   }
 }
 
@@ -123,10 +262,26 @@ function readJson(file, fallback) {
 }
 
 function writeJson(file, value) {
-  const tmp = `${file}.${process.pid}.tmp`;
+  // 原子写：随机临时名避免多进程撞名；rename 在 Windows 上遇 EPERM 重试
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf-8');
-  fs.renameSync(tmp, file);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (error) {
+      if (attempt >= 20 || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) {
+        try {
+          fs.rmSync(tmp, { force: true });
+        } catch {
+          // 忽略
+        }
+        throw error;
+      }
+      sleepSync(10 + Math.floor(Math.random() * 20));
+    }
+  }
 }
 
 function validateProjectId(id) {
@@ -221,61 +376,17 @@ function createProjectRegistry(options = {}) {
   }
 
   /**
-   * 注册表 / 快照 / 回退的统一互斥锁（NEW-06）。
-   * 同进程内 JS 单线程已串行；文件锁用于多进程（CLI + server）并发时防止丢更新。
+   * 注册表 / 快照 / 回退的统一互斥锁（NEW-06 / NEW-C04-02）。
+   *
+   * 设计要点：
+   *  - EPERM/EACCES/ENOENT/EBUSY 都视为「抢锁失败」，退避重试，绝不上抛；
+   *  - 陈旧判定必须「连续两次读到同一 owner」且 pid 已死/超硬上限，避免 TOCTOU；
+   *  - 回收用 rename 抢占到唯一 stale 名，再校验归属：若误抢活锁则尝试放回；
+   *  - 释放前核对 token，只删自己持有的锁；
+   *  - 所有跨进程写操作（CLI 与 server）都只能经由此锁。
    */
-  function withRegistryLock(fn) {
-    const dir = path.join(home, '.opengame');
-    fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, 'registry.lock');
-    const deadline = Date.now() + LOCK_TIMEOUT_MS;
-    for (;;) {
-      try {
-        const fd = fs.openSync(file, 'wx');
-        fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
-        fs.closeSync(fd);
-        break;
-      } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        let info = null;
-        try {
-          info = JSON.parse(fs.readFileSync(file, 'utf-8'));
-        } catch {
-          info = null;
-        }
-        let alive = false;
-        if (info && info.pid) {
-          try {
-            process.kill(info.pid, 0);
-            alive = true;
-          } catch {
-            alive = false;
-          }
-        }
-        const stale = !alive || (info && Date.now() - Number(info.at || 0) > LOCK_STALE_MS);
-        if (stale) {
-          try {
-            fs.rmSync(file, { force: true });
-          } catch {
-            // 继续重试
-          }
-          continue;
-        }
-        if (Date.now() > deadline) {
-          throw new ProjectError('registry is busy', 409, 'REGISTRY_LOCKED');
-        }
-        sleepSync(50);
-      }
-    }
-    try {
-      return fn();
-    } finally {
-      try {
-        fs.rmSync(file, { force: true });
-      } catch {
-        // 忽略
-      }
-    }
+  function withRegistryLock(fn, options = {}) {
+    return withHomeLock(home, fn, options);
   }
 
   function projectDirOf(id) {
@@ -591,10 +702,20 @@ function createProjectRegistry(options = {}) {
     return path.join(snapshotsDir(id), `${String(seq).padStart(3, '0')}.manifest.json`);
   }
 
+  /** 清单按 uid 命名：全局唯一，不会因序号竞争而互相覆盖。 */
+  function manifestFile(id, entry) {
+    if (entry && entry.uid) {
+      return path.join(snapshotsDir(id), `${entry.uid}.manifest.json`);
+    }
+    return manifestPathOf(id, entry ? entry.seq : 0);
+  }
+
   /** 清单缺失/损坏必须报错，绝不回退为 {}（否则会把工作区删空）。 */
   function manifestOf(id, entry) {
-    const file = manifestPathOf(id, entry.seq);
-    if (!fs.existsSync(file)) {
+    const candidates = [manifestFile(id, entry)];
+    if (!entry.uid) candidates.push(manifestPathOf(id, entry.seq));
+    const file = candidates.find((candidate) => fs.existsSync(candidate));
+    if (!file) {
       throw new ProjectError('快照清单缺失，拒绝回退', 409, 'SNAPSHOT_MANIFEST_MISSING');
     }
     const parsed = readJson(file, null);
@@ -611,9 +732,19 @@ function createProjectRegistry(options = {}) {
    * 回退前的完整预验证（NEW-02）：目录边界、清单、摘要、实际内容必须全部一致。
    * 任何一项不通过都在「删除/写入之前」抛出。
    */
-  function validateSnapshot(id, seq) {
-    const entry = listSnapshots(id).find((item) => Number(item.seq) === Number(seq));
-    if (!entry) throw new ProjectError(`快照不存在: ${seq}`, 404, 'SNAPSHOT_NOT_FOUND');
+  function validateSnapshot(id, ref) {
+    const entries = listSnapshots(id);
+    const byUid = typeof ref === 'string';
+    const entry = byUid
+      ? entries.find((item) => item.uid === ref)
+      : entries.find((item) => Number(item.seq) === Number(ref));
+    if (!entry) {
+      if (byUid) {
+        // 本次写入已被并发覆盖：必须让调用方重试，绝不能报告成功
+        throw new ProjectError('snapshot entry lost during write', 409, 'LOCK_LOST');
+      }
+      throw new ProjectError(`快照不存在: ${ref}`, 404, 'SNAPSHOT_NOT_FOUND');
+    }
     const dir = snapshotPath(id, entry);
     if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
       throw new ProjectError('快照目录缺失，拒绝回退', 409, 'SNAPSHOT_DIR_MISSING');
@@ -630,24 +761,59 @@ function createProjectRegistry(options = {}) {
   }
 
   function snapshot(id, label) {
-    return withRegistryLock(() => snapshotInternal(id, label));
+    let lastError = null;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      try {
+        return withRegistryLock(() => snapshotInternal(id, label));
+      } catch (error) {
+        lastError = error;
+        if (error.code !== 'LOCK_LOST' && error.code !== 'EEXIST') throw error;
+      }
+    }
+    throw lastError || new ProjectError('snapshot failed', 500, 'SNAPSHOT_FAILED');
   }
 
   function snapshotInternal(id, label) {
     const record = requireProject(id);
-    const state = readJson(snapshotsFile(id), { seq: 0, snapshots: [] });
-    const maxSeq = (state.snapshots || []).reduce(
-      (max, item) => Math.max(max, Number(item.seq) || 0),
-      0,
-    );
-    const seq = Math.max(Number(state.seq || 0), maxSeq) + 1;
-    const dirName = `${String(seq).padStart(3, '0')}-${slugify(label)}`;
-    const dir = path.join(snapshotsDir(id), dirName);
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(snapshotsDir(id), { recursive: true });
 
+    let state;
+    let seq;
+    let dir;
+    let dirName;
+    let maxDirSeq = 0;
+    try {
+      for (const item of fs.readdirSync(snapshotsDir(id), { withFileTypes: true })) {
+        if (!item.isDirectory()) continue;
+        const match = /^(\d{3,})-/.exec(item.name);
+        if (match) maxDirSeq = Math.max(maxDirSeq, Number(match[1]));
+      }
+    } catch {
+      maxDirSeq = 0;
+    }
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      state = readJson(snapshotsFile(id), { seq: 0, snapshots: [] });
+      const maxSeq = (state.snapshots || []).reduce(
+        (max, item) => Math.max(max, Number(item.seq) || 0),
+        0,
+      );
+      seq = Math.max(Number(state.seq || 0), maxSeq, maxDirSeq) + 1;
+      dirName = `${String(seq).padStart(3, '0')}-${slugify(label)}`;
+      dir = path.join(snapshotsDir(id), dirName);
+      try {
+        // 非递归创建：同名目录已存在说明序号冲突，必须重新分配而不是覆盖
+        fs.mkdirSync(dir);
+        break;
+      } catch (error) {
+        if (error.code !== 'EEXIST' || attempt === 4) throw error;
+        maxDirSeq = Math.max(maxDirSeq, seq);
+      }
+    }
+
+    let entry = null;
     try {
       const links = findLinks(record.srcDir);
-      const { skippedLinks } = copyTree(record.srcDir, dir);
+      copyTree(record.srcDir, dir);
       // 兜底：某些平台 cpSync 会把链接本身复制过去，这里只删链接、不跟随目标
       for (const rel of links) {
         removeLinkOnly(path.join(dir, rel));
@@ -656,28 +822,80 @@ function createProjectRegistry(options = {}) {
       if (Object.keys(manifest).length === 0) {
         throw new Error('snapshot is empty');
       }
-      const entry = {
+      const entryData = {
         seq,
+        uid: `${process.pid}-${crypto.randomBytes(6).toString('hex')}`,
         label: label || `snapshot-${seq}`,
         dir: dirName,
         createdAt: new Date().toISOString(),
         fileCount: Object.keys(manifest).length,
         digest: digestManifest(manifest),
-        skippedLinks: [...new Set([...(skippedLinks || []), ...links])].slice(0, 20),
+        skippedLinks: links.slice(0, 20),
       };
-      writeJson(manifestPathOf(id, seq), manifest);
+      entry = entryData;
+      writeJson(manifestFile(id, entry), manifest);
 
-      state.seq = seq;
-      state.snapshots = (state.snapshots || []).concat(entry);
-      if (state.snapshots.length > MAX_SNAPSHOTS) {
-        state.snapshots = state.snapshots.slice(-MAX_SNAPSHOTS);
+      // OCC 合并写：写入前重读注册表并合并，写后核对 uid。
+      // 即使跨进程临界区短暂重叠，也不会静默丢条目或产生「虚假成功」。
+      let persisted = false;
+      for (let round = 0; round < 8 && !persisted; round += 1) {
+        const current = readJson(snapshotsFile(id), { seq: 0, snapshots: [] });
+        const existing = current.snapshots || [];
+        if (existing.some((item) => item.uid === entry.uid)) {
+          persisted = true;
+          break;
+        }
+        const used = new Set(existing.map((item) => Number(item.seq)));
+        if (used.has(Number(entry.seq))) {
+          // 序号被并发占用：换号并同步改名目录与清单
+          const next = Math.max(Number(current.seq) || 0, ...[...used], 0) + 1;
+          const nextName = `${String(next).padStart(3, '0')}-${slugify(label)}`;
+          try {
+            fs.renameSync(
+              path.join(snapshotsDir(id), entry.dir),
+              path.join(snapshotsDir(id), nextName),
+            );
+            entry.seq = next;
+            entry.dir = nextName;
+            seq = next;
+            dir = path.join(snapshotsDir(id), nextName);
+          } catch {
+            sleepSync(10 + Math.floor(Math.random() * 20));
+            continue;
+          }
+        }
+        const merged = existing.concat(entry);
+        if (merged.length > MAX_SNAPSHOTS) {
+          const dropped = merged.splice(0, merged.length - MAX_SNAPSHOTS);
+          for (const item of dropped) {
+            fs.rmSync(path.join(snapshotsDir(id), item.dir), { recursive: true, force: true });
+            fs.rmSync(manifestFile(id, item), { force: true });
+          }
+        }
+        writeJson(snapshotsFile(id), {
+          seq: Math.max(Number(current.seq) || 0, entry.seq),
+          snapshots: merged,
+        });
+        const check = readJson(snapshotsFile(id), { snapshots: [] });
+        persisted = (check.snapshots || []).some((item) => item.uid === entry.uid);
+        if (persisted) {
+          // 二次确认：给并发写入者一个落盘窗口，防止「我先验证、随后被覆盖」
+          sleepSync(20 + Math.floor(Math.random() * 20));
+          const confirm = readJson(snapshotsFile(id), { snapshots: [] });
+          persisted = (confirm.snapshots || []).some((item) => item.uid === entry.uid);
+        }
+        if (!persisted) sleepSync(10 + Math.floor(Math.random() * 20));
       }
-      writeJson(snapshotsFile(id), state);
+      if (!persisted) {
+        throw new ProjectError('registry update lost, retrying', 409, 'LOCK_LOST');
+      }
+
+      validateSnapshot(id, entry.uid);
       return entry;
     } catch (error) {
       // NEW-03：失败时清理半成品目录，避免累积并挤占配额
       fs.rmSync(dir, { recursive: true, force: true });
-      fs.rmSync(manifestPathOf(id, seq), { force: true });
+      fs.rmSync(manifestFile(id, entry || { seq }), { force: true });
       throw error;
     }
   }
@@ -871,30 +1089,112 @@ function createProjectRegistry(options = {}) {
     }
   }
 
-  /** 服务启动时调用：上次回退中途崩溃，按 journal 用备份还原。 */
-  function recoverInterruptedRollbacks() {
-    const results = [];
-    for (const record of registry.projects) {
-      const journal = journalPathOf(record.id);
-      if (!fs.existsSync(journal)) continue;
-      let info = null;
-      try {
-        info = readJson(journal, null);
-      } catch {
-        info = null;
-      }
-      try {
-        if (!info || !info.backupSeq) throw new Error('journal has no backup seq');
-        const tree = validateSnapshot(record.id, info.backupSeq);
-        const applied = applyTree(record.id, tree.dir, tree.manifest);
-        buildPreview(record.id);
-        results.push({ id: record.id, recovered: applied.equal, backupSeq: tree.entry.seq });
-      } catch (error) {
-        results.push({ id: record.id, recovered: false, reason: error.message });
-      }
-      fs.rmSync(journal, { force: true });
+  function appendRecoveryEvidence(id, payload) {
+    try {
+      fs.appendFileSync(
+        path.join(projectDirOf(id), '.rollback-recovery.log'),
+        `${JSON.stringify({ at: new Date().toISOString(), ...payload })}\n`,
+        'utf-8',
+      );
+    } catch {
+      // 证据写入失败不影响主流程
     }
-    return results;
+  }
+
+  /**
+   * 服务启动时调用：上次回退中途崩溃，按 journal 用备份还原。
+   * OBS-C04-01：只有「完整校验通过」才删除 journal；失败则保留 journal 并留证据，
+   * 以便下一次启动继续重试。
+   */
+  function recoverInterruptedRollbacks() {
+    return withRegistryLock(() => {
+      const results = [];
+      for (const record of registry.projects) {
+        const journal = journalPathOf(record.id);
+        if (!fs.existsSync(journal)) continue;
+        let info = null;
+        try {
+          info = readJson(journal, null);
+        } catch {
+          info = null;
+        }
+        try {
+          if (!info || !info.backupSeq) throw new Error('journal has no backup seq');
+          const tree = validateSnapshot(record.id, info.backupSeq);
+          const applied = applyTree(record.id, tree.dir, tree.manifest);
+          if (!applied.equal) {
+            throw new Error('recovered tree does not match backup digest');
+          }
+          buildPreview(record.id);
+          fs.rmSync(journal, { force: true });
+          results.push({
+            id: record.id,
+            recovered: true,
+            backupSeq: tree.entry.seq,
+            journalKept: false,
+          });
+        } catch (error) {
+          // 保留 journal + 证据，下一次启动继续尝试
+          appendRecoveryEvidence(record.id, {
+            event: 'rollback-recovery-failed',
+            backupSeq: info && info.backupSeq ? info.backupSeq : null,
+            reason: error.message,
+            journalKept: true,
+          });
+          results.push({
+            id: record.id,
+            recovered: false,
+            reason: error.message,
+            journalKept: true,
+          });
+        }
+      }
+      return results;
+    });
+  }
+
+  /**
+   * 启动时隔离未登记的孤儿快照目录（NEW-C04-02 验收项：无孤儿目录）。
+   * 不删除数据，只移动到 <project>/.snapshot-orphans/ 便于人工处理。
+   */
+  function recoverOrphanSnapshots() {
+    return withRegistryLock(() => {
+      const results = [];
+      for (const record of registry.projects) {
+        const base = snapshotsDir(record.id);
+        if (!fs.existsSync(base)) continue;
+        const state = readJson(snapshotsFile(record.id), { snapshots: [] });
+        const known = new Set((state.snapshots || []).map((item) => item.dir));
+        let entries = [];
+        try {
+          entries = fs.readdirSync(base, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        const orphans = entries
+          .filter((item) => item.isDirectory() && !known.has(item.name))
+          .map((item) => item.name);
+        if (orphans.length === 0) continue;
+        const trashDir = path.join(projectDirOf(record.id), '.snapshot-orphans');
+        fs.mkdirSync(trashDir, { recursive: true });
+        for (const name of orphans) {
+          try {
+            fs.renameSync(
+              path.join(base, name),
+              path.join(trashDir, `${name}-${Date.now()}`),
+            );
+          } catch {
+            // 单个目录移动失败不影响其他
+          }
+        }
+        appendRecoveryEvidence(record.id, {
+          event: 'orphan-snapshots-quarantined',
+          dirs: orphans,
+        });
+        results.push({ id: record.id, quarantined: orphans });
+      }
+      return results;
+    });
   }
 
   function appendRound(id, round) {
@@ -982,6 +1282,7 @@ function createProjectRegistry(options = {}) {
     snapshot,
     validateSnapshot,
     recoverInterruptedRollbacks,
+    recoverOrphanSnapshots,
     listSnapshots,
     diff,
     rollback,
@@ -1005,5 +1306,6 @@ module.exports = {
   validateProjectId,
   ProjectError,
   digestManifest,
+  withHomeLock,
   DEFAULT_EXCLUDES,
 };

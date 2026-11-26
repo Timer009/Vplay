@@ -27,20 +27,27 @@ const DEFAULT_EXCLUDES = new Set([
 ]);
 
 /**
- * 敏感文件策略（NEW-04 / NEW-05）：导入、快照、Diff、预览使用同一套判定。
- * 只按「文件名 + 内容特征」判断，不误伤 gameConfig.json 这类正常配置。
+ * 敏感文件策略（NEW-04 / NEW-05 / NEW-C04-01）：
+ * 名字级规则只对「配置类扩展名」生效；图片/音频/字体等资产不做名字级判定，
+ * 避免 token.png / secret-door.png / credentials-ui.json 这类正常素材被误伤。
+ * 资产的凭据风险由预览阶段的 containsSecretContent() 兜底。
  */
-const SENSITIVE_NAME_PATTERNS = [
-  /^id_(rsa|dsa|ecdsa|ed25519)(\.|$)/i,
-  /(^|[-_.])(credential|credentials|secret|secrets|token|apikey|api-key)([-_.]|$)/i,
-  /service[-_]?account/i,
-  /firebase[-_]?config/i,
-  /^(keypair|private[-_]?key)\.(pem|key|p12|pfx)$/i,
-];
+const CONFIG_EXTENSIONS = new Set([
+  '.json', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.env', '.yaml', '.yml',
+  '.ini', '.cfg', '.conf', '.properties', '.txt', '.toml', '.xml',
+  '.pem', '.key', '.p12', '.pfx', '.jks', '.keystore', '.crt', '.cer', '.log',
+]);
 const SENSITIVE_EXTENSIONS = new Set([
   '.pem', '.key', '.p12', '.pfx', '.jks', '.keystore', '.crt', '.cer',
   '.log', '.pcap', '.sqlite', '.db',
 ]);
+const CONFIG_NAME_PATTERNS = [
+  // credentials.json / token.json / apikey.yml …（但不匹配 credentials-ui.json）
+  /^(credentials?|creds|secrets?|tokens?|api[-_]?keys?|auth[-_]?keys?)(\.[a-z0-9]+)?$/i,
+  /^(credentials?|secrets?|tokens?)[-_](config|settings)\.(json|ya?ml|js|ts)$/i,
+  /(service[-_]?account|firebase[-_]?config|google[-_]?services)/i,
+  /^id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i,
+];
 const SECRET_CONTENT_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /\bAKIA[0-9A-Z]{16}\b/,
@@ -55,8 +62,11 @@ const SECRET_CONTENT_PATTERNS = [
 function isSensitivePath(relPath) {
   const base = path.basename(relPath);
   if (base.startsWith('.')) return true;
-  if (SENSITIVE_EXTENSIONS.has(path.extname(base).toLowerCase())) return true;
-  return SENSITIVE_NAME_PATTERNS.some((pattern) => pattern.test(base));
+  const ext = path.extname(base).toLowerCase();
+  if (SENSITIVE_EXTENSIONS.has(ext)) return true;
+  // 资产扩展名（png/mp3/woff2/glb…）不做名字级判定
+  if (!CONFIG_EXTENSIONS.has(ext)) return false;
+  return CONFIG_NAME_PATTERNS.some((pattern) => pattern.test(base));
 }
 
 /** 只读文件头判断是否包含私钥 / API Key 特征（预览发布前使用）。 */

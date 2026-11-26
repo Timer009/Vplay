@@ -100,6 +100,10 @@
   `withRegistryLock()`（`<VPLAY_HOME>/.opengame/registry.lock`，O_EXCL + pid 存活/超时回收）；
   注册表与清单仍是「临时文件 + rename」原子写；seq 取 `max(state.seq, 已有 seq)+1`。
 - 证据：两个进程各并发 5 次快照 → 注册表 **11 条**（initial + 10）、目录 **11 个**、seq 无重复。
+- **结论更正（C04 复审）**：该用例实际只有 2 路并发，**不足以证明高并发安全**。
+  C04 在 10 路并发下复现了丢更新、重复 seq 与不可回退快照；本轮结论应修正为
+  「2 路串行并发成立，高并发未覆盖」。高并发修复与 5 路/10 路 × 10 次回归见
+  `docs/reports/SPRINT-02-B04-REPORT.md` §1。
 
 ## 3. 测试与构建
 
