@@ -121,6 +121,7 @@ for ($i=1; $i -le 5; $i++) { node --test remote/test/concurrency.test.cjs }
 
 ## 8. 提交
 
-- 最终完整 SHA：`<!-- SHA -->`
+- 实现提交（最终完整 SHA）：`77516f7714779592803f8bd64fdb6307f8313ee5`
+- 本报告以紧随其后的文档提交落库；分支 tip 以远端 `sprint-02-project-adoption` 为准
 - 分支：`sprint-02-project-adoption`（推送，不合并 main，不 force push）
 - 未使用真实模型/真实密钥，未开放公网。
