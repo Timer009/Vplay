@@ -93,6 +93,14 @@ const PROMPT_RATE_LIMIT = Number(process.env.REMOTE_RATE_LIMIT || 10);
 const LOGIN_RATE_LIMIT = Number(process.env.REMOTE_LOGIN_RATE_LIMIT || 10);
 const RATE_WINDOW_MS = 60 * 1000;
 
+// P1-3：Host 白名单（控制面与预览面共用；必须在创建预览服务前定义）
+const ALLOWED_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+if (HOST && HOST !== '0.0.0.0' && HOST !== '::') ALLOWED_HOSTS.add(String(HOST).toLowerCase());
+for (const entry of String(process.env.REMOTE_ALLOWED_HOSTS || '').split(',')) {
+  const value = entry.trim().toLowerCase();
+  if (value) ALLOWED_HOSTS.add(value);
+}
+
 const { token: TOKEN, source: TOKEN_SOURCE } = resolveToken();
 const REMOTE_ENABLED = Boolean(TOKEN);
 
@@ -138,7 +146,17 @@ const LEGACY_PREVIEW_DIR = path.join(RUNTIME_DIR, '.preview-legacy');
 function rebuildLegacyPreview() {
   if (projects) return null;
   try {
-    copyPreviewTree(WORKSPACE, LEGACY_PREVIEW_DIR);
+    const result = copyPreviewTree(WORKSPACE, LEGACY_PREVIEW_DIR);
+    try {
+      fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+      fs.writeFileSync(
+        path.join(RUNTIME_DIR, '.publish-legacy-manifest.json'),
+        JSON.stringify({ generatedAt: new Date().toISOString(), ...result.manifest }, null, 2),
+        'utf-8',
+      );
+    } catch {
+      // 清单写入失败不影响预览
+    }
     return fs.existsSync(path.join(LEGACY_PREVIEW_DIR, 'index.html'))
       ? LEGACY_PREVIEW_DIR
       : null;
@@ -151,6 +169,7 @@ const previewServer = createPreviewServer({
   projects,
   // 单工作区模式也只暴露独立预览产物目录；项目模式只暴露 .preview
   legacyRoot: projects ? null : LEGACY_PREVIEW_DIR,
+  allowedHosts: ALLOWED_HOSTS,
   logger: (line) => console.log(line),
 });
 
@@ -216,13 +235,6 @@ function dropSession(sessionId) {
 }
 
 // ---- Host / Origin 白名单（P1-3）----
-const ALLOWED_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
-if (HOST && HOST !== '0.0.0.0' && HOST !== '::') ALLOWED_HOSTS.add(String(HOST).toLowerCase());
-for (const entry of String(process.env.REMOTE_ALLOWED_HOSTS || '').split(',')) {
-  const value = entry.trim().toLowerCase();
-  if (value) ALLOWED_HOSTS.add(value);
-}
-
 function hostAllowed(req) {
   const raw = String(req.headers.host || '');
   const hostname = raw.replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
@@ -485,9 +497,20 @@ function serveConsole(res) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-  const pathname = url.pathname.replace(/\/+$/, '') || '/';
+  // NEW-01：不信任 Host 做 URL 解析，畸形 Host 只返回 400，绝不抛异常
   const method = req.method || 'GET';
+  let pathname = '/';
+  let params = new URLSearchParams();
+  try {
+    const rawUrl = String(req.url || '/');
+    const qIndex = rawUrl.indexOf('?');
+    const rawPath = qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
+    pathname = rawPath.replace(/\/+$/, '') || '/';
+    params = new URLSearchParams(qIndex >= 0 ? rawUrl.slice(qIndex + 1) : '');
+  } catch {
+    sendJson(res, 400, { ok: false, error: 'bad request' });
+    return;
+  }
 
   try {
     // P1-3：Host 白名单，防 DNS rebinding
@@ -599,8 +622,8 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/tasks' && method === 'GET') {
       if (!requireAuth(req, res)) return;
-      const limit = Math.min(Number(url.searchParams.get('limit') || 20), 50);
-      const projectFilter = url.searchParams.get('projectId');
+      const limit = Math.min(Number(params.get('limit') || 20), 50);
+      const projectFilter = params.get('projectId');
       let tasks = store.list();
       if (projectFilter) tasks = tasks.filter((t) => (t.projectId || 'default') === projectFilter);
       tasks = tasks.slice(-limit).reverse().map(publicTask);
@@ -705,7 +728,7 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/artifact' && method === 'GET') {
       if (!requireAuth(req, res)) return;
-      const projectId = url.searchParams.get('projectId') || (projects ? null : 'default');
+      const projectId = params.get('projectId') || (projects ? null : 'default');
       if (projects && !projectId) {
         const all = projects.list();
         sendJson(res, 200, {
@@ -769,8 +792,8 @@ const server = http.createServer(async (req, res) => {
       try {
         const detail = projects.get(projectId);
         if (rest[1] === 'diff') {
-          const from = Number(url.searchParams.get('from'));
-          const toParam = url.searchParams.get('to');
+          const from = Number(params.get('from'));
+          const toParam = params.get('to');
           const to = !toParam || toParam === 'current' ? 'current' : Number(toParam);
           if (!Number.isFinite(from) || from <= 0) {
             sendJson(res, 400, { ok: false, error: 'from must be a snapshot seq' });
@@ -849,6 +872,15 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// NEW-01：畸形请求只影响当前连接/请求，不让进程崩溃
+server.on('clientError', (error, socket) => {
+  try {
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+  } catch {
+    // 忽略
+  }
+});
+
 // ---- 启动 ----
 // P1-6：单工作区互斥锁，防止两个实例同时写同一工作区
 const SERVER_LOCK = path.join(RUNTIME_DIR, 'server.lock');
@@ -902,6 +934,20 @@ if (!acquireServerLock()) {
 }
 
 rebuildLegacyPreview();
+
+// NEW-02：上次回退中途崩溃时，用 journal 指向的备份还原工作区
+if (projects) {
+  try {
+    const recoveredRollbacks = projects.recoverInterruptedRollbacks();
+    if (recoveredRollbacks.length > 0) {
+      console.log(
+        `[remote] rollback recovery: ${JSON.stringify(recoveredRollbacks)}`,
+      );
+    }
+  } catch (error) {
+    console.error(`[remote] rollback recovery failed: ${error.message}`);
+  }
+}
 
 const recovered = store.recoverOnStartup();
 if (recovered.length > 0) {
@@ -966,3 +1012,17 @@ function shutdown(signal) {
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// 异常边界：未捕获错误记录后优雅退出，避免进程处于半死状态
+process.on('uncaughtException', (error) => {
+  console.error(`[remote] uncaught exception: ${error && error.stack ? error.stack : error}`);
+  try {
+    fs.rmSync(SERVER_LOCK, { force: true });
+  } catch {
+    // 忽略
+  }
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error(`[remote] unhandled rejection: ${reason}`);
+});

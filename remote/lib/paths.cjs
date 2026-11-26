@@ -22,8 +22,59 @@ const DEFAULT_EXCLUDES = new Set([
   'node_modules',
   '.opengame',
   '.snapshots',
+  '.preview',
   'dist',
 ]);
+
+/**
+ * 敏感文件策略（NEW-04 / NEW-05）：导入、快照、Diff、预览使用同一套判定。
+ * 只按「文件名 + 内容特征」判断，不误伤 gameConfig.json 这类正常配置。
+ */
+const SENSITIVE_NAME_PATTERNS = [
+  /^id_(rsa|dsa|ecdsa|ed25519)(\.|$)/i,
+  /(^|[-_.])(credential|credentials|secret|secrets|token|apikey|api-key)([-_.]|$)/i,
+  /service[-_]?account/i,
+  /firebase[-_]?config/i,
+  /^(keypair|private[-_]?key)\.(pem|key|p12|pfx)$/i,
+];
+const SENSITIVE_EXTENSIONS = new Set([
+  '.pem', '.key', '.p12', '.pfx', '.jks', '.keystore', '.crt', '.cer',
+  '.log', '.pcap', '.sqlite', '.db',
+]);
+const SECRET_CONTENT_PATTERNS = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /\bAKIA[0-9A-Z]{16}\b/,
+  /\bsk-[A-Za-z0-9_-]{20,}\b/,
+  /\bAIza[0-9A-Za-z_-]{35}\b/,
+  /"client_secret"\s*:/i,
+  /"private_key"\s*:/i,
+  /\bghp_[A-Za-z0-9]{20,}\b/,
+  /xox[baprs]-[A-Za-z0-9-]{10,}/,
+];
+
+function isSensitivePath(relPath) {
+  const base = path.basename(relPath);
+  if (base.startsWith('.')) return true;
+  if (SENSITIVE_EXTENSIONS.has(path.extname(base).toLowerCase())) return true;
+  return SENSITIVE_NAME_PATTERNS.some((pattern) => pattern.test(base));
+}
+
+/** 只读文件头判断是否包含私钥 / API Key 特征（预览发布前使用）。 */
+function containsSecretContent(file, maxBytes = 8192) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const buffer = Buffer.alloc(maxBytes);
+      const read = fs.readSync(fd, buffer, 0, maxBytes, 0);
+      const head = buffer.subarray(0, read).toString('utf-8');
+      return SECRET_CONTENT_PATTERNS.some((pattern) => pattern.test(head));
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
 
 function isInside(root, target) {
   const rel = path.relative(path.resolve(root), path.resolve(target));
@@ -107,6 +158,7 @@ function sha256File(file) {
 function walkFiles(rootDir, options = {}) {
   const excludes = options.excludes || DEFAULT_EXCLUDES;
   const maxFiles = options.maxFiles || 50000;
+  const includeSensitive = options.includeSensitive === true;
   const out = [];
 
   function walk(current, depth) {
@@ -120,9 +172,13 @@ function walkFiles(rootDir, options = {}) {
     for (const entry of entries) {
       if (excludes.has(entry.name)) continue;
       const full = path.join(current, entry.name);
+      // 不跟随 symlink / junction（NEW-03），避免哈希外部数据
+      if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) {
         walk(full, depth + 1);
       } else if (entry.isFile()) {
+        const rel = path.relative(rootDir, full).split(path.sep).join('/');
+        if (!includeSensitive && isSensitivePath(rel)) continue;
         out.push(full);
       }
     }
@@ -164,21 +220,40 @@ function compareManifests(before, after) {
   return { added, removed, modified };
 }
 
-/** 复制目录（跳过 excludes）。 */
+/** 复制目录（跳过 excludes、符号链接与敏感文件）。 */
 function copyTree(sourceDir, targetDir, options = {}) {
   const excludes = options.excludes || DEFAULT_EXCLUDES;
+  const includeSensitive = options.includeSensitive === true;
+  const skippedLinks = [];
   fs.mkdirSync(targetDir, { recursive: true });
   fs.cpSync(path.resolve(sourceDir), path.resolve(targetDir), {
     recursive: true,
     force: true,
     errorOnExist: false,
+    dereference: false,
     filter: (src) => {
-      const name = path.basename(src);
-      // 只按目录名过滤，允许顶层自身
       if (path.resolve(src) === path.resolve(sourceDir)) return true;
-      return !excludes.has(name);
+      const name = path.basename(src);
+      if (excludes.has(name)) return false;
+      let stat;
+      try {
+        stat = fs.lstatSync(src);
+      } catch {
+        return false;
+      }
+      if (stat.isSymbolicLink()) {
+        skippedLinks.push(path.relative(sourceDir, src).split(path.sep).join('/'));
+        return false;
+      }
+      if (!includeSensitive) {
+        const rel = path.relative(sourceDir, src).split(path.sep).join('/');
+        if (stat.isFile() && isSensitivePath(rel)) return false;
+      }
+      return true;
     },
   });
+  copyTree.lastSkippedLinks = skippedLinks;
+  return { skippedLinks };
 }
 
 /** 清空目录内容（保留目录本身），跳过 excludes。 */
@@ -334,7 +409,11 @@ function copyPreviewTree(sourceDir, targetDir, options = {}) {
   fs.mkdirSync(dest, { recursive: true });
 
   let copied = 0;
-  let skipped = 0;
+  const skipped = [];
+
+  function skip(rel, reason) {
+    skipped.push({ path: rel, reason });
+  }
 
   function walk(current) {
     let entries;
@@ -344,52 +423,75 @@ function copyPreviewTree(sourceDir, targetDir, options = {}) {
       return;
     }
     for (const entry of entries) {
+      const rel = path.relative(root, path.join(current, entry.name)).split(path.sep).join('/');
       if (entry.name.startsWith('.')) {
-        skipped += 1;
+        skip(rel, 'dot-file');
         continue;
       }
       const full = path.join(current, entry.name);
+      if (entry.isSymbolicLink()) {
+        skip(rel, 'symlink');
+        continue;
+      }
       if (entry.isDirectory()) {
         if (entry.name === 'node_modules') {
-          skipped += 1;
+          skip(rel, 'node_modules');
           continue;
         }
         walk(full);
         continue;
       }
       if (!entry.isFile()) {
-        // symlink / junction：不跟随
-        skipped += 1;
+        skip(rel, 'not-a-file');
         continue;
       }
       if (!isPreviewable(entry.name)) {
-        skipped += 1;
+        skip(rel, 'extension');
+        continue;
+      }
+      // NEW-04：文件名级敏感规则 + 内容特征，双重过滤
+      if (isSensitivePath(rel)) {
+        skip(rel, 'sensitive-name');
+        continue;
+      }
+      if (containsSecretContent(full)) {
+        skip(rel, 'secret-content');
         continue;
       }
       if (copied >= maxFiles) {
-        skipped += 1;
+        skip(rel, 'max-files');
         continue;
       }
-      const rel = path.relative(root, full);
-      const target = path.join(dest, rel);
+      const target = path.join(dest, path.relative(root, full));
       fs.mkdirSync(path.dirname(target), { recursive: true });
       try {
         fs.copyFileSync(full, target);
         copied += 1;
       } catch {
-        skipped += 1;
+        skip(rel, 'copy-error');
       }
     }
   }
 
   walk(root);
-  return { copied, skipped };
+  return {
+    copied,
+    skippedCount: skipped.length,
+    skipped,
+    manifest: {
+      generatedAt: new Date().toISOString(),
+      published: copied,
+      skipped,
+    },
+  };
 }
 
 module.exports = {
   DEFAULT_EXCLUDES,
   PREVIEW_EXTENSIONS,
   isPreviewable,
+  isSensitivePath,
+  containsSecretContent,
   isInside,
   realpathSafe,
   resolveStaticFile,

@@ -25,6 +25,7 @@ const crypto = require('crypto');
 const {
   DEFAULT_EXCLUDES,
   isInside,
+  isSensitivePath,
   hashTree,
   compareManifests,
   copyTree,
@@ -35,7 +36,55 @@ const {
 } = require('./paths.cjs');
 
 const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,39}$/;
+const SNAPSHOT_DIR_PATTERN = /^\d{3,}-[a-z0-9-]+$/;
 const MAX_SNAPSHOTS = 50;
+const LOCK_TIMEOUT_MS = 10000;
+const LOCK_STALE_MS = 30000;
+
+function sleepSync(ms) {
+  const buffer = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+}
+
+/** 只删除链接本身（junction/symlink），绝不跟随到目标目录。 */
+function removeLinkOnly(target) {
+  try {
+    const stat = fs.lstatSync(target);
+    if (!stat.isSymbolicLink()) return;
+    try {
+      fs.unlinkSync(target);
+    } catch {
+      fs.rmdirSync(target);
+    }
+  } catch {
+    // 不存在或已被删除
+  }
+}
+
+/** 找出目录中的 symlink / junction（不跟随），用于导入前显式拒绝（NEW-03）。 */
+function findLinks(rootDir) {
+  const links = [];
+  function walk(current, depth) {
+    if (depth > 12) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (DEFAULT_EXCLUDES.has(entry.name)) continue;
+      const full = path.join(current, entry.name);
+      if (entry.isSymbolicLink()) {
+        links.push(path.relative(rootDir, full).split(path.sep).join('/'));
+        continue;
+      }
+      if (entry.isDirectory()) walk(full, depth + 1);
+    }
+  }
+  walk(path.resolve(rootDir), 0);
+  return links;
+}
 
 class ProjectError extends Error {
   constructor(message, statusCode = 400, code = 'PROJECT_ERROR') {
@@ -171,6 +220,64 @@ function createProjectRegistry(options = {}) {
     writeJson(registryFile, registry);
   }
 
+  /**
+   * 注册表 / 快照 / 回退的统一互斥锁（NEW-06）。
+   * 同进程内 JS 单线程已串行；文件锁用于多进程（CLI + server）并发时防止丢更新。
+   */
+  function withRegistryLock(fn) {
+    const dir = path.join(home, '.opengame');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'registry.lock');
+    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    for (;;) {
+      try {
+        const fd = fs.openSync(file, 'wx');
+        fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+        fs.closeSync(fd);
+        break;
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        let info = null;
+        try {
+          info = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        } catch {
+          info = null;
+        }
+        let alive = false;
+        if (info && info.pid) {
+          try {
+            process.kill(info.pid, 0);
+            alive = true;
+          } catch {
+            alive = false;
+          }
+        }
+        const stale = !alive || (info && Date.now() - Number(info.at || 0) > LOCK_STALE_MS);
+        if (stale) {
+          try {
+            fs.rmSync(file, { force: true });
+          } catch {
+            // 继续重试
+          }
+          continue;
+        }
+        if (Date.now() > deadline) {
+          throw new ProjectError('registry is busy', 409, 'REGISTRY_LOCKED');
+        }
+        sleepSync(50);
+      }
+    }
+    try {
+      return fn();
+    } finally {
+      try {
+        fs.rmSync(file, { force: true });
+      } catch {
+        // 忽略
+      }
+    }
+  }
+
   function projectDirOf(id) {
     return path.join(projectsRoot, id);
   }
@@ -221,7 +328,11 @@ function createProjectRegistry(options = {}) {
     };
   }
 
-  function importProject({ sourceDir, id, name, entry }) {
+  function importProject(args) {
+    return withRegistryLock(() => importProjectUnlocked(args));
+  }
+
+  function importProjectUnlocked({ sourceDir, id, name, entry }) {
     const source = path.resolve(sourceDir);
     validateProjectId(id);
     if (raw(id)) throw new ProjectError(`项目 ID 已存在: ${id}`, 409, 'PROJECT_EXISTS');
@@ -232,6 +343,15 @@ function createProjectRegistry(options = {}) {
         '未找到入口 index.html（深度 <= 3），请用 --entry 指定',
         400,
         'ENTRY_NOT_FOUND',
+      );
+    }
+    // NEW-03：含 symlink / junction 的工程在复制前显式拒绝，原工程不受影响
+    const links = findLinks(source);
+    if (links.length > 0) {
+      throw new ProjectError(
+        `工程包含不支持的符号链接/目录联接（${links.length} 个）：${links.slice(0, 5).join(', ')}`,
+        400,
+        'SYMLINK_UNSUPPORTED',
       );
     }
     let resolvedEntry = detected.entry;
@@ -250,7 +370,11 @@ function createProjectRegistry(options = {}) {
     fs.mkdirSync(dir, { recursive: true });
     const srcDir = path.join(dir, 'src');
 
-    // 1) 导入前哈希原始工程
+    // 1) 导入前哈希原始工程（NEW-05：敏感文件统一排除，与快照/Diff/预览一致）
+    const sourceFiles = walkFiles(source, { includeSensitive: true });
+    const skippedSensitive = sourceFiles
+      .map((file) => path.relative(source, file).split(path.sep).join('/'))
+      .filter((rel) => isSensitivePath(rel));
     const before = hashTree(source);
     const beforeDigest = digestManifest(before);
 
@@ -297,13 +421,14 @@ function createProjectRegistry(options = {}) {
         fileCount: Object.keys(before).length,
         hashDigest: beforeDigest,
         originalUnchanged: afterDigest === beforeDigest,
+        skippedSensitive,
       },
     });
     writeJson(memoryPath(id), { rounds: [] });
     writeJson(snapshotsFile(id), { seq: 0, snapshots: [] });
 
     // 5) 初始快照 = 导入时的状态，可随时回退
-    const initial = snapshot(id, 'initial');
+    const initial = snapshotInternal(id, 'initial');
 
     return {
       project: get(id),
@@ -311,13 +436,18 @@ function createProjectRegistry(options = {}) {
         fileCount: Object.keys(before).length,
         hashDigest: beforeDigest,
         originalUnchanged: afterDigest === beforeDigest,
+        skippedSensitive,
         initialSnapshot: initial.seq,
       },
     };
   }
 
   /** Create Mode：直接以现有工作区注册一个受控项目（不复制）。 */
-  function registerWorkspace({ id = 'default', name = 'Create Mode workspace', workspaceDir, entry }) {
+  function registerWorkspace(args) {
+    return withRegistryLock(() => registerWorkspaceUnlocked(args));
+  }
+
+  function registerWorkspaceUnlocked({ id = 'default', name = 'Create Mode workspace', workspaceDir, entry }) {
     const src = path.resolve(workspaceDir);
     validateProjectId(id);
     const existing = raw(id);
@@ -409,10 +539,20 @@ function createProjectRegistry(options = {}) {
       fs.rmSync(dest, { recursive: true, force: true });
       return null;
     }
+    let result;
     try {
-      copyPreviewTree(source, dest);
+      result = copyPreviewTree(source, dest);
     } catch {
       return null;
+    }
+    // NEW-04：发布清单落盘，便于审计「发布了什么、跳过了什么」
+    try {
+      writeJson(path.join(projectDirOf(id), '.publish-manifest.json'), {
+        projectId: id,
+        ...result.manifest,
+      });
+    } catch {
+      // 清单写入失败不影响预览
     }
     const entryRel = record.kind === 'vite' ? 'index.html' : record.entry || 'index.html';
     if (!fs.existsSync(path.join(dest, entryRel))) return null;
@@ -434,51 +574,118 @@ function createProjectRegistry(options = {}) {
     return readJson(snapshotsFile(id), { snapshots: [] }).snapshots || [];
   }
 
+  /** NEW-02：快照目录必须落在 .snapshots 内且命名合法，否则一律拒绝。 */
   function snapshotPath(id, entry) {
-    return path.join(snapshotsDir(id), entry.dir);
+    if (!entry || typeof entry.dir !== 'string' || !SNAPSHOT_DIR_PATTERN.test(entry.dir)) {
+      throw new ProjectError('快照目录名非法，拒绝回退', 409, 'SNAPSHOT_PATH_INVALID');
+    }
+    const base = snapshotsDir(id);
+    const resolved = path.resolve(base, entry.dir);
+    if (!isInside(base, resolved)) {
+      throw new ProjectError('快照目录越界，拒绝回退', 409, 'SNAPSHOT_PATH_INVALID');
+    }
+    return resolved;
+  }
+
+  function manifestPathOf(id, seq) {
+    return path.join(snapshotsDir(id), `${String(seq).padStart(3, '0')}.manifest.json`);
+  }
+
+  /** 清单缺失/损坏必须报错，绝不回退为 {}（否则会把工作区删空）。 */
+  function manifestOf(id, entry) {
+    const file = manifestPathOf(id, entry.seq);
+    if (!fs.existsSync(file)) {
+      throw new ProjectError('快照清单缺失，拒绝回退', 409, 'SNAPSHOT_MANIFEST_MISSING');
+    }
+    const parsed = readJson(file, null);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new ProjectError('快照清单损坏，拒绝回退', 409, 'SNAPSHOT_MANIFEST_INVALID');
+    }
+    if (Object.keys(parsed).length === 0) {
+      throw new ProjectError('快照清单为空，拒绝回退', 409, 'SNAPSHOT_MANIFEST_EMPTY');
+    }
+    return parsed;
+  }
+
+  /**
+   * 回退前的完整预验证（NEW-02）：目录边界、清单、摘要、实际内容必须全部一致。
+   * 任何一项不通过都在「删除/写入之前」抛出。
+   */
+  function validateSnapshot(id, seq) {
+    const entry = listSnapshots(id).find((item) => Number(item.seq) === Number(seq));
+    if (!entry) throw new ProjectError(`快照不存在: ${seq}`, 404, 'SNAPSHOT_NOT_FOUND');
+    const dir = snapshotPath(id, entry);
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+      throw new ProjectError('快照目录缺失，拒绝回退', 409, 'SNAPSHOT_DIR_MISSING');
+    }
+    const manifest = manifestOf(id, entry);
+    const digest = digestManifest(manifest);
+    if (entry.digest && entry.digest !== digest) {
+      throw new ProjectError('快照摘要与清单不一致，拒绝回退', 409, 'SNAPSHOT_DIGEST_MISMATCH');
+    }
+    if (digestManifest(hashTree(dir)) !== digest) {
+      throw new ProjectError('快照内容与清单不一致，拒绝回退', 409, 'SNAPSHOT_CORRUPT');
+    }
+    return { entry, dir, manifest, digest };
   }
 
   function snapshot(id, label) {
+    return withRegistryLock(() => snapshotInternal(id, label));
+  }
+
+  function snapshotInternal(id, label) {
     const record = requireProject(id);
     const state = readJson(snapshotsFile(id), { seq: 0, snapshots: [] });
-    const seq = Number(state.seq || 0) + 1;
+    const maxSeq = (state.snapshots || []).reduce(
+      (max, item) => Math.max(max, Number(item.seq) || 0),
+      0,
+    );
+    const seq = Math.max(Number(state.seq || 0), maxSeq) + 1;
     const dirName = `${String(seq).padStart(3, '0')}-${slugify(label)}`;
     const dir = path.join(snapshotsDir(id), dirName);
     fs.mkdirSync(dir, { recursive: true });
 
-    copyTree(record.srcDir, dir);
-    const manifest = hashTree(dir);
-    const entry = {
-      seq,
-      label: label || `snapshot-${seq}`,
-      dir: dirName,
-      createdAt: new Date().toISOString(),
-      fileCount: Object.keys(manifest).length,
-      digest: digestManifest(manifest),
-    };
-    writeJson(path.join(snapshotsDir(id), `${String(seq).padStart(3, '0')}.manifest.json`), manifest);
+    try {
+      const links = findLinks(record.srcDir);
+      const { skippedLinks } = copyTree(record.srcDir, dir);
+      // 兜底：某些平台 cpSync 会把链接本身复制过去，这里只删链接、不跟随目标
+      for (const rel of links) {
+        removeLinkOnly(path.join(dir, rel));
+      }
+      const manifest = hashTree(dir);
+      if (Object.keys(manifest).length === 0) {
+        throw new Error('snapshot is empty');
+      }
+      const entry = {
+        seq,
+        label: label || `snapshot-${seq}`,
+        dir: dirName,
+        createdAt: new Date().toISOString(),
+        fileCount: Object.keys(manifest).length,
+        digest: digestManifest(manifest),
+        skippedLinks: [...new Set([...(skippedLinks || []), ...links])].slice(0, 20),
+      };
+      writeJson(manifestPathOf(id, seq), manifest);
 
-    state.seq = seq;
-    state.snapshots.push(entry);
-    if (state.snapshots.length > MAX_SNAPSHOTS) state.snapshots = state.snapshots.slice(-MAX_SNAPSHOTS);
-    writeJson(snapshotsFile(id), state);
-    return entry;
-  }
-
-  function requireSnapshot(id, seq) {
-    const found = listSnapshots(id).find((item) => Number(item.seq) === Number(seq));
-    if (!found) throw new ProjectError(`快照不存在: ${seq}`, 404, 'SNAPSHOT_NOT_FOUND');
-    return found;
-  }
-
-  function manifestOf(id, entry) {
-    const file = path.join(snapshotsDir(id), `${String(entry.seq).padStart(3, '0')}.manifest.json`);
-    return readJson(file, {});
+      state.seq = seq;
+      state.snapshots = (state.snapshots || []).concat(entry);
+      if (state.snapshots.length > MAX_SNAPSHOTS) {
+        state.snapshots = state.snapshots.slice(-MAX_SNAPSHOTS);
+      }
+      writeJson(snapshotsFile(id), state);
+      return entry;
+    } catch (error) {
+      // NEW-03：失败时清理半成品目录，避免累积并挤占配额
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(manifestPathOf(id, seq), { force: true });
+      throw error;
+    }
   }
 
   function diff(id, fromSeq, to = 'current') {
     const record = requireProject(id);
-    const from = requireSnapshot(id, fromSeq);
+    const from = listSnapshots(id).find((item) => Number(item.seq) === Number(fromSeq));
+    if (!from) throw new ProjectError(`快照不存在: ${fromSeq}`, 404, 'SNAPSHOT_NOT_FOUND');
     const fromDir = snapshotPath(id, from);
     const before = manifestOf(id, from);
 
@@ -490,7 +697,8 @@ function createProjectRegistry(options = {}) {
       after = hashTree(record.srcDir);
       toLabel = 'current';
     } else {
-      const target = requireSnapshot(id, to);
+      const target = listSnapshots(id).find((item) => Number(item.seq) === Number(to));
+      if (!target) throw new ProjectError(`快照不存在: ${to}`, 404, 'SNAPSHOT_NOT_FOUND');
       afterDir = snapshotPath(id, target);
       after = manifestOf(id, target);
       toLabel = Number(to);
@@ -520,29 +728,25 @@ function createProjectRegistry(options = {}) {
   }
 
   /**
-   * 回退到指定快照：
-   *  - 先备份当前状态（pre-rollback-*）
-   *  - 恢复新增/修改/删除全部文件
-   *  - 回退后哈希必须与目标快照一致
-   *  - 不使用 git reset --hard / git clean -fd
+   * 把一棵已校验的树写入工作区：
+   *  - 删除「当前有、目标没有」的文件（只限 manifest 内、非敏感、非排除目录）
+   *  - 写回目标树全部文件
+   *  - 返回执行后的摘要与是否一致
    */
-  function rollback(id, seq) {
+  function applyTree(id, treeDir, treeManifest) {
     const record = requireProject(id);
-    const target = requireSnapshot(id, seq);
-    const targetManifest = manifestOf(id, target);
-    const targetDir = snapshotPath(id, target);
-
-    const backup = snapshot(id, `pre-rollback-${target.seq}`);
-
     const current = hashTree(record.srcDir);
-    const compared = compareManifests(current, targetManifest);
+    const compared = compareManifests(current, treeManifest);
+    const removed = [];
 
-    // 删除「目标里没有」的文件
     for (const rel of compared.removed) {
+      if (isSensitivePath(rel)) continue;
       const full = path.resolve(record.srcDir, rel);
-      if (!isInside(record.srcDir, full)) continue;
-      fs.rmSync(full, { recursive: false, force: true });
-      // 清理空目录（不越过工作区）
+      if (!isInside(record.srcDir, full)) {
+        throw new ProjectError('回退路径越界', 500, 'ROLLBACK_PATH_INVALID');
+      }
+      fs.rmSync(full, { force: true });
+      removed.push(rel);
       let parent = path.dirname(full);
       while (isInside(record.srcDir, parent) && parent !== path.resolve(record.srcDir)) {
         try {
@@ -555,38 +759,142 @@ function createProjectRegistry(options = {}) {
       }
     }
 
-    // 写回目标快照中的所有文件
-    for (const rel of Object.keys(targetManifest)) {
-      const from = path.join(targetDir, rel);
+    const restored = [];
+    for (const rel of Object.keys(treeManifest)) {
+      if (isSensitivePath(rel)) continue;
+      const from = path.join(treeDir, rel);
       const to = path.resolve(record.srcDir, rel);
-      if (!isInside(record.srcDir, to)) continue;
+      if (!isInside(record.srcDir, to)) {
+        throw new ProjectError('回退写入路径越界', 500, 'ROLLBACK_PATH_INVALID');
+      }
       fs.mkdirSync(path.dirname(to), { recursive: true });
       fs.copyFileSync(from, to);
+      restored.push(rel);
     }
 
-    const restored = hashTree(record.srcDir);
-    const verified = digestManifest(restored) === digestManifest(targetManifest);
-
-    // 回退后刷新独立预览产物（预览面永远不直读 src）
-    let preview = null;
-    try {
-      preview = buildPreview(id);
-    } catch {
-      preview = null;
-    }
-
+    const digest = digestManifest(hashTree(record.srcDir));
     return {
-      projectId: id,
-      restoredSeq: Number(seq),
-      backupSeq: backup.seq,
-      files: {
-        removed: compared.removed,
-        restored: compared.added.concat(compared.modified),
-      },
-      verified,
-      previewReady: Boolean(preview),
-      digest: digestManifest(restored),
+      removed,
+      restored,
+      digest,
+      equal: digest === digestManifest(treeManifest),
     };
+  }
+
+  function journalPathOf(id) {
+    return path.join(projectDirOf(id), '.rollback-journal.json');
+  }
+
+  /** NEW-02：回退 = 预验证 → 备份 → 暂存目录 → 校验 → 应用 → 失败自动还原。 */
+  function rollback(id, seq) {
+    return withRegistryLock(() => rollbackUnlocked(id, seq));
+  }
+
+  function rollbackUnlocked(id, seq) {
+    // 预验证：目录边界 / 清单存在 / 摘要一致 / 内容未被篡改
+    const target = validateSnapshot(id, seq);
+
+    // 先备份当前状态，并验证备份可用
+    const backup = snapshotInternal(id, `pre-rollback-${target.entry.seq}`);
+    const backupTree = validateSnapshot(id, backup.seq);
+
+    const staging = path.join(
+      projectDirOf(id),
+      `.rollback-staging-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    );
+    const journal = journalPathOf(id);
+
+    try {
+      fs.mkdirSync(staging, { recursive: true });
+      copyTree(target.dir, staging);
+      if (digestManifest(hashTree(staging)) !== target.digest) {
+        throw new ProjectError('暂存恢复目录校验失败，已中止', 500, 'ROLLBACK_STAGE_MISMATCH');
+      }
+
+      writeJson(journal, {
+        state: 'applying',
+        targetSeq: target.entry.seq,
+        backupSeq: backup.seq,
+        staging,
+        startedAt: new Date().toISOString(),
+      });
+
+      const applied = applyTree(id, staging, target.manifest);
+      if (!applied.equal) {
+        throw new ProjectError('回退后完整性校验失败', 500, 'ROLLBACK_VERIFY_FAILED');
+      }
+
+      fs.rmSync(journal, { force: true });
+      let preview = null;
+      try {
+        preview = buildPreview(id);
+      } catch {
+        preview = null;
+      }
+
+      return {
+        projectId: id,
+        restoredSeq: target.entry.seq,
+        backupSeq: backup.seq,
+        files: { removed: applied.removed, restored: applied.restored },
+        verified: true,
+        previewReady: Boolean(preview),
+        digest: applied.digest,
+      };
+    } catch (error) {
+      // 失败恢复：用刚建立的备份把工作区还原，保证不丢文件
+      let recovered = false;
+      try {
+        const restoredTree = applyTree(id, backupTree.dir, backupTree.manifest);
+        recovered = restoredTree.equal;
+      } catch {
+        recovered = false;
+      }
+      try {
+        buildPreview(id);
+      } catch {
+        // 忽略
+      }
+      if (!recovered) {
+        // 保留 journal，供服务重启时再次恢复
+        throw new ProjectError(
+          `回退失败且自动还原未通过校验，请查看 ${journal}`,
+          500,
+          'ROLLBACK_RECOVERY_FAILED',
+        );
+      }
+      fs.rmSync(journal, { force: true });
+      if (error instanceof ProjectError) throw error;
+      throw new ProjectError(`回退失败，已从备份 #${backup.seq} 恢复`, 500, 'ROLLBACK_FAILED');
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
+    }
+  }
+
+  /** 服务启动时调用：上次回退中途崩溃，按 journal 用备份还原。 */
+  function recoverInterruptedRollbacks() {
+    const results = [];
+    for (const record of registry.projects) {
+      const journal = journalPathOf(record.id);
+      if (!fs.existsSync(journal)) continue;
+      let info = null;
+      try {
+        info = readJson(journal, null);
+      } catch {
+        info = null;
+      }
+      try {
+        if (!info || !info.backupSeq) throw new Error('journal has no backup seq');
+        const tree = validateSnapshot(record.id, info.backupSeq);
+        const applied = applyTree(record.id, tree.dir, tree.manifest);
+        buildPreview(record.id);
+        results.push({ id: record.id, recovered: applied.equal, backupSeq: tree.entry.seq });
+      } catch (error) {
+        results.push({ id: record.id, recovered: false, reason: error.message });
+      }
+      fs.rmSync(journal, { force: true });
+    }
+    return results;
   }
 
   function appendRound(id, round) {
@@ -646,6 +954,10 @@ function createProjectRegistry(options = {}) {
   }
 
   function removeProject(id) {
+    return withRegistryLock(() => removeProjectUnlocked(id));
+  }
+
+  function removeProjectUnlocked(id) {
     const record = requireProject(id);
     if (record.managed) {
       const dir = projectDirOf(id);
@@ -668,6 +980,8 @@ function createProjectRegistry(options = {}) {
     registerWorkspace,
     detect: detectProject,
     snapshot,
+    validateSnapshot,
+    recoverInterruptedRollbacks,
     listSnapshots,
     diff,
     rollback,

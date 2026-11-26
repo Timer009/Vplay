@@ -69,30 +69,98 @@ function sendJson(res, status, payload) {
 function createPreviewServer(options) {
   const projects = options.projects;
   const legacyRoot = options.legacyRoot || null;
+  const allowedHosts = options.allowedHosts || null;
   const logger = options.logger || ((line) => console.log(line));
 
   const server = http.createServer((req, res) => {
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-    const method = req.method || 'GET';
+    try {
+      const method = req.method || 'GET';
+      // NEW-01 / OBS-01：不信任 Host 解析 URL，且补上预览面 Host 白名单
+      const rawUrl = String(req.url || '/');
+      const qIndex = rawUrl.indexOf('?');
+      const pathname = ((qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl).replace(/\/+$/, '')) || '/';
 
-    if (method !== 'GET' && method !== 'HEAD') {
-      sendJson(res, 405, { ok: false, error: 'method not allowed' });
-      return;
-    }
+      if (allowedHosts) {
+        const hostname = String(req.headers.host || '')
+          .replace(/:\d+$/, '')
+          .replace(/^\[|\]$/g, '')
+          .toLowerCase();
+        if (!hostname || !allowedHosts.has(hostname)) {
+          sendJson(res, 400, { ok: false, error: 'host not allowed' });
+          return;
+        }
+      }
 
-    if (url.pathname === '/health') {
-      sendJson(res, 200, { ok: true, service: 'vplay-preview', auth: 'none' });
-      return;
-    }
-
-    // 单工作区模式：只暴露一个 legacy 根目录
-    if (url.pathname === '/legacy' || url.pathname.startsWith('/legacy/')) {
-      if (!legacyRoot) {
-        sendJson(res, 404, { ok: false, error: 'legacy preview is not configured' });
+      if (method !== 'GET' && method !== 'HEAD') {
+        sendJson(res, 405, { ok: false, error: 'method not allowed' });
         return;
       }
-      const rest = url.pathname.replace(/^\/legacy/, '') || '/';
-      const resolved = resolveStaticFile(legacyRoot, rest);
+
+      if (pathname === '/health') {
+        sendJson(res, 200, { ok: true, service: 'vplay-preview', auth: 'none' });
+        return;
+      }
+
+      // 单工作区模式：只暴露一个 legacy 根目录
+      if (pathname === '/legacy' || pathname.startsWith('/legacy/')) {
+        if (!legacyRoot) {
+          sendJson(res, 404, { ok: false, error: 'legacy preview is not configured' });
+          return;
+        }
+        const rest = pathname.replace(/^\/legacy/, '') || '/';
+        const resolved = resolveStaticFile(legacyRoot, rest);
+        if (!resolved.ok) {
+          sendJson(res, resolved.status, {
+            ok: false,
+            error: resolved.status === 403 ? 'forbidden' : 'not found',
+          });
+          return;
+        }
+        fs.readFile(resolved.file, (error, data) => {
+          if (error) {
+            sendJson(res, 404, { ok: false, error: 'not found' });
+            return;
+          }
+          const ext = path.extname(resolved.file).toLowerCase();
+          res.writeHead(200, {
+            'Content-Type': MIME[ext] || 'application/octet-stream',
+            'Content-Length': data.length,
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+            'Referrer-Policy': 'no-referrer',
+            'X-Frame-Options': 'SAMEORIGIN',
+            'Content-Security-Policy': "frame-ancestors 'self'",
+          });
+          res.end(method === 'HEAD' ? undefined : data);
+        });
+        return;
+      }
+
+      const match = /^\/p\/([a-z0-9][a-z0-9-]{1,39})(\/.*)?$/.exec(pathname);
+      if (!match) {
+        sendJson(res, 404, { ok: false, error: 'not found' });
+        return;
+      }
+      const projectId = match[1];
+      const rest = match[2] || '/';
+
+      let root;
+      try {
+        root = projects.previewRoot(projectId);
+      } catch {
+        sendJson(res, 404, { ok: false, error: 'unknown project' });
+        return;
+      }
+      if (!root) {
+        sendJson(res, 409, {
+          ok: false,
+          error: 'preview not built',
+          detail: 'Vite 项目需要先产出 dist/，或该项目缺少入口文件',
+        });
+        return;
+      }
+
+      const resolved = resolveStaticFile(root, rest);
       if (!resolved.ok) {
         sendJson(res, resolved.status, {
           ok: false,
@@ -100,6 +168,7 @@ function createPreviewServer(options) {
         });
         return;
       }
+
       fs.readFile(resolved.file, (error, data) => {
         if (error) {
           sendJson(res, 404, { ok: false, error: 'not found' });
@@ -117,61 +186,23 @@ function createPreviewServer(options) {
         });
         res.end(method === 'HEAD' ? undefined : data);
       });
-      return;
-    }
-
-    const match = /^\/p\/([a-z0-9][a-z0-9-]{1,39})(\/.*)?$/.exec(url.pathname);
-    if (!match) {
-      sendJson(res, 404, { ok: false, error: 'not found' });
-      return;
-    }
-    const projectId = match[1];
-    const rest = match[2] || '/';
-
-    let root;
-    try {
-      root = projects.previewRoot(projectId);
-    } catch {
-      sendJson(res, 404, { ok: false, error: 'unknown project' });
-      return;
-    }
-    if (!root) {
-      sendJson(res, 409, {
-        ok: false,
-        error: 'preview not built',
-        detail: 'Vite 项目需要先产出 dist/，或该项目缺少入口文件',
-      });
-      return;
-    }
-
-    const resolved = resolveStaticFile(root, rest);
-    if (!resolved.ok) {
-      // 不泄露真实路径
-      sendJson(res, resolved.status, {
-        ok: false,
-        error: resolved.status === 403 ? 'forbidden' : 'not found',
-      });
-      return;
-    }
-
-    fs.readFile(resolved.file, (error, data) => {
-      if (error) {
-        sendJson(res, 404, { ok: false, error: 'not found' });
-        return;
+    } catch (error) {
+      // 任何解析/处理异常都只影响当前请求
+      try {
+        if (!res.headersSent) sendJson(res, 400, { ok: false, error: 'bad request' });
+      } catch {
+        // 连接可能已断开
       }
-      const ext = path.extname(resolved.file).toLowerCase();
-      res.writeHead(200, {
-        'Content-Type': MIME[ext] || 'application/octet-stream',
-        'Content-Length': data.length,
-        'Cache-Control': 'no-store',
-        'X-Content-Type-Options': 'nosniff',
-        'Referrer-Policy': 'no-referrer',
-        'X-Frame-Options': 'SAMEORIGIN',
-        // 预览面没有管理接口，显式禁止它被别的站点内嵌。
-        'Content-Security-Policy': "frame-ancestors 'self'",
-      });
-      res.end(method === 'HEAD' ? undefined : data);
-    });
+      logger(`[preview] request error: ${error.message}`);
+    }
+  });
+
+  server.on('clientError', (error, socket) => {
+    try {
+      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    } catch {
+      // 忽略
+    }
   });
 
   server.on('error', (error) => logger(`[preview] error: ${error.message}`));
