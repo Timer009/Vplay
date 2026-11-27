@@ -21,7 +21,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 
 const {
   DEFAULT_EXCLUDES,
@@ -30,7 +30,8 @@ const {
   hashTree,
   compareManifests,
   copyTree,
-  copyPreviewTree,
+  copyPreviewTreeStaged,
+  previewManifestOf,
   emptyTree,
   unifiedDiff,
   walkFiles,
@@ -42,6 +43,7 @@ const MAX_SNAPSHOTS = 200;
 const LOCK_TIMEOUT_MS = 20000;
 const LOCK_RETRY_MS = 15;
 const LOCK_HARD_TTL_MS = 5 * 60 * 1000;
+const LOCK_EMPTY_GRACE_MS = 5000;
 
 function sleepSync(ms) {
   const buffer = new SharedArrayBuffer(4);
@@ -72,6 +74,27 @@ function pidAlive(pid) {
   }
 }
 
+/** 终止整个构建进程树（异步构建超时/回退失败时使用）。 */
+function killProcessTree(child) {
+  if (!child || child.exitCode !== null) return;
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+    } else {
+      child.kill('SIGKILL');
+    }
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // 已退出
+    }
+  }
+}
+
 function readLockInfo(file) {
   try {
     const raw = fs.readFileSync(file, 'utf-8');
@@ -80,6 +103,62 @@ function readLockInfo(file) {
   } catch {
     return null;
   }
+}
+
+function parseLockRaw(raw) {
+  if (!raw || !String(raw).trim()) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 观察锁文件（两次读取 + stat）。
+ *
+ * B10 / C09 B-01 关键修复：**绝不允许把「读不到 / 刚创建还没写入」判为陈旧**。
+ * 只有同时满足下列之一才允许回收：
+ *  - 读到完整内容，且持有者 pid 不存在，或超过 5 分钟硬上限；
+ *  - 文件确实存在，两次读取内容完全一致，且「空文件持续 >5s」或「损坏内容持续 >5min」。
+ */
+function observeLock(file) {
+  const now = () => Date.now();
+  const started = now();
+  let firstRaw = null;
+  let firstStat = null;
+  try {
+    firstRaw = fs.readFileSync(file, 'utf-8');
+    firstStat = fs.statSync(file);
+  } catch {
+    firstStat = null;
+  }
+  sleepSync(20);
+  let secondRaw = null;
+  let secondStat = null;
+  try {
+    secondRaw = fs.readFileSync(file, 'utf-8');
+    secondStat = fs.statSync(file);
+  } catch {
+    secondStat = null;
+  }
+  const info = secondStat ? parseLockRaw(secondRaw) : null;
+  const stableSame =
+    Boolean(firstStat && secondStat) && String(firstRaw) === String(secondRaw);
+  const empty = !String(secondRaw || '').trim();
+  const stat = secondStat || firstStat;
+  const fileAgeMs = stat ? now() - stat.mtimeMs : Infinity;
+  const ageMs = info ? now() - Number(info.at || 0) : Infinity;
+  return {
+    observedAt: started,
+    exists: Boolean(stat),
+    info,
+    stableSame,
+    empty,
+    fileAgeMs,
+    ageMs,
+  };
 }
 
 /**
@@ -110,35 +189,37 @@ function withHomeLock(home, fn, options = {}) {
         throw error;
       }
 
-      // 连续两次读取：用于识别「读到了半写入内容」
-      const first = readLockInfo(file);
-      sleepSync(20);
-      const second = readLockInfo(file);
-      const info = second || first;
-      const age = info ? Date.now() - Number(info.at || 0) : Infinity;
-      let fileAge = Infinity;
-      if (!info) {
-        try {
-          fileAge = Date.now() - fs.statSync(file).mtimeMs;
-        } catch {
-          fileAge = Infinity;
-        }
-      }
+      const observed = observeLock(file);
+      const info = observed.info;
       let stale = false;
-      if (!info) {
-        // 只有「明显的空文件残留」才回收：刚创建未落盘的文件必须等待
-        stale = fileAge > 5000;
-      } else if (!pidAlive(Number(info.pid))) {
-        stale = true; // 持有者已退出（含 SIGKILL）
-      } else if (age > LOCK_HARD_TTL_MS) {
-        stale = true; // 唯一允许的「活进程超时」回收：5 分钟硬上限
+      if (info) {
+        const pid = Number(info.pid);
+        if (!Number.isFinite(pid) || pid <= 0) {
+          // 损坏的 pid：只有文件稳定存在够久才回收
+          stale = observed.stableSame && observed.fileAgeMs > LOCK_EMPTY_GRACE_MS;
+        } else if (!pidAlive(pid)) {
+          stale = true; // 持有者已退出（含 SIGKILL）
+        } else if (observed.ageMs > LOCK_HARD_TTL_MS) {
+          stale = true; // 唯一允许的「活进程超时」回收：5 分钟硬上限
+        }
+      } else if (observed.exists && observed.stableSame) {
+        // 空文件：刚打开还没写完，必须等够宽限期；损坏内容只有在硬上限后才回收
+        if (observed.empty && observed.fileAgeMs > LOCK_EMPTY_GRACE_MS) stale = true;
+        else if (!observed.empty && observed.fileAgeMs > LOCK_HARD_TTL_MS) stale = true;
       }
-      // 注意：绝不因「读到的内容发生变化」而回收——那正是活锁被误删的来源
+      // 读不到（ENOENT）或内容不稳定：一律只重试，绝不回收
+
       if (process.env.VPLAY_LOCK_DEBUG === '1') {
         try {
           fs.appendFileSync(
             path.join(dir, 'lock-debug.log'),
-            `${JSON.stringify({ at: Date.now(), pid: process.pid, first, second, fileAge, stale, code: error.code })}\n`,
+            `${JSON.stringify({
+              at: Date.now(),
+              pid: process.pid,
+              observed,
+              stale,
+              code: error.code,
+            })}\n`,
           );
         } catch {
           // 忽略
@@ -146,31 +227,37 @@ function withHomeLock(home, fn, options = {}) {
       }
 
       if (stale) {
-        // 原子抢占：rename 到唯一 stale 名，再校验是否误抢活锁
+        // 原子抢占：rename 到唯一 stale 名，再按「观察到的 token」逐字校验
         const trash = `${file}.stale-${token}-${Math.random().toString(36).slice(2, 8)}`;
         try {
           fs.renameSync(file, trash);
         } catch (renameError) {
           if (!['ENOENT', 'EPERM', 'EACCES'].includes(renameError.code)) throw renameError;
+          continue;
         }
         const moved = readLockInfo(trash);
-        if (
-          moved &&
-          pidAlive(Number(moved.pid)) &&
-          Date.now() - Number(moved.at || 0) <= LOCK_HARD_TTL_MS
-        ) {
-          // 误抢了活锁：尽量放回，绝不删除
+        const movedToken = moved ? String(moved.token || '') : '';
+        const observedToken = info ? String(info.token || '') : '';
+        const matchesObserved = info ? Boolean(moved) && movedToken === observedToken : !moved;
+        const stillStale = !moved
+          ? true
+          : !Number.isFinite(Number(moved.pid)) ||
+            !pidAlive(Number(moved.pid)) ||
+            Date.now() - Number(moved.at || 0) > LOCK_HARD_TTL_MS;
+        if (!matchesObserved || !stillStale) {
+          // 误抢活锁 / 内容在观察后被替换：绝不删除，尽量放回原处
           try {
             if (!fs.existsSync(file)) fs.renameSync(trash, file);
           } catch {
-            // 放回失败时保留 trash 文件，交给对方/人工处理
+            // 放回失败时保留 trash 文件，交给人工处理
           }
-        } else {
-          try {
-            fs.rmSync(trash, { force: true });
-          } catch {
-            // 忽略
-          }
+          sleepSync(LOCK_RETRY_MS + Math.floor(Math.random() * 15));
+          continue;
+        }
+        try {
+          fs.rmSync(trash, { force: true });
+        } catch {
+          // 忽略
         }
         continue;
       }
@@ -543,6 +630,11 @@ function createProjectRegistry(options = {}) {
     const initial = snapshotInternal(id, 'initial');
 
     // 6) 预热预览（失败不影响导入；GET 不再按需构建）
+    //    Vite：导入时若已有 dist，视为「与当前源码对应的首次构建」，写入构建摘要；
+    //    之后任何源码修改都必须重新构建才能再次发布（B10 / C09 B-03）。
+    if (record.kind === 'vite' && fs.existsSync(path.join(srcDir, 'dist', 'index.html'))) {
+      writeBuildStamp(record, '(imported dist)');
+    }
     try {
       buildPreview(id);
     } catch {
@@ -645,8 +737,8 @@ function createProjectRegistry(options = {}) {
     return entryDir === '.' ? dest : path.join(dest, entryDir);
   }
 
-  /** 执行项目构建（Vite 等）。只传系统必需环境，不传任何模型 Key。 */
-  function buildProject(record) {
+  /** 构建命令与最小环境（只传系统必需变量，不传任何模型 Key）。 */
+  function buildSpec(record) {
     const detected = (record.profile && record.profile.detected) || {};
     const command = detected.buildCommand || 'npm run build';
     const env = {};
@@ -662,24 +754,108 @@ function createProjectRegistry(options = {}) {
     if (process.platform === 'win32') env.Path = env.PATH;
     const shell = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : '/bin/sh';
     const args = process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-c', command];
-    const result = spawnSync(shell, args, {
+    return { command, env, shell, args };
+  }
+
+  /** 同步构建（仅用于启动期恢复等不可并发的路径）。 */
+  function buildProject(record) {
+    const spec = buildSpec(record);
+    const result = spawnSync(spec.shell, spec.args, {
       cwd: record.srcDir,
-      env,
+      env: spec.env,
       timeout: 5 * 60 * 1000,
       windowsHide: true,
       encoding: 'utf-8',
     });
+    if (result.status === 0) writeBuildStamp(record, spec.command);
     return {
       ok: result.status === 0,
       status: result.status,
-      command,
+      command: spec.command,
       stderr: String(result.stderr || '').slice(-4000),
     };
   }
 
   /**
-   * 全量预览新鲜度校验（C07-P1-06 / ORD-11）：
-   * 发布清单中的每个文件，其预览哈希必须等于清单哈希，且等于当前源码/构建产物哈希。
+   * 异步构建（B10 / C09 B-04）：spawn 不阻塞事件循环，
+   * 回退/ Vision 构建期间 SSE 心跳与其它 HTTP 请求仍可响应。
+   */
+  function buildProjectAsync(record, options = {}) {
+    const spec = buildSpec(record);
+    const timeoutMs = Number(options.timeoutMs || 5 * 60 * 1000);
+    return new Promise((resolve) => {
+      let child;
+      try {
+        child = spawn(spec.shell, spec.args, {
+          cwd: record.srcDir,
+          env: spec.env,
+          windowsHide: true,
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+      } catch (error) {
+        resolve({ ok: false, status: null, command: spec.command, stderr: String(error.message) });
+        return;
+      }
+      let stderr = '';
+      let timedOut = false;
+      child.stderr.on('data', (chunk) => {
+        stderr = `${stderr}${chunk.toString()}`.slice(-8000);
+      });
+      const timer = setTimeout(() => {
+        timedOut = true;
+        killProcessTree(child);
+      }, timeoutMs);
+      child.on('error', (error) => {
+        clearTimeout(timer);
+        resolve({ ok: false, status: null, command: spec.command, stderr: String(error.message) });
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (!timedOut && code === 0) writeBuildStamp(record, spec.command);
+        resolve({
+          ok: !timedOut && code === 0,
+          status: code,
+          command: spec.command,
+          timedOut,
+          stderr: stderr.slice(-4000),
+        });
+      });
+    });
+  }
+
+  /** 源码输入摘要：可预览文件集合，Vite 排除 dist（绑定「产物 ← 源码」）。 */
+  function sourceInputManifest(record) {
+    return previewManifestOf(record.srcDir, {
+      excludeDirs: new Set(['dist', '.preview', '.snapshots']),
+    });
+  }
+
+  function currentSrcDigest(record) {
+    return digestManifest(sourceInputManifest(record).files);
+  }
+
+  function buildStampPath(id) {
+    return path.join(projectDirOf(id), '.build-stamp.json');
+  }
+
+  /** Vite 构建成功后记录「构建输入摘要」；发布时要求摘要仍与当前源码一致。 */
+  function writeBuildStamp(record, command) {
+    try {
+      writeJson(buildStampPath(record.id), {
+        srcDigest: currentSrcDigest(record),
+        command,
+        at: new Date().toISOString(),
+      });
+    } catch {
+      // 摘要写入失败会导致后续发布被拒绝（更安全）
+    }
+  }
+
+  /**
+   * 全量预览新鲜度校验（C07-P1-06 / ORD-11 / B10 B-03）：
+   *  - 发布清单中每个文件必须存在，且预览哈希 == 清单哈希 == 当前产物哈希；
+   *  - manifest.srcDigest 必须等于当前源码输入摘要（Vite 改源码未构建 ⇒ 失败）；
+   *  - manifest.buildDigest 必须等于当前构建产物（dist / static src）的可预览摘要。
    */
   function verifyPreview(id, record = requireProject(id)) {
     const source = previewSourceDir(record);
@@ -690,6 +866,25 @@ function createProjectRegistry(options = {}) {
     }
     const dest = previewDirOf(id);
     const mismatches = [];
+
+    if (manifest.srcDigest) {
+      const actual = digestManifest(sourceInputManifest(record).files);
+      if (actual !== manifest.srcDigest) {
+        mismatches.push({ rel: '<src>', reason: 'src-digest-mismatch' });
+      }
+    } else {
+      mismatches.push({ rel: '<src>', reason: 'src-digest-missing' });
+    }
+
+    if (manifest.buildDigest) {
+      const actual = digestManifest(previewManifestOf(source).files);
+      if (actual !== manifest.buildDigest) {
+        mismatches.push({ rel: '<build>', reason: 'build-digest-mismatch' });
+      }
+    } else {
+      mismatches.push({ rel: '<build>', reason: 'build-digest-missing' });
+    }
+
     for (const [rel, hash] of Object.entries(manifest.files)) {
       const published = path.join(dest, rel);
       const sourceFile = path.join(source, rel);
@@ -723,61 +918,149 @@ function createProjectRegistry(options = {}) {
   }
 
   /**
-   * 生成独立预览产物目录（P0-1/P0-3）：
-   * 只复制可预览类型、跳过点文件与 node_modules，预览面只读这里，
-   * 永远不直接读 src。C07：原子发布 + 全量 manifest 校验。
+   * 生成独立预览产物目录（P0-1/P0-3 / C09 B-02）：
+   *  1) 只构建到 staging，不切换；
+   *  2) 在 staging 内完成全量哈希校验 + 入口存在 + 清单写入临时文件；
+   *  3) 校验通过才原子切换预览目录与 manifest；
+   *  4) 切换后再次全量校验；任一失败恢复旧版本并返回 null。
+   * 预览面只读 .preview，永远不直接读 src。
    */
   function buildPreview(id) {
     const record = requireProject(id);
     const dest = previewDirOf(id);
     const source = previewSourceDir(record);
-    if (!source) {
-      return null;
-    }
-    let result;
+    if (!source) return null;
+    const manifestFile = path.join(projectDirOf(id), '.publish-manifest.json');
+    let previousManifestRaw = null;
     try {
-      result = copyPreviewTree(source, dest);
+      previousManifestRaw = fs.readFileSync(manifestFile, 'utf-8');
     } catch {
-      // 原子发布失败：旧预览保持不变，不返回半成品
+      previousManifestRaw = null;
+    }
+
+    // B10 / C09 B-03：Vite 只有「当前源码摘要 == 最近一次成功构建的输入摘要」才允许发布
+    const srcDigest = currentSrcDigest(record);
+    if (record.kind === 'vite') {
+      const stamp = readJson(buildStampPath(id), null);
+      if (!stamp || stamp.srcDigest !== srcDigest) {
+        try {
+          writeJson(path.join(projectDirOf(id), '.preview-stale.json'), {
+            at: new Date().toISOString(),
+            reason: 'BUILD_STALE',
+            detail: 'source changed since last successful build; run build before publishing',
+          });
+        } catch {
+          // 忽略
+        }
+        return null;
+      }
+    }
+
+    let staged;
+    try {
+      staged = copyPreviewTreeStaged(source, dest);
+    } catch {
       return null;
     }
-    // NEW-04：发布清单落盘，便于审计「发布了什么、跳过了什么」
+
     try {
-      writeJson(path.join(projectDirOf(id), '.publish-manifest.json'), {
+      const expected = staged.manifest.files;
+      const entryRel = record.kind === 'vite' ? 'index.html' : record.entry || 'index.html';
+      if (Object.keys(expected).length === 0) throw new Error('PREVIEW_EMPTY');
+      const stagedEntry = path.join(staged.stagedDir, entryRel);
+      if (!fs.existsSync(stagedEntry) || !fs.statSync(stagedEntry).isFile()) {
+        throw new Error('PREVIEW_ENTRY_MISSING');
+      }
+      // staging 全量校验：重新哈希 staging 目录，必须与清单逐文件一致
+      const stagedCheck = previewManifestOf(staged.stagedDir);
+      if (
+        Object.keys(stagedCheck.files).length !== Object.keys(expected).length ||
+        digestManifest(stagedCheck.files) !== digestManifest(expected)
+      ) {
+        throw new Error('PREVIEW_STAGE_HASH_MISMATCH');
+      }
+
+      const newManifest = {
         projectId: id,
-        ...result.manifest,
-      });
-    } catch {
-      // 清单写入失败不影响预览
-    }
-    const entryRel = record.kind === 'vite' ? 'index.html' : record.entry || 'index.html';
-    if (!fs.existsSync(path.join(dest, entryRel))) return null;
-    const check = verifyPreview(id, record);
-    if (!check.ok) {
+        generatedAt: new Date().toISOString(),
+        published: staged.copied,
+        skipped: staged.skipped,
+        files: expected,
+        entry: entryRel,
+        srcDigest,
+        buildDigest: digestManifest(expected),
+      };
+      const tmpManifest = `${manifestFile}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+      fs.mkdirSync(path.dirname(manifestFile), { recursive: true });
+      fs.writeFileSync(tmpManifest, JSON.stringify(newManifest, null, 2), 'utf-8');
+
+      // 原子切换预览目录，再原子替换 manifest
+      staged.commit();
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          fs.renameSync(tmpManifest, manifestFile);
+          break;
+        } catch (error) {
+          if (attempt >= 20 || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
+          sleepSync(10 + Math.floor(Math.random() * 20));
+        }
+      }
+
+      const check = verifyPreview(id, record);
+      if (!check.ok) {
+        throw new ProjectError(
+          `preview verify failed: ${check.reason}`,
+          500,
+          'PREVIEW_VERIFY_FAILED',
+        );
+      }
+      staged.finalize();
+      try {
+        fs.rmSync(path.join(projectDirOf(id), '.preview-stale.json'), { force: true });
+      } catch {
+        // 忽略
+      }
+      return previewRootPath(record, dest);
+    } catch (error) {
+      // 失败不发布：恢复旧预览与旧 manifest
+      try {
+        staged.restore();
+      } catch {
+        // 忽略
+      }
+      try {
+        if (previousManifestRaw === null) fs.rmSync(manifestFile, { force: true });
+        else fs.writeFileSync(manifestFile, previousManifestRaw, 'utf-8');
+      } catch {
+        // 忽略
+      }
       try {
         writeJson(path.join(projectDirOf(id), '.preview-stale.json'), {
           at: new Date().toISOString(),
-          ...check,
+          reason: error.code || 'PREVIEW_PUBLISH_FAILED',
+          detail: error.message,
         });
       } catch {
         // 证据写入失败不影响返回
       }
       return null;
     }
-    try {
-      fs.rmSync(path.join(projectDirOf(id), '.preview-stale.json'), { force: true });
-    } catch {
-      // 忽略
-    }
-    return previewRootPath(record, dest);
   }
 
-  /** 读取现有预览；C07-P1-01：GET 不再触发按需构建（避免无鉴权 DoS）。 */
+  /**
+   * 读取现有预览；C07-P1-01：GET 不触发构建。
+   * B10：入口哈希必须与 manifest 一致，否则视为不可用（防止发布后目录被篡改）。
+   */
   function previewRoot(id) {
     const record = requireProject(id);
     const dest = previewDirOf(id);
     const entryRel = record.kind === 'vite' ? 'index.html' : record.entry || 'index.html';
-    if (!fs.existsSync(path.join(dest, entryRel))) return null;
+    const entryFile = path.join(dest, entryRel);
+    if (!fs.existsSync(entryFile) || !fs.statSync(entryFile).isFile()) return null;
+    const manifest = readJson(path.join(projectDirOf(id), '.publish-manifest.json'), null);
+    if (!manifest || !manifest.files || !manifest.files[entryRel]) return null;
+    const actual = crypto.createHash('sha256').update(fs.readFileSync(entryFile)).digest('hex');
+    if (actual !== manifest.files[entryRel]) return null;
     return previewRootPath(record, dest);
   }
 
@@ -1103,17 +1386,37 @@ function createProjectRegistry(options = {}) {
     return path.join(projectDirOf(id), '.rollback-journal.json');
   }
 
-  /** NEW-02：回退 = 预验证 → 备份 → 暂存目录 → 校验 → 应用 → 失败自动还原。 */
-  function rollback(id, seq) {
-    return withRegistryLock(() => rollbackUnlocked(id, seq));
+  /**
+   * NEW-02 / B10 / C09 B-04：回退 = 预验证 → 备份 → 暂存 → 校验 → 应用 → 失败自动还原。
+   *
+   * 锁语义：
+   *  - 默认自行获取**项目锁**，覆盖重建、验证、发布全过程；与任务/其它回退互斥；
+   *  - 调用方（worker / Vision）已持锁时传 `lockToken`，宿主只校验 token，不重复加锁；
+   *  - 构建使用异步 spawn，回退期间事件循环不被阻塞（SSE 心跳可用）。
+   */
+  async function rollback(id, seq, options = {}) {
+    const providedToken = options.lockToken || null;
+    if (providedToken) {
+      const current = readLock(id);
+      if (!current || current.token !== providedToken) {
+        throw new ProjectError('回退需要持有当前项目锁', 409, 'PROJECT_LOCKED');
+      }
+      return rollbackLocked(id, seq);
+    }
+    const lock = acquireLock(id, { taskId: options.taskId || `rollback-${seq}` });
+    try {
+      return await rollbackLocked(id, seq);
+    } finally {
+      releaseLock(id, lock.token);
+    }
   }
 
-  function rollbackUnlocked(id, seq) {
+  async function rollbackLocked(id, seq) {
     // 预验证：目录边界 / 清单存在 / 摘要一致 / 内容未被篡改
     const target = validateSnapshot(id, seq);
 
-    // 先备份当前状态，并验证备份可用
-    const backup = snapshotInternal(id, `pre-rollback-${target.entry.seq}`);
+    // 先备份当前状态，并验证备份可用（通过 registry 锁，避免与并发快照互相覆盖）
+    const backup = snapshot(id, `pre-rollback-${target.entry.seq}`);
     const backupTree = validateSnapshot(id, backup.seq);
 
     const staging = path.join(
@@ -1146,7 +1449,7 @@ function createProjectRegistry(options = {}) {
       const record = requireProject(id);
       let build = null;
       if (record.kind === 'vite') {
-        build = buildProject(record);
+        build = await buildProjectAsync(record);
         if (!build.ok) {
           throw new ProjectError(
             `回退后构建失败（${build.command}，exit=${build.status}）`,
@@ -1190,7 +1493,7 @@ function createProjectRegistry(options = {}) {
           // 若回退过程中已重建 dist，必须按还原后的源码再构建一次
           const current = requireProject(id);
           if (current.kind === 'vite') {
-            const rebuilt = buildProject(current);
+            const rebuilt = await buildProjectAsync(current);
             if (!rebuilt.ok) recovered = false;
           }
           buildPreview(id);
@@ -1249,6 +1552,11 @@ function createProjectRegistry(options = {}) {
           const applied = applyTree(record.id, tree.dir, tree.manifest);
           if (!applied.equal) {
             throw new Error('recovered tree does not match backup digest');
+          }
+          // B10：崩溃恢复后 Vite 必须按恢复后的源码重建，避免发布陈旧 dist
+          if (record.kind === 'vite') {
+            const rebuilt = buildProject(record);
+            if (!rebuilt.ok) throw new Error(`rebuild failed: ${rebuilt.command} exit=${rebuilt.status}`);
           }
           buildPreview(record.id);
           fs.rmSync(journal, { force: true });
@@ -1510,6 +1818,7 @@ function createProjectRegistry(options = {}) {
     buildPreview,
     verifyPreview,
     buildProject,
+    buildProjectAsync,
     memory: (id) => readJson(memoryPath(id), { rounds: [] }),
     appendRound,
     acquireLock,

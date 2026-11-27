@@ -35,7 +35,7 @@
 4. **扩散式回退**：支持按文件回退，而不只是整快照回退。
 5. **跨互联网**：接入成熟组网方案（Tailscale / Cloudflare Tunnel），本仓库不自建 Relay。
 
-## Sprint 03B（当前）— Connect L2 + Vision 集成
+## Sprint 03B — Connect L2 + Vision 集成（B09）
 
 - [x] 持久化 SSE 事件流（seq / Last-Event-ID / 心跳 / 客户端去重）
 - [x] 统一 taskId / projectId / versionId / artifactId
@@ -47,6 +47,25 @@
 - [ ] Tailscale 登录 → Serve HTTPS → C08 网络 7 项复验
 - [ ] 真实模型 Vision 闭环（预算授权后）
 - [ ] C08 40 项全量验收与独立复审
+
+## Sprint 03C（当前）— 安全与集成收口（B10）
+
+- [x] 复现 C09 P0：455a187 并发丢快照（独立 worktree 20 轮命中 4 次）
+- [x] 注册表锁所有权/活锁不可回收/崩溃恢复/提交原子性
+- [x] 预览 staging 全量校验后原子发布；失败保持旧版本
+- [x] Vite 构建摘要绑定源码；改源码未构建拒绝发布
+- [x] 回退全程持项目锁；异步构建不阻塞 SSE/心跳
+- [x] Worker settle 异常安全；journal 恢复与失败回退复核
+- [x] Vision 宿主结构化增量校验（真实 Spacer 不再误报）
+- [x] 禁止客户端 prevalidated 绕过；最终文件一致性校验
+- [x] Vision `verify` 独立功能复验（不调用模型）
+- [x] 短期预览票据注入浏览器 context；登出/吊销即时失效
+- [x] 授权设备共享工程可见性；未授权无元数据
+- [x] 证据 HMAC/指纹/全量 manifest/链校验 + 负对照
+- [x] Qoder `verify-run.cjs` 契约适配器（合成包 PASS，篡改/降级 FAIL）
+- [ ] Tailscale 双设备 HTTPS 验证（用户负责登录）
+- [ ] Qoder 独立安全门禁；通过后才考虑私有 Serve
+- [ ] 真实模型 Vision 闭环（预算授权后）
 
 ## 非目标
 

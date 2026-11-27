@@ -23,8 +23,13 @@
 
 - 控制面与预览面都只监听 `127.0.0.1`；由 tailscaled 终止 TLS。
 - Host 白名单加入 MagicDNS 名称（不含端口），保留 `localhost/127.0.0.1`。
-- `x-forwarded-proto: https` 使 session Cookie 带 `Secure`；`X-Forwarded-For` 只记录，不用于鉴权。
-- 预览鉴权：设置 `PREVIEW_ACCESS_KEY`，登录后下发 `vplay_preview` Cookie；未登录 401。
+- **必须设置 `REMOTE_TRUST_PROXY=1`** 才接受 `X-Forwarded-Proto: https`；否则直连回环伪造该头无效。
+- `X-Forwarded-For` 只记录，不用于鉴权。
+- 预览鉴权：设置 `PREVIEW_ACCESS_KEY` 作为启用开关；登录后下发**短期、会话绑定、可吊销**的
+  `vplay_preview` 票据（不再是静态哈希）。登出、`/auth/revoke-all`、设备吊销立即失效。
+- Serve/代理模式（`VPLAY_PUBLIC_MODE=1` 或 `REMOTE_TRUST_PROXY=1`）下：
+  - 强制 `publicMode`，yolo 永远不可开启；
+  - 拒绝 `REMOTE_ALLOW_TEST_SEAM=1` 启动（即使 HOST 是回环）。
 
 ## 3. ACL（默认拒绝；只放行两台手机）
 
@@ -65,6 +70,8 @@ $env:REMOTE_PORT='8787'
 $env:PREVIEW_PORT='8788'
 $env:REMOTE_ALLOWED_HOSTS="$dns,localhost,127.0.0.1"
 $env:PREVIEW_ACCESS_KEY='<随机长串>'
+$env:REMOTE_TRUST_PROXY='1'      # 仅 Tailscale Serve 回环代理；不得在直连场景开启
+# 不要设置：VPLAY_PUBLIC_MODE、VPLAY_ALLOW_YOLO、REMOTE_ALLOW_TEST_SEAM、REMOTE_EXECUTOR_CMD
 node remote/server.cjs
 
 # 2) Serve（只映射回环）
@@ -84,3 +91,12 @@ node remote/server.cjs
 7. 隔离空工程验证 SSE/任务/回退（无真实工程数据）。
 
 > 未完成上述 7 项前，只能使用回环或隔离测试服务，不向 tailnet 发布。
+
+## 6. B10 状态（2026-11-27）
+
+- 用户已注册 Tailscale 账号，正在添加 Windows 与 iPhone 设备；**登录由用户本人完成**。
+- 两台设备在线后，允许先用「无凭据、无工程数据」的隔离测试服务验证 HTTPS 与跨网络通信。
+- 正式 Runtime 继续只监听回环；**待 Qoder 独立安全门禁通过后**才启用私有 Serve。
+- 不启用 Funnel、Exit Node、子网路由，不开放公网端口。
+- 复核要点：`tailscale serve status` 仅 443/8443；`tailscale funnel status` 为空；
+  `Get-NetTCPConnection` 中 8787/8788 仅绑定 `127.0.0.1`。

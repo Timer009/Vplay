@@ -113,7 +113,7 @@ test('C07-P0-03: project lock is atomic, owner-scoped and crash-recoverable', ()
   }
 });
 
-test('C07-P0-04: Vite rollback rebuilds dist and verifies full preview manifest', () => {
+test('C07-P0-04: Vite rollback rebuilds dist and verifies full preview manifest', async () => {
   const root = makeWorkspace('vplay-c07-vite-');
   const home = path.join(root, 'home');
   try {
@@ -135,7 +135,7 @@ test('C07-P0-04: Vite rollback rebuilds dist and verifies full preview manifest'
     assert.ok(registry.buildPreview('vite-demo'));
     assert.match(fs.readFileSync(path.join(record.srcDir, 'dist', 'index.html'), 'utf8'), /MODIFIED/);
 
-    const rolled = registry.rollback('vite-demo', 1);
+    const rolled = await registry.rollback('vite-demo', 1);
     assert.equal(rolled.verified, true);
     assert.equal(rolled.previewReady, true);
     assert.ok(rolled.build && rolled.build.ok, 'rollback must rebuild vite output');
@@ -330,12 +330,26 @@ test('C07-P1-01/P1-02: optional preview auth and cross-site GET blocking', async
     const previewCookie = setCookies.find((item) => item.startsWith('vplay_preview='));
     assert.ok(previewCookie, 'login must issue preview cookie');
     const previewValue = previewCookie.split(';')[0].split('=')[1];
-    assert.equal(previewValue, crypto.createHash('sha256').update('preview-key-123').digest('hex'));
+    assert.notEqual(
+      previewValue,
+      crypto.createHash('sha256').update('preview-key-123').digest('hex'),
+      'B10: preview cookie must be an opaque ticket, not a static key hash',
+    );
 
     const authed = await request(server.previewPort, 'GET', '/p/demo/', {
       headers: { Cookie: `vplay_preview=${previewValue}` },
     });
     assert.equal(authed.status, 200);
+
+    // B10 / C09 B-09：登出后票据立即吊销（即使客户端仍持有旧 cookie）
+    const logout = await request(server.port, 'POST', '/auth/logout', {
+      headers: { Cookie: `vplay_session=${String(login.headers['set-cookie']).match(/vplay_session=([^;]+)/)[1]}` },
+    });
+    assert.equal(logout.status, 200);
+    const stale = await request(server.previewPort, 'GET', '/p/demo/', {
+      headers: { Cookie: `vplay_preview=${previewValue}` },
+    });
+    assert.equal(stale.status, 401, 'revoked preview ticket must be rejected');
 
     const crossSite = await request(server.port, 'GET', '/projects', {
       headers: { ...jsonHeaders(TOKEN), 'Sec-Fetch-Site': 'cross-site' },

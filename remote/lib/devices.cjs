@@ -70,6 +70,18 @@ function createDeviceStore(options = {}) {
     return read().devices.map((device) => ({ ...device, tokenHash: undefined }));
   }
 
+  /** 按 id 读取设备（含 revoked 标记），供运行期吊销检查。 */
+  function get(id) {
+    const device = read().devices.find((item) => item.id === id);
+    return device ? { ...device, tokenHash: undefined } : null;
+  }
+
+  /** 设备是否仍有效（未吊销）。管理员/未知设备返回 false。 */
+  function isActive(id) {
+    const device = read().devices.find((item) => item.id === id);
+    return Boolean(device && !device.revoked);
+  }
+
   function revoke(id) {
     const state = read();
     const device = state.devices.find((item) => item.id === id);
@@ -101,7 +113,7 @@ function createDeviceStore(options = {}) {
     return device.projects.includes(projectId);
   }
 
-  return { file, createDevice, list, revoke, authenticate, isProjectAllowed };
+  return { file, createDevice, list, get, isActive, revoke, authenticate, isProjectAllowed };
 }
 
 module.exports = { createDeviceStore };

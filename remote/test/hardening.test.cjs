@@ -174,7 +174,7 @@ test('NEW-03: unsupported links are rejected at import; later links are skipped 
     false,
   );
 
-  const rolled = registry.rollback('demo', 1);
+  const rolled = await registry.rollback('demo', 1);
   assert.equal(rolled.verified, true);
   assert.equal(digestOf(project.srcDir), initial);
   assert.ok(fs.existsSync(path.join(project.srcDir, 'outlink')), 'link itself must survive');
@@ -254,7 +254,7 @@ test('NEW-05: sensitive files are excluded consistently and never deleted by rol
 
   // 用户后来放的 .env 不应被回退删除
   write(path.join(project.srcDir, '.env'), 'USER_CONFIG=keep-me');
-  const rolled = registry.rollback('demo', 1);
+  const rolled = await registry.rollback('demo', 1);
   assert.equal(rolled.verified, true);
   assert.equal(fs.readFileSync(path.join(project.srcDir, '.env'), 'utf-8'), 'USER_CONFIG=keep-me');
 });

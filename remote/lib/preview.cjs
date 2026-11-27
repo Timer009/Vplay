@@ -18,7 +18,6 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 
 const { resolveStaticFile } = require('./paths.cjs');
 
@@ -102,26 +101,27 @@ function createPreviewServer(options) {
   const projects = options.projects;
   const legacyRoot = options.legacyRoot || null;
   const allowedHosts = options.allowedHosts || null;
-  const previewAccessHash = options.previewAccessHash || null;
+  const previewAuthEnabled = Boolean(options.previewAuthEnabled);
+  // B10：票据授权回调 (cookieValue, projectId) => boolean；按项目校验，可即时吊销
+  const authorizePreview = typeof options.authorizePreview === 'function'
+    ? options.authorizePreview
+    : () => true;
   const logger = options.logger || ((line) => console.log(line));
 
-  function previewAuthed(req) {
-    if (!previewAccessHash) return true;
+  function previewCookieValue(req) {
     const header = String(req.headers.cookie || '');
     for (const part of header.split(';')) {
       const index = part.indexOf('=');
       if (index < 0) continue;
       if (part.slice(0, index).trim() !== 'vplay_preview') continue;
-      const value = part.slice(index + 1).trim();
-      try {
-        const expected = Buffer.from(previewAccessHash);
-        const actual = Buffer.from(value);
-        return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
-      } catch {
-        return false;
-      }
+      return decodeURIComponent(part.slice(index + 1).trim());
     }
-    return false;
+    return '';
+  }
+
+  function previewAuthed(req, projectId = null) {
+    if (!previewAuthEnabled) return true;
+    return authorizePreview(previewCookieValue(req), projectId) === true;
   }
 
   const server = http.createServer((req, res) => {
@@ -193,6 +193,12 @@ function createPreviewServer(options) {
       }
       const projectId = match[1];
       const rest = match[2] || '/';
+
+      // B10 / C09 B-09：按项目校验票据（设备被吊销或无权访问该项目时立即 401）
+      if (previewAuthEnabled && !previewAuthed(req, projectId)) {
+        sendJson(res, 401, { ok: false, error: 'preview is not authorized for this project' });
+        return;
+      }
 
       let root;
       try {

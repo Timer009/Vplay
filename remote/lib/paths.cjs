@@ -409,28 +409,17 @@ function unifiedDiff(aDir, bDir, files, options = {}) {
 }
 
 /**
- * 复制「可预览」文件到独立预览目录（P0-1 / P0-3 / C07-P1-06）：
- * - 跳过任何以 "." 开头的目录/文件（.env/.git/.opengame）
- * - 只复制扩展名白名单内的文件
- * - 保留相对目录结构，便于 ../assets 这类相对引用
- * - **原子发布**：先构建到同级临时目录，成功后 rename 切换；失败保留旧版本
- * - 清单记录每个已发布文件的 sha256，供全量新鲜度校验
+ * 列出「可预览」文件（与 copyPreviewTree 完全相同的过滤规则）。
+ * 用于：
+ *  - 计算源码输入摘要（srcDigest），绑定「构建产物 ← 源码」；
+ *  - 发布前对 staging 目录做全量校验（不复制、不写盘）。
  */
-function copyPreviewTree(sourceDir, targetDir, options = {}) {
+function previewManifestOf(sourceDir, options = {}) {
   const root = path.resolve(sourceDir);
-  const dest = path.resolve(targetDir);
   const maxFiles = options.maxFiles || 5000;
-  const suffix = `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
-  const tmp = `${dest}.tmp-${suffix}`;
-  const old = `${dest}.old-${suffix}`;
-
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.rmSync(tmp, { recursive: true, force: true });
-  fs.mkdirSync(tmp, { recursive: true });
-
-  let copied = 0;
-  const skipped = [];
   const files = {};
+  const skipped = [];
+  let published = 0;
 
   function skip(rel, reason) {
     skipped.push({ path: rel, reason });
@@ -459,6 +448,10 @@ function copyPreviewTree(sourceDir, targetDir, options = {}) {
           skip(rel, 'node_modules');
           continue;
         }
+        if (options.excludeDirs && options.excludeDirs.has(entry.name)) {
+          skip(rel, 'excluded');
+          continue;
+        }
         walk(full);
         continue;
       }
@@ -470,7 +463,6 @@ function copyPreviewTree(sourceDir, targetDir, options = {}) {
         skip(rel, 'extension');
         continue;
       }
-      // NEW-04：文件名级敏感规则 + 内容特征，双重过滤
       if (isSensitivePath(rel)) {
         skip(rel, 'sensitive-name');
         continue;
@@ -479,68 +471,164 @@ function copyPreviewTree(sourceDir, targetDir, options = {}) {
         skip(rel, 'secret-content');
         continue;
       }
-      if (copied >= maxFiles) {
+      if (published >= maxFiles) {
         skip(rel, 'max-files');
         continue;
       }
-      const target = path.join(tmp, path.relative(root, full));
-      fs.mkdirSync(path.dirname(target), { recursive: true });
       try {
-        fs.copyFileSync(full, target);
-        files[rel] = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
-        copied += 1;
+        files[rel] = sha256File(full);
+        published += 1;
       } catch {
-        skip(rel, 'copy-error');
+        skip(rel, 'read-error');
       }
     }
   }
 
-  try {
-    walk(root);
-  } catch (error) {
-    fs.rmSync(tmp, { recursive: true, force: true });
-    throw error;
+  walk(root);
+  return { published, skipped, files };
+}
+
+/**
+ * 把可预览文件复制到同级 staging 目录，但不切换发布。
+ * 调用方必须：
+ *   1) 在 staging 内完成全量校验（previewManifestOf(stagedDir) 与 manifest 逐文件一致）；
+ *   2) 校验通过后 commit() 原子切换；
+ *   3) 校验失败 abort() 丢弃 staging，旧预览保持不变。
+ */
+function copyPreviewTreeStaged(sourceDir, targetDir, options = {}) {
+  const root = path.resolve(sourceDir);
+  const dest = path.resolve(targetDir);
+  const suffix = `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  const tmp = `${dest}.tmp-${suffix}`;
+  const old = `${dest}.old-${suffix}`;
+
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.mkdirSync(tmp, { recursive: true });
+
+  const listed = previewManifestOf(root, options);
+  const skipped = listed.skipped.slice();
+  const files = {};
+  for (const [rel, hash] of Object.entries(listed.files)) {
+    const from = path.join(root, rel);
+    const target = path.join(tmp, rel);
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(from, target);
+      const copiedHash = sha256File(target);
+      if (copiedHash !== hash) {
+        skipped.push({ path: rel, reason: 'copy-mismatch' });
+        fs.rmSync(target, { force: true });
+        continue;
+      }
+      files[rel] = copiedHash;
+    } catch {
+      skipped.push({ path: rel, reason: 'copy-error' });
+    }
   }
 
   const manifest = {
     generatedAt: new Date().toISOString(),
-    published: copied,
+    published: Object.keys(files).length,
     skipped,
     files,
   };
 
-  // 原子切换：旧目录先改名，新目录就位后再删除旧目录；失败则回滚
+  let committed = false;
   let hadOld = false;
-  try {
-    if (fs.existsSync(dest)) {
-      fs.renameSync(dest, old);
-      hadOld = true;
-    }
-    fs.renameSync(tmp, dest);
-  } catch (error) {
-    if (hadOld) {
-      try {
-        fs.renameSync(old, dest);
-      } catch {
-        // 保留 old 目录，交给人工处理
-      }
-    }
-    fs.rmSync(tmp, { recursive: true, force: true });
-    throw error;
-  }
-  if (hadOld) {
-    try {
-      fs.rmSync(old, { recursive: true, force: true });
-    } catch {
-      // 旧目录清理失败不影响新版本可用
-    }
-  }
-
   return {
-    copied,
+    stagedDir: tmp,
+    manifest,
+    copied: manifest.published,
     skippedCount: skipped.length,
     skipped,
-    manifest,
+    /** 原子切换：旧目录改名备份，新目录就位；失败则还原。 */
+    commit() {
+      if (committed) return;
+      try {
+        if (fs.existsSync(dest)) {
+          fs.renameSync(dest, old);
+          hadOld = true;
+        }
+        fs.renameSync(tmp, dest);
+        committed = true;
+      } catch (error) {
+        if (hadOld) {
+          try {
+            fs.renameSync(old, dest);
+            hadOld = false;
+          } catch {
+            // 保留 old 目录，交给人工处理
+          }
+        }
+        fs.rmSync(tmp, { recursive: true, force: true });
+        throw error;
+      }
+    },
+    /** 校验通过后清理旧目录。 */
+    finalize() {
+      if (hadOld) {
+        try {
+          fs.rmSync(old, { recursive: true, force: true });
+        } catch {
+          // 旧目录清理失败不影响新版本可用
+        }
+        hadOld = false;
+      }
+    },
+    /** 已切换但后续校验失败：恢复旧预览。 */
+    restore() {
+      if (!committed) {
+        fs.rmSync(tmp, { recursive: true, force: true });
+        return hadOld === false;
+      }
+      const failed = `${dest}.failed-${suffix}`;
+      try {
+        if (fs.existsSync(dest)) fs.renameSync(dest, failed);
+      } catch {
+        return false;
+      }
+      let restored = true;
+      if (hadOld) {
+        try {
+          fs.renameSync(old, dest);
+          hadOld = false;
+        } catch {
+          restored = false;
+        }
+      }
+      committed = false;
+      try {
+        fs.rmSync(failed, { recursive: true, force: true });
+      } catch {
+        // 忽略
+      }
+      return restored;
+    },
+    abort() {
+      if (committed) {
+        this.restore();
+        return;
+      }
+      fs.rmSync(tmp, { recursive: true, force: true });
+      hadOld = false;
+    },
+  };
+}
+
+/**
+ * 复制「可预览」文件到独立预览目录（P0-1 / P0-3 / C07-P1-06）：
+ * staging 构建 + 原子切换；失败保留旧版本。
+ */
+function copyPreviewTree(sourceDir, targetDir, options = {}) {
+  const staged = copyPreviewTreeStaged(sourceDir, targetDir, options);
+  staged.commit();
+  staged.finalize();
+  return {
+    copied: staged.copied,
+    skippedCount: staged.skippedCount,
+    skipped: staged.skipped,
+    manifest: staged.manifest,
   };
 }
 
@@ -559,6 +647,8 @@ module.exports = {
   compareManifests,
   copyTree,
   copyPreviewTree,
+  copyPreviewTreeStaged,
+  previewManifestOf,
   emptyTree,
   unifiedDiff,
   looksTextual,

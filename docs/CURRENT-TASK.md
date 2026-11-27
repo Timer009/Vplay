@@ -1,39 +1,44 @@
 # Vplay Studio · 当前任务
 
-> Sprint 03B — Connect L2 + Vision 主工程集成
-> 分支：`sprint-03-connected-agent`　基线：`abc8e24`（Sprint03A 安全基础）
+> Sprint 03C — 安全与集成收口（B10）
+> 分支：`sprint-03-connected-agent`　基线：`455a187`（Sprint03B 候选）
 > 负责人：唯一开发 Agent（Trae）
 
 ## 1. 本轮目标
 
-实现手机/电脑双向任务协同（持久 SSE、统一 ID、设备授权），以及 Vision 0.2.0
-与真实工程 Agent 的统一运行闭环（analyze / verify / 受限 repair）。
+只做收口，不扩展产品功能：在 B09 精确基线上复现并关闭 C09 的 P0 正确性问题，
+完成 Vision 集成接口修正与 Connect 协同/吊销语义，补齐独立证据契约，更新文档与候选分支。
 
 ## 2. 任务清单
 
-| #   | 任务                                                     | 状态                |
-| --- | -------------------------------------------------------- | ------------------- |
-| 1   | 持久化 SSE 事件流（seq/Last-Event-ID/心跳/去重）         | ✅                  |
-| 2   | 统一 taskId / projectId / versionId / artifactId         | ✅                  |
-| 3   | 设备身份、项目授权、任务 owner 过滤（P1-04）             | ✅                  |
-| 4   | Console：SSE 实时刷新、版本/产物 ID、Vision 报告与截图   | ✅                  |
-| 5   | Vision 0.2.0 vendoring（相对路径，无绝对路径）           | ✅                  |
-| 6   | vision-service：analyze / verify / 受限 repair、skipLock | ✅                  |
-| 7   | 原子 apply + journal + 全量 manifest + 失败回退          | ✅                  |
-| 8   | 预览 CSP、同源浏览器守卫（E05）、截图/源码脱敏、同意门禁 | ✅                  |
-| 9   | 项目外 evidence + 事件哈希链 + HMAC 锚定（P1-11）        | ✅                  |
-| 10  | C08 X-01..X-05 契约回归                                  | ✅                  |
-| 11  | Tailscale 真实登录 / MagicDNS / HTTPS Serve              | ⏳ 等待用户认证     |
-| 12  | C08 40 项全量验收（网络 7 项 + 真实模型）                | ⏳ 待网络与预算授权 |
-| 13  | Sprint02 合并 main（ff-only）                            | ⏳ 待用户授权       |
+| #   | 任务                                                              | 状态        |
+| --- | ----------------------------------------------------------------- | ----------- |
+| 1   | 复现 C09 B-01（并发丢快照）：455a187 独立 worktree 20 轮命中 4 次 | ✅          |
+| 2   | 注册表锁：禁把「空/读不到」判 stale；token 比对回收；误抢放回     | ✅          |
+| 3   | 预览：staging 全量校验 → 原子切换 → 再全量校验；失败保留旧版      | ✅          |
+| 4   | Vite：构建摘要绑定源码；改源码未构建拒绝发布                      | ✅          |
+| 5   | 回退：全程持项目锁；构建改异步 spawn，不阻塞 SSE/心跳             | ✅          |
+| 6   | Worker：settle 异常安全（verify/记账/证据异常也收尾并释放锁）     | ✅          |
+| 7   | Vision：宿主**结构化增量**校验，真实 Spacer 基线不再误报          | ✅          |
+| 8   | Vision：禁止客户端 `prevalidated` 绕过；最终文件一致性校验        | ✅          |
+| 9   | Vision：`verify` 独立为浏览器功能复验（不调用模型）               | ✅          |
+| 10  | Vision：短期预览票据注入独立浏览器 context（不落盘/不进报告）     | ✅          |
+| 11  | Connect：授权设备可查看共同工程任务；未授权无元数据               | ✅          |
+| 12  | Connect：设备吊销即时影响 Session/SSE/预览；登出吊销预览票据      | ✅          |
+| 13  | 硬化：代理头信任开关、Serve 模式拒绝 test seam、凭据显式名单      | ✅          |
+| 14  | 证据：HMAC/密钥指纹/全量 manifest/事件链离线校验 + 负对照         | ✅          |
+| 15  | Qoder `verify-run.cjs` 契约适配器（合成包 PASS；篡改/降级 FAIL）  | ✅          |
+| 16  | Tailscale 登录 / Serve / 真机 HTTPS                               | ⏳ 用户认证 |
+| 17  | 真实模型 Vision 闭环（需预算授权）                                | ⏳ 未授权   |
+| 18  | Sprint02/03 合并 main                                             | ⏳ 待授权   |
 
 ## 3. 验收边界（必须如实说明）
 
-- Tailscale 已安装但**未登录**；未启用 Serve/Funnel，未向 tailnet 发布 Runtime。
-- 未进行真实模型调用（无 API Key 授权）；Vision 闭环使用注入的离线假模块验证。
-- 证据链为宿主 HMAC + 哈希链，**不是** OS 级不可篡改存储；不宣称证据不可篡改。
+- Tailscale 已安装但本轮按用户要求由用户完成设备登录；正式 Runtime 仍只监听回环。
+- 未进行真实模型调用；Vision 闭环使用离线假模块与真实 Spacer 文件的策略校验。
+- 证据 HMAC 不是 OS 级不可篡改；**无 OS 沙箱/独立账号隔离**，不宣称证据不可篡改。
 - 未修改 Spacer 正式仓库，未提前实现陆地回收。
 
 ## 4. 完成后
 
-见 `G:\AI_GAME\VPLAY-SPRINT03-B09-REPORT.md`。停止，等待用户/ChatGPT 审核。
+见 `G:\AI_GAME\VPLAY-SPRINT03-B10-REPORT.md`。停止，等待用户/ChatGPT 审核。

@@ -81,7 +81,7 @@ async function assertConsistent(home, expected) {
     const validated = registry.validateSnapshot('demo', entry.seq);
     assert.equal(validated.digest, entry.digest, `snapshot ${entry.seq} must verify`);
   }
-  const rolled = registry.rollback('demo', 1);
+  const rolled = await registry.rollback('demo', 1);
   assert.equal(rolled.verified, true);
 }
 

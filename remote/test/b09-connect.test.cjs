@@ -233,6 +233,8 @@ test('C07-P1-04: device tokens are project-scoped and only see their own tasks',
   try {
     const adminTask = await submit(server.port, TOKEN, { text: 'BACKGROUND admin task', projectId: 'demo' });
     await waitTask(server.port, TOKEN, adminTask.json.task.id);
+    const hiddenTask = await submit(server.port, TOKEN, { text: 'BACKGROUND secret task', projectId: 'secret-demo' });
+    await waitTask(server.port, TOKEN, hiddenTask.json.task.id);
 
     const deviceCookie = await login(server.port, created.token);
     const projects = await request(server.port, 'GET', '/projects', { headers: { Cookie: deviceCookie } });
@@ -244,12 +246,25 @@ test('C07-P1-04: device tokens are project-scoped and only see their own tasks',
     });
     assert.equal(forbidden.status, 403);
 
+    // B10 / C-1：授权设备可查看共同工程（demo）的任务详情/日志，但看不到未授权工程
     const list = await request(server.port, 'GET', '/tasks', { headers: { Cookie: deviceCookie } });
-    assert.equal(list.json.tasks.length, 0, 'device must not see admin tasks');
-    const hidden = await request(server.port, 'GET', `/tasks/${adminTask.json.task.id}`, {
+    assert.deepEqual(
+      list.json.tasks.map((item) => item.projectId),
+      ['demo'],
+      'device must only see tasks in authorized projects',
+    );
+    const visible = await request(server.port, 'GET', `/tasks/${adminTask.json.task.id}`, {
       headers: { Cookie: deviceCookie },
     });
-    assert.equal(hidden.status, 403);
+    assert.equal(visible.status, 200, 'authorized device may inspect shared-project task');
+    const log = await request(server.port, 'GET', `/tasks/${adminTask.json.task.id}/log`, {
+      headers: { Cookie: deviceCookie },
+    });
+    assert.equal(log.status, 200);
+    const hidden = await request(server.port, 'GET', `/tasks/${hiddenTask.json.task.id}`, {
+      headers: { Cookie: deviceCookie },
+    });
+    assert.equal(hidden.status, 403, 'task metadata in unauthorized project must not leak');
     const artifact = await request(server.port, 'GET', '/artifact?projectId=secret-demo', {
       headers: { Cookie: deviceCookie },
     });
@@ -259,8 +274,10 @@ test('C07-P1-04: device tokens are project-scoped and only see their own tasks',
     assert.equal(own.status, 202);
     await waitTask(server.port, deviceCookie, own.json.task.id);
     const list2 = await request(server.port, 'GET', '/tasks', { headers: { Cookie: deviceCookie } });
-    assert.equal(list2.json.tasks.length, 1);
-    assert.equal(list2.json.tasks[0].createdBy, created.device.id);
+    assert.ok(list2.json.tasks.some((item) => item.id === own.json.task.id));
+    assert.equal(list2.json.tasks.some((item) => item.id === hiddenTask.json.task.id), false);
+    const ownDetail = list2.json.tasks.find((item) => item.id === own.json.task.id);
+    assert.equal(ownDetail.createdBy, created.device.id);
 
     // 事件流仍可看到元数据（X-03），但不含 prompt
     const stream = openSse(server.port, deviceCookie);

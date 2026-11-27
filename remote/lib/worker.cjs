@@ -25,22 +25,39 @@ const { hashTree, compareManifests } = require('./paths.cjs');
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const STATUS_POLL_MS = 1000;
 
-/** 允许传给 CLI 子进程的环境变量（P0-4：默认拒绝，显式放行）。 */
+/** 允许传给 CLI 子进程的环境变量（P0-4 / C09 B-08：显式名单，默认拒绝）。 */
 const ENV_PASSTHROUGH = new Set([
   'PATH', 'Path', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'windir', 'ComSpec',
   'TEMP', 'TMP', 'TMPDIR', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA',
-  'NODE_OPTIONS', 'NODE_ENV', 'LANG', 'LC_ALL', 'TZ', 'SHELL', 'TERM',
-  'OPENGAME_POST_VERIFY', 'OPENGAME_TEMPLATES_DIR', 'OPENGAME_DEBUG_PROTOCOL',
+  'NODE_ENV', 'LANG', 'LC_ALL', 'TZ', 'SHELL', 'TERM',
+  'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy',
 ]);
-const ENV_PREFIXES = ['OPENAI_', 'OPENGAME_REASONING_', 'GEMINI_', 'QWEN_', 'DASHSCOPE_'];
+
+/**
+ * 模型凭据/端点的显式名单（C09 B-08）：
+ * 过去按 OPENAI_/GEMINI_/QWEN_/DASHSCOPE_ 前缀全量透传，宿主环境里任何同前缀变量
+ * （包括未来新增的密钥）都会进入 Agent 子进程。这里只放行列出的 key，
+ * 并显式剥离 NODE_OPTIONS / NODE_PATH 等可注入执行路径的变量。
+ */
+const MODEL_ENV_KEYS = new Set([
+  'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL',
+  'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL',
+  'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GOOGLE_GENAI_USE_VERTEXAI',
+  'QWEN_API_KEY', 'QWEN_BASE_URL', 'QWEN_MODEL',
+  'DASHSCOPE_API_KEY', 'DASHSCOPE_BASE_URL',
+  'DEEPSEEK_API_KEY', 'DEEPSEEK_BASE_URL',
+  'VLM_SWITCH_MODE',
+  'OPENGAME_MODEL', 'OPENGAME_PROVIDER', 'OPENGAME_API_KEY', 'OPENGAME_BASE_URL',
+  'OPENGAME_REASONING_EFFORT', 'OPENGAME_POST_VERIFY', 'OPENGAME_TEMPLATES_DIR',
+  'OPENGAME_DEBUG_PROTOCOL',
+]);
 
 /** 只传「模型调用必需 + 系统运行必需」的变量；REMOTE_* / VPLAY_* 一律不传。 */
 function buildChildEnv(taskId, source = process.env) {
   const env = {};
   for (const [key, value] of Object.entries(source)) {
-    if (key.startsWith('REMOTE_') || key.startsWith('VPLAY_')) continue;
-    const allowed =
-      ENV_PASSTHROUGH.has(key) || ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+    if (key.startsWith('REMOTE_') || key.startsWith('VPLAY_') || key.startsWith('EVIDENCE_')) continue;
+    const allowed = ENV_PASSTHROUGH.has(key) || MODEL_ENV_KEYS.has(key);
     if (allowed) env[key] = value;
   }
   env.OPENGAME_REMOTE_TASK_ID = taskId;
@@ -367,6 +384,7 @@ function createWorker(options) {
         mode: task.visionMode || 'analyze',
         allowedFiles: task.allowedFiles || undefined,
         skipLock: true,
+        lockToken,
       });
 
       const verified = Boolean(
@@ -588,93 +606,144 @@ function createWorker(options) {
       clearInterval(poll);
       clearTimeout(timeout);
 
-      const verification = verify(project, dir, task, startedAtMs);
-      let changes = null;
-      let diff = null;
       try {
-        if (project && snapshotSeq) {
-          diff = projects.diff(projectId, snapshotSeq, 'current');
-          changes = diff.counts;
-        } else if (beforeManifest) {
-          const compared = compareManifests(beforeManifest, hashTree(dir));
-          changes = {
-            added: compared.added.length,
-            removed: compared.removed.length,
-            modified: compared.modified.length,
-          };
+        const verification = verify(project, dir, task, startedAtMs);
+        let changes = null;
+        let diff = null;
+        try {
+          if (project && snapshotSeq) {
+            diff = projects.diff(projectId, snapshotSeq, 'current');
+            changes = diff.counts;
+          } else if (beforeManifest) {
+            const compared = compareManifests(beforeManifest, hashTree(dir));
+            changes = {
+              added: compared.added.length,
+              removed: compared.removed.length,
+              modified: compared.modified.length,
+            };
+          }
+        } catch (error) {
+          store.appendLog(task.id, `[remote] change detection failed: ${error.message}\n`);
         }
+        const totalChanges = changes ? changes.added + changes.modified + changes.removed : null;
+        const noChanges = totalChanges === 0;
+        // B10 / C09 B-02/B-03：先发布新预览并做全量新鲜度校验，成功才算 verified；
+        // 发布失败（校验失败/构建产物陈旧）保持旧预览，任务不得标记为 verified。
+        let published = true;
+        let publishError = null;
+        if (
+          project &&
+          !noChanges &&
+          verification.entryExists &&
+          !verification.postVerifyStale &&
+          (!verification.postVerify || verification.postVerify.issues === 0)
+        ) {
+          try {
+            const root = projects.buildPreview(projectId);
+            const check = projects.verifyPreview(projectId);
+            if (!root || !check.ok) {
+              published = false;
+              publishError = check.reason;
+            }
+          } catch (error) {
+            published = false;
+            publishError = error.message;
+          }
+        }
+        const verified = verification.verified && !noChanges && published;
+        const outcome = noChanges ? 'no_changes' : verified ? 'verified' : 'unverified';
+
+        const enriched = { ...patch };
+        const baseResult = enriched.result || { exitCode: null };
+        enriched.result = {
+          ...baseResult,
+          artifactPath: project ? project.entry || 'index.html' : 'index.html',
+          postVerify: verification.postVerify,
+          verified,
+          outcome,
+          noChanges,
+          changedFiles: changes,
+          diffSummary:
+            diff && diff.files.length > 0
+              ? diff.files.slice(0, 20).map((f) => `${f.status}: ${f.path}`)
+              : [],
+          verification: {
+            entryExists: verification.entryExists,
+            previewReady: verification.previewReady,
+            postVerifyStale: verification.postVerifyStale,
+            published,
+            publishError,
+          },
+        };
+
+        if (project) {
+          try {
+            projects.appendRound(projectId, {
+              taskId: task.id,
+              prompt: task.text.slice(0, 200),
+              changedFiles: totalChanges ?? 0,
+              verified,
+              status,
+            });
+          } catch (error) {
+            store.appendLog(task.id, `[remote] post-run bookkeeping failed: ${error.message}\n`);
+          }
+        }
+
+        // C07-P1-03：只有 functional verified 才允许发布预览；
+        // C07 ORD-05：发布期间仍持有项目锁，发布完成后再释放（见 finally）。
+        if (onFinished) {
+          try {
+            onFinished({ taskId: task.id, projectId, status, verified });
+          } catch (error) {
+            log(`[remote] onFinished failed: ${error.message}`);
+          }
+        }
+
+        const evidence = persistEvidence(task, enriched.result, status, projectId);
+        if (enriched.result) {
+          enriched.result.versionId = evidence ? evidence.versionId : latestVersionId(projectId);
+          enriched.result.artifactId = evidence ? evidence.artifactId : null;
+          enriched.result.evidenceDir = evidence ? evidence.dir : null;
+          enriched.result.previewPath = projectId ? `/p/${projectId}/` : '/legacy/';
+        }
+
+        finish(task.id, status, enriched);
+        emitEvent(status === 'succeeded' ? 'task.succeeded' : 'task.failed', task, {
+          status,
+          data: { verified, outcome },
+        });
+        store.appendLog(task.id, `[remote] ${new Date().toISOString()} finished: ${status}\n`);
+        log(`[remote] task ${task.id} ${status}`);
       } catch (error) {
-        store.appendLog(task.id, `[remote] change detection failed: ${error.message}\n`);
-      }
-      const totalChanges = changes ? changes.added + changes.modified + changes.removed : null;
-      const noChanges = totalChanges === 0;
-      const verified = verification.verified && !noChanges;
-      const outcome = noChanges ? 'no_changes' : verified ? 'verified' : 'unverified';
-
-      const enriched = { ...patch };
-      const baseResult = enriched.result || { exitCode: null };
-      enriched.result = {
-        ...baseResult,
-        artifactPath: project ? project.entry || 'index.html' : 'index.html',
-        postVerify: verification.postVerify,
-        verified,
-        outcome,
-        noChanges,
-        changedFiles: changes,
-        diffSummary:
-          diff && diff.files.length > 0
-            ? diff.files.slice(0, 20).map((f) => `${f.status}: ${f.path}`)
-            : [],
-        verification: {
-          entryExists: verification.entryExists,
-          previewReady: verification.previewReady,
-          postVerifyStale: verification.postVerifyStale,
-        },
-      };
-
-      if (project) {
+        // B-05：verify()/记账/证据任一异常都不能让进程崩溃或让任务悬挂
+        const message = scrub(error && error.message ? error.message : String(error), dir);
         try {
-          projects.appendRound(projectId, {
-            taskId: task.id,
-            prompt: task.text.slice(0, 200),
-            changedFiles: totalChanges ?? 0,
-            verified,
-            status,
+          store.appendLog(task.id, `[remote] settle failed: ${message}\n`);
+        } catch {
+          // 忽略
+        }
+        try {
+          finish(task.id, 'failed', {
+            error: { code: 'SETTLE_FAILED', message },
           });
-        } catch (error) {
-          store.appendLog(task.id, `[remote] post-run bookkeeping failed: ${error.message}\n`);
+          emitEvent('task.failed', task, { status: 'failed', data: { settleFailed: true } });
+        } catch {
+          // 忽略
         }
-      }
-
-      currentChild = null;
-      // C07-P1-03：只有 functional verified 才允许发布预览；
-      // C07 ORD-05：发布期间仍持有项目锁，发布完成后再释放。
-      if (onFinished) {
-        try {
-          onFinished({ taskId: task.id, projectId, status, verified });
-        } catch (error) {
-          log(`[remote] onFinished failed: ${error.message}`);
+        log(`[remote] task ${task.id} settle failed: ${message}`);
+      } finally {
+        if (project && lockToken) {
+          try {
+            projects.releaseLock(projectId, lockToken);
+          } catch {
+            // 忽略
+          }
         }
+        currentChild = null;
+        current = null;
+        tick();
       }
-      if (project) projects.releaseLock(projectId, lockToken);
-
-      const evidence = persistEvidence(task, enriched.result, status, projectId);
-      if (enriched.result) {
-        enriched.result.versionId = evidence ? evidence.versionId : latestVersionId(projectId);
-        enriched.result.artifactId = evidence ? evidence.artifactId : null;
-        enriched.result.evidenceDir = evidence ? evidence.dir : null;
-        enriched.result.previewPath = projectId ? `/p/${projectId}/` : '/legacy/';
-      }
-
-      finish(task.id, status, enriched);
-      emitEvent(status === 'succeeded' ? 'task.succeeded' : 'task.failed', task, {
-        status,
-        data: { verified, outcome },
-      });
-      store.appendLog(task.id, `[remote] ${new Date().toISOString()} finished: ${status}\n`);
-      log(`[remote] task ${task.id} ${status}`);
-      current = null;
-      tick();
     };
 
     child.on('error', (error) => {

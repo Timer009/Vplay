@@ -194,7 +194,7 @@ async function main() {
         'PROJECT_LOCKED',
       );
     }
-    print({ ok: true, ...registry.rollback(target, seq) });
+    print({ ok: true, ...(await registry.rollback(target, seq)) });
     return;
   }
 

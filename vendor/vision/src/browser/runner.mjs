@@ -50,6 +50,7 @@ export function createBrowserRunner({
   launchArgs = [],
   env = process.env,
   timeoutMs = 30000,
+  cookies = [],
 } = {}) {
   const resolved = executablePath || findBrowserExecutable({ env });
   if (!resolved) {
@@ -85,6 +86,10 @@ export function createBrowserRunner({
           serviceWorkers: 'block',
           acceptDownloads: false,
         });
+        // B10 / E06 B2：短期预览票据只注入浏览器内存上下文，不落盘、不进入页面文本。
+        if (Array.isArray(cookies) && cookies.length) {
+          await context.addCookies(cookies);
+        }
         const guard = await installNetworkGuard({ context, previewUrl: url, allowedExtraOrigins });
         const page = await context.newPage();
         guard.setMainPage(page);

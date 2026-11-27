@@ -144,7 +144,7 @@ test('snapshot + diff: shows added, modified and removed files', () => {
   }
 });
 
-test('rollback: restores modified/added/removed files and matches the snapshot hash', () => {
+test('rollback: restores modified/added/removed files and matches the snapshot hash', async () => {
   const root = makeWorkspace('vplay-rollback-');
   try {
     const source = makeStaticProject(path.join(root, 'original'));
@@ -157,7 +157,7 @@ test('rollback: restores modified/added/removed files and matches the snapshot h
     fs.writeFileSync(path.join(project.srcDir, 'added.txt'), 'temporary', 'utf-8');
     fs.rmSync(path.join(project.srcDir, 'css', 'style.css'));
 
-    const rollback = registry.rollback('demo', 1);
+    const rollback = await registry.rollback('demo', 1);
     assert.equal(rollback.verified, true);
     assert.equal(rollback.digest, initialDigest);
     assert.ok(fs.existsSync(path.join(project.srcDir, 'css', 'style.css')));

@@ -49,7 +49,7 @@ const { copyPreviewTree } = require('./lib/paths.cjs');
 const { createEventStore } = require('./lib/events.cjs');
 const { createEvidenceStore } = require('./lib/evidence.cjs');
 const { createDeviceStore } = require('./lib/devices.cjs');
-const { createVisionService } = require('./lib/vision-service.cjs');
+const { createVisionService, recoverVisionApplies } = require('./lib/vision-service.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
@@ -90,8 +90,10 @@ const WORKSPACE = path.resolve(
 const PREVIEW_PORT = Number(
   process.env.PREVIEW_PORT || (PORT === 0 ? 8788 : PORT + 1),
 );
+const TRUST_PROXY = process.env.REMOTE_TRUST_PROXY === '1';
+const SERVE_MODE = process.env.VPLAY_PUBLIC_MODE === '1' || TRUST_PROXY;
 const PUBLIC_MODE =
-  process.env.VPLAY_PUBLIC_MODE === '1' || HOST === '0.0.0.0' || HOST === '::';
+  SERVE_MODE || HOST === '0.0.0.0' || HOST === '::';
 const AUTHORUN = process.env.REMOTE_AUTORUN !== '0';
 const TASK_TIMEOUT_MS = Number(process.env.REMOTE_TASK_TIMEOUT_MS || 15 * 60 * 1000);
 const PROMPT_RATE_LIMIT = Number(process.env.REMOTE_RATE_LIMIT || 10);
@@ -108,11 +110,10 @@ for (const entry of String(process.env.REMOTE_ALLOWED_HOSTS || '').split(',')) {
 
 const { token: TOKEN, source: TOKEN_SOURCE } = resolveToken();
 const REMOTE_ENABLED = Boolean(TOKEN);
-// C07-P1-01：可选预览鉴权；启用后，预览页需要控制面登录下发的 cookie
-const PREVIEW_ACCESS_KEY = (process.env.PREVIEW_ACCESS_KEY || '').trim();
-const PREVIEW_ACCESS_HASH = PREVIEW_ACCESS_KEY
-  ? crypto.createHash('sha256').update(PREVIEW_ACCESS_KEY).digest('hex')
-  : null;
+// B10 / C09 B-09：预览鉴权改为「短期、会话绑定、可吊销」的票据。
+// PREVIEW_ACCESS_KEY 仅作为启用开关（不再把静态哈希写进 Cookie）。
+const PREVIEW_AUTH_ENABLED = Boolean((process.env.PREVIEW_ACCESS_KEY || '').trim());
+const PREVIEW_TICKET_TTL_MS = 4 * 60 * 60 * 1000;
 
 const projects = process.env.VPLAY_HOME
   ? createProjectRegistry({ home: process.env.VPLAY_HOME })
@@ -140,6 +141,65 @@ const devices = createDeviceStore({
   file: projects ? path.join(projects.home, 'devices.json') : path.join(RUNTIME_DIR, 'devices.json'),
 });
 
+// ---- 预览票据（B10 / C09 B-09）：内存存储、会话绑定、可即时吊销 ----
+const previewTickets = new Map();
+
+function prunePreviewTickets() {
+  const now = Date.now();
+  for (const [value, ticket] of previewTickets) {
+    if (now > ticket.expiresAt) previewTickets.delete(value);
+  }
+}
+
+function issuePreviewTicket({ projectId = null, deviceId = null, admin = false, sessionKey: boundKey = null, ttlMs = PREVIEW_TICKET_TTL_MS } = {}) {
+  if (!PREVIEW_AUTH_ENABLED) return null;
+  prunePreviewTickets();
+  const value = crypto.randomBytes(32).toString('base64url');
+  previewTickets.set(value, {
+    projectId,
+    deviceId,
+    admin: admin === true,
+    sessionKey: boundKey,
+    expiresAt: Date.now() + Number(ttlMs || PREVIEW_TICKET_TTL_MS),
+  });
+  return value;
+}
+
+function revokePreviewTickets(predicate) {
+  let removed = 0;
+  for (const [value, ticket] of previewTickets) {
+    if (!predicate || predicate(ticket)) {
+      previewTickets.delete(value);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
+/**
+ * 预览面授权：票据有效 + 设备未被吊销 + 项目授权。
+ * 设备吊销后，下一次请求立即 401（不依赖票据过期）。
+ */
+function authorizePreview(value, projectId) {
+  if (!PREVIEW_AUTH_ENABLED) return true;
+  if (!value) return false;
+  const ticket = previewTickets.get(value);
+  if (!ticket) return false;
+  if (Date.now() > ticket.expiresAt) {
+    previewTickets.delete(value);
+    return false;
+  }
+  if (ticket.admin) return true;
+  if (ticket.deviceId) {
+    const device = devices.get(ticket.deviceId);
+    if (!device || device.revoked) return false;
+    if (projectId && !devices.isProjectAllowed(device, projectId)) return false;
+    return true;
+  }
+  if (ticket.projectId && projectId && ticket.projectId !== projectId) return false;
+  return true;
+}
+
 const store = createTaskStore({
   runtimeDir: RUNTIME_DIR,
   workspaceDir: RUNTIME_ROOT,
@@ -148,9 +208,20 @@ const store = createTaskStore({
 
 const visionService = createVisionService({
   registry: projects,
-  home: RUNTIME_ROOT,
+  home: projects ? RUNTIME_ROOT : RUNTIME_DIR,
   eventStore,
   logger: (line) => console.log(line),
+  deps: {
+    previewPort: PREVIEW_PORT,
+    // 短期票据只存在于本进程内存，注入浏览器 context 后立即失效；不写盘、不进模型上下文
+    previewTicketProvider: ({ projectId, taskId }) =>
+      issuePreviewTicket({
+        projectId,
+        admin: true,
+        ttlMs: 5 * 60 * 1000,
+        sessionKey: `vision:${taskId}`,
+      }),
+  },
 });
 
 const worker = createWorker({
@@ -171,12 +242,12 @@ const worker = createWorker({
   onFinished: ({ projectId, verified }) => {
     try {
       // C07-P1-03：只有功能验证通过的任务才切换预览；失败保留 last-known-good。
+      // 项目模式：worker 在 settle 内已完成「发布 + 全量校验」，这里只处理单工作区。
       if (!verified) {
         console.log(`[remote] project ${projectId} not verified; preview kept`);
         return;
       }
-      if (projects) projects.buildPreview(projectId);
-      else rebuildLegacyPreview();
+      if (!projects) rebuildLegacyPreview();
     } catch {
       // 预览重建失败不影响任务结果
     }
@@ -214,7 +285,8 @@ const previewServer = createPreviewServer({
   // 单工作区模式也只暴露独立预览产物目录；项目模式只暴露 .preview
   legacyRoot: projects ? null : LEGACY_PREVIEW_DIR,
   allowedHosts: ALLOWED_HOSTS,
-  previewAccessHash: PREVIEW_ACCESS_HASH,
+  previewAuthEnabled: PREVIEW_AUTH_ENABLED,
+  authorizePreview: (value, projectId) => authorizePreview(value, projectId),
   logger: (line) => console.log(line),
 });
 
@@ -283,6 +355,11 @@ function validSession(sessionId) {
     sessions.delete(key);
     return false;
   }
+  // B10：设备被吊销后，现有 Session 立即失效（不等待 TTL）
+  if (session.deviceId && !devices.isActive(session.deviceId)) {
+    sessions.delete(key);
+    return false;
+  }
   session.lastSeen = now;
   return true;
 }
@@ -290,11 +367,17 @@ function validSession(sessionId) {
 function revokeAllSessions() {
   const count = sessions.size;
   sessions.clear();
+  // 预览票据与会话同生命周期：全部吊销
+  revokePreviewTickets(() => true);
   return count;
 }
 
 function dropSession(sessionId) {
-  if (sessionId) sessions.delete(sessionKey(sessionId));
+  if (!sessionId) return;
+  const key = sessionKey(sessionId);
+  sessions.delete(key);
+  // 只吊销与该会话绑定的预览票据
+  revokePreviewTickets((ticket) => ticket.sessionKey === key);
 }
 
 // ---- Host / Origin 白名单（P1-3）----
@@ -358,7 +441,7 @@ function authState(req) {
       kind: 'session',
       deviceId,
       admin: Boolean(session && session.admin === true),
-      device: deviceId ? devices.list().find((item) => item.id === deviceId) || null : null,
+      device: deviceId ? devices.get(deviceId) : null,
     };
   }
   return null;
@@ -379,8 +462,8 @@ function isAuthed(req) {
 function projectAllowed(auth, projectId) {
   if (!auth) return false;
   if (auth.kind === 'admin' || auth.admin === true) return true;
-  const device = auth.device || (auth.deviceId ? devices.list().find((item) => item.id === auth.deviceId) : null);
-  if (!device) return false;
+  const device = auth.device || (auth.deviceId ? devices.get(auth.deviceId) : null);
+  if (!device || device.revoked) return false;
   return devices.isProjectAllowed(device, projectId);
 }
 
@@ -695,7 +778,10 @@ const server = http.createServer(async (req, res) => {
       }
       // P1-2：下发短期 Session，而不是把主 Token 写进 Cookie
       const sessionId = createSession(device ? device.id : null, isAdmin);
-      const secure = req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https';
+      // B10：只有明确信任回环代理（Tailscale Serve）时才接受 X-Forwarded-Proto
+      const secure =
+        Boolean(req.socket.encrypted) ||
+        (TRUST_PROXY && req.headers['x-forwarded-proto'] === 'https');
       const cookie = [
         `${COOKIE_NAME}=${encodeURIComponent(sessionId)}`,
         'HttpOnly',
@@ -705,10 +791,17 @@ const server = http.createServer(async (req, res) => {
         ...(secure ? ['Secure'] : []),
       ].join('; ');
       const cookies = [cookie];
-      if (PREVIEW_ACCESS_HASH) {
+      const previewTicket = PREVIEW_AUTH_ENABLED
+        ? issuePreviewTicket({
+            deviceId: device ? device.id : null,
+            admin: isAdmin,
+            sessionKey: sessionKey(sessionId),
+          })
+        : null;
+      if (previewTicket) {
         cookies.push(
           [
-            `vplay_preview=${PREVIEW_ACCESS_HASH}`,
+            `vplay_preview=${encodeURIComponent(previewTicket)}`,
             'HttpOnly',
             'SameSite=Strict',
             'Path=/',
@@ -745,12 +838,11 @@ const server = http.createServer(async (req, res) => {
         'Path=/',
         'Max-Age=0',
       ].join('; ');
-      const cookies = [cookie];
-      if (PREVIEW_ACCESS_HASH) {
-        cookies.push(
-          ['vplay_preview=', 'HttpOnly', 'SameSite=Strict', 'Path=/', 'Max-Age=0'].join('; '),
-        );
-      }
+      const cookies = [
+        cookie,
+        // B10：登出立即吊销预览票据（服务端），并清除客户端 Cookie
+        ['vplay_preview=', 'HttpOnly', 'SameSite=Strict', 'Path=/', 'Max-Age=0'].join('; '),
+      ];
       res.writeHead(
         200,
         commonHeaders({
@@ -792,29 +884,56 @@ const server = http.createServer(async (req, res) => {
         }),
       );
       const last = req.headers['last-event-id'] || params.get('lastEventId') || '0';
+      let closed = false;
+      let unsubscribe = () => {};
+      let ping = null;
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
+        if (ping) clearInterval(ping);
+        unsubscribe();
+      };
+      // B10 / C-1：事件按项目授权过滤；未授权设备不得获得项目/任务元数据。
       const send = (record) => {
+        if (closed) return;
+        const current = authState(req);
+        if (!current) {
+          // 设备被吊销 / 会话失效：立即断开现有 SSE
+          cleanup();
+          try {
+            res.end();
+          } catch {
+            // 忽略
+          }
+          return;
+        }
+        if (record.projectId && !projectAllowed(current, record.projectId)) {
+          const createdBy = record.data && record.data.createdBy;
+          if (!(current.deviceId && createdBy === current.deviceId)) return;
+        }
         res.write(`id: ${record.id}\ndata: ${JSON.stringify(record)}\n\n`);
       };
       res.write('retry: 3000\n\n');
       for (const record of eventStore.listAfter(last, 2000)) send(record);
-      const unsubscribe = eventStore.subscribe((record) => {
+      unsubscribe = eventStore.subscribe((record) => {
         try {
           send(record);
         } catch {
           // 连接已断开
         }
       });
-      const ping = setInterval(() => {
+      ping = setInterval(() => {
         try {
+          if (!authState(req)) {
+            cleanup();
+            res.end();
+            return;
+          }
           res.write(': ping\n\n');
         } catch {
           // 忽略
         }
       }, 15000);
-      const cleanup = () => {
-        clearInterval(ping);
-        unsubscribe();
-      };
       req.on('close', cleanup);
       req.on('error', cleanup);
       res.on('close', cleanup);
@@ -827,9 +946,13 @@ const server = http.createServer(async (req, res) => {
       const limit = Math.min(Number(params.get('limit') || 20), 50);
       const projectFilter = params.get('projectId');
       let tasks = store.list();
-      // C07-P1-04：设备只看到自己创建的任务；管理员看全部
+      // B10 / C-1：同一用户授权的设备可查看共同工程的任务；未授权设备不得读取元数据。
       if (auth && auth.kind !== 'admin' && auth.admin !== true) {
-        tasks = tasks.filter((t) => (t.createdBy || 'admin') === auth.deviceId);
+        tasks = tasks.filter(
+          (t) =>
+            (t.createdBy || 'admin') === auth.deviceId ||
+            projectAllowed(auth, t.projectId || 'default'),
+        );
       }
       if (projectFilter) tasks = tasks.filter((t) => (t.projectId || 'default') === projectFilter);
       tasks = tasks.slice(-limit).reverse().map(publicTask);
@@ -847,7 +970,13 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 404, { ok: false, error: 'task not found' });
         return;
       }
-      if (auth && auth.kind !== 'admin' && auth.admin !== true && (task.createdBy || 'admin') !== auth.deviceId) {
+      if (
+        auth &&
+        auth.kind !== 'admin' &&
+        auth.admin !== true &&
+        (task.createdBy || 'admin') !== auth.deviceId &&
+        !projectAllowed(auth, task.projectId || 'default')
+      ) {
         sendJson(res, 403, { ok: false, error: 'task is not visible to this device' });
         return;
       }
@@ -1256,7 +1385,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       try {
-        const result = projects.rollback(projectId, seq);
+        const result = await projects.rollback(projectId, seq);
         console.log(`[remote] project ${projectId} rolled back to #${seq} (backup #${result.backupSeq})`);
         sendJson(res, 200, { ok: true, ...result });
       } catch (error) {
@@ -1404,18 +1533,34 @@ if (!isBindableHost(HOST)) {
   process.exit(1);
 }
 
-// C07-P0-02：测试后门绝不允许与网络监听同时启用
+// C07-P0-02 / C09 B-07：测试后门不允许与任何对外暴露模式（Serve/代理/通配）共存
 if (
   (process.env.REMOTE_ALLOW_TEST_SEAM === '1' || process.env.NODE_ENV === 'test') &&
-  !['127.0.0.1', 'localhost', '::1'].includes(HOST)
+  (PUBLIC_MODE || SERVE_MODE || !['127.0.0.1', 'localhost', '::1'].includes(HOST))
 ) {
   console.error(
-    '[remote] refuse to start: test seam is loopback-only; unset REMOTE_ALLOW_TEST_SEAM/REMOTE_EXECUTOR_CMD for networked runs.',
+    '[remote] refuse to start: test seam is loopback-only and forbidden in Serve/proxy/public mode; unset REMOTE_ALLOW_TEST_SEAM/REMOTE_EXECUTOR_CMD for networked runs.',
   );
   process.exit(1);
 }
+if (process.env.VPLAY_ALLOW_YOLO === '1' && PUBLIC_MODE) {
+  console.warn('[remote] VPLAY_ALLOW_YOLO=1 ignored: public/Serve mode forces controlled approval.');
+}
 if (process.env.REMOTE_ALLOW_TEST_SEAM === '1') {
   console.warn('[remote] WARNING: test seam enabled (loopback only). Never use for acceptance or production.');
+}
+
+// B10：上次 Vision 写入中断时，复核 journal（不自动改写源码，交给快照与人工）
+try {
+  const journals = recoverVisionApplies({
+    home: projects ? RUNTIME_ROOT : RUNTIME_DIR,
+    logger: (line) => console.log(line),
+  });
+  if (journals.length > 0) {
+    console.log(`[remote] vision apply journals reviewed: ${JSON.stringify(journals)}`);
+  }
+} catch (error) {
+  console.error(`[remote] vision journal recovery failed: ${error.message}`);
 }
 
 server.listen(PORT, HOST, () => {
