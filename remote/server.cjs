@@ -37,6 +37,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 
 const { createTaskStore, ValidationError, DuplicateTaskError } = require('./lib/tasks.cjs');
@@ -103,6 +104,11 @@ for (const entry of String(process.env.REMOTE_ALLOWED_HOSTS || '').split(',')) {
 
 const { token: TOKEN, source: TOKEN_SOURCE } = resolveToken();
 const REMOTE_ENABLED = Boolean(TOKEN);
+// C07-P1-01：可选预览鉴权；启用后，预览页需要控制面登录下发的 cookie
+const PREVIEW_ACCESS_KEY = (process.env.PREVIEW_ACCESS_KEY || '').trim();
+const PREVIEW_ACCESS_HASH = PREVIEW_ACCESS_KEY
+  ? crypto.createHash('sha256').update(PREVIEW_ACCESS_KEY).digest('hex')
+  : null;
 
 const projects = process.env.VPLAY_HOME
   ? createProjectRegistry({ home: process.env.VPLAY_HOME })
@@ -127,10 +133,15 @@ const worker = createWorker({
   executorScript: resolveExecutorScript(process.env),
   timeoutMs: TASK_TIMEOUT_MS,
   publicMode: PUBLIC_MODE,
-  allowYolo: process.env.VPLAY_ALLOW_YOLO !== '0',
+  allowYolo: process.env.VPLAY_ALLOW_YOLO === '1',
   secrets: TOKEN ? [TOKEN] : [],
-  onFinished: ({ projectId }) => {
+  onFinished: ({ projectId, verified }) => {
     try {
+      // C07-P1-03：只有功能验证通过的任务才切换预览；失败保留 last-known-good。
+      if (!verified) {
+        console.log(`[remote] project ${projectId} not verified; preview kept`);
+        return;
+      }
       if (projects) projects.buildPreview(projectId);
       else rebuildLegacyPreview();
     } catch {
@@ -170,6 +181,7 @@ const previewServer = createPreviewServer({
   // 单工作区模式也只暴露独立预览产物目录；项目模式只暴露 .preview
   legacyRoot: projects ? null : LEGACY_PREVIEW_DIR,
   allowedHosts: ALLOWED_HOSTS,
+  previewAccessHash: PREVIEW_ACCESS_HASH,
   logger: (line) => console.log(line),
 });
 
@@ -212,7 +224,11 @@ function createSession() {
   pruneSessions();
   const sessionId = crypto.randomBytes(24).toString('base64url');
   const now = Date.now();
-  sessions.set(sessionKey(sessionId), { createdAt: now, lastSeen: now });
+  sessions.set(sessionKey(sessionId), {
+    createdAt: now,
+    lastSeen: now,
+    tokenFingerprint: REMOTE_ENABLED ? digest(TOKEN).toString('hex') : null,
+  });
   return sessionId;
 }
 
@@ -226,8 +242,20 @@ function validSession(sessionId) {
     sessions.delete(key);
     return false;
   }
+  // C07-P1-09：session 绑定当前 token 指纹；token 轮换后旧 session 自动失效
+  const current = REMOTE_ENABLED ? digest(TOKEN).toString('hex') : null;
+  if (session.tokenFingerprint !== current) {
+    sessions.delete(key);
+    return false;
+  }
   session.lastSeen = now;
   return true;
+}
+
+function revokeAllSessions() {
+  const count = sessions.size;
+  sessions.clear();
+  return count;
 }
 
 function dropSession(sessionId) {
@@ -519,6 +547,21 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // C07-P1-02：API 的 GET 不接受跨站请求（预览源脚本携带 Cookie 的弱边界加固）
+    const secFetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+    if (
+      secFetchSite === 'cross-site' &&
+      method === 'GET' &&
+      (pathname === '/status' ||
+        pathname === '/tasks' ||
+        pathname.startsWith('/tasks/') ||
+        pathname === '/projects' ||
+        pathname.startsWith('/projects/'))
+    ) {
+      sendJson(res, 403, { ok: false, error: 'cross-site request blocked' });
+      return;
+    }
+
     if (method === 'GET' && pathname === '/health') {
       // P2-1：公开端点只返回最小信息
       sendJson(res, 200, {
@@ -580,11 +623,24 @@ const server = http.createServer(async (req, res) => {
         `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
         ...(secure ? ['Secure'] : []),
       ].join('; ');
+      const cookies = [cookie];
+      if (PREVIEW_ACCESS_HASH) {
+        cookies.push(
+          [
+            `vplay_preview=${PREVIEW_ACCESS_HASH}`,
+            'HttpOnly',
+            'SameSite=Strict',
+            'Path=/',
+            `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+            ...(secure ? ['Secure'] : []),
+          ].join('; '),
+        );
+      }
       res.writeHead(
         200,
         commonHeaders({
           'Content-Type': 'application/json; charset=utf-8',
-          'Set-Cookie': cookie,
+          'Set-Cookie': cookies,
           'Cache-Control': 'no-store',
         }),
       );
@@ -603,14 +659,32 @@ const server = http.createServer(async (req, res) => {
         'Path=/',
         'Max-Age=0',
       ].join('; ');
+      const cookies = [cookie];
+      if (PREVIEW_ACCESS_HASH) {
+        cookies.push(
+          ['vplay_preview=', 'HttpOnly', 'SameSite=Strict', 'Path=/', 'Max-Age=0'].join('; '),
+        );
+      }
       res.writeHead(
         200,
         commonHeaders({
           'Content-Type': 'application/json; charset=utf-8',
-          'Set-Cookie': cookie,
+          'Set-Cookie': cookies,
         }),
       );
       res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (method === 'POST' && pathname === '/auth/revoke-all') {
+      // C07-P1-09：token 轮换/应急时吊销全部 session；只接受 Bearer 主 token
+      if (!requireAuth(req, res)) return;
+      if (authVia(req) !== 'token') {
+        sendJson(res, 403, { ok: false, error: 'bearer token required' });
+        return;
+      }
+      const revoked = revokeAllSessions();
+      sendJson(res, 200, { ok: true, revoked });
       return;
     }
 
@@ -691,12 +765,21 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      const via = authVia(req);
+      // C07-P0-01：yolo 必须由主 token 显式按任务申请；Session 不能开启 yolo
+      const requestedYolo = payload.allowYolo === true;
+      if (requestedYolo && via !== 'token') {
+        sendJson(res, 403, { ok: false, error: 'yolo requires bearer token authorization' });
+        return;
+      }
+
       try {
         const { task, duplicate } = store.create({
           text: payload.text,
           idempotencyKey: payload.idempotencyKey,
           source: 'remote',
           projectId,
+          allowYolo: requestedYolo && via === 'token',
         });
         console.log(
           `[remote] task ${task.id} ${duplicate ? 'already exists (idempotent)' : 'queued'} project=${projectId}`,
@@ -839,6 +922,14 @@ const server = http.createServer(async (req, res) => {
         });
         return;
       }
+      // C07 ORD-15：任何持有项目锁的写入方（含 Vision）都应阻止回退
+      if (projects.readLock(projectId)) {
+        sendJson(res, 409, {
+          ok: false,
+          error: 'project is locked by another writer; rollback is not allowed',
+        });
+        return;
+      }
       const raw = await readBody(req);
       if (raw === null) return;
       let seq;
@@ -967,6 +1058,41 @@ const leaseActions = recoverStaleLeases({
 const killed = leaseActions.filter((item) => item.action.startsWith('killed'));
 if (killed.length > 0) {
   console.log(`[remote] reaped ${killed.length} orphan process(es) from a previous run`);
+}
+
+// C07 §2.2 / 方案 A：禁止 0.0.0.0 等通配监听；REMOTE_HOST 必须是本机已存在的地址
+function isBindableHost(host) {
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+  if (host === '0.0.0.0' || host === '::') return false;
+  const nets = os.networkInterfaces();
+  for (const list of Object.values(nets)) {
+    for (const item of list || []) {
+      if (item && item.address === host) return true;
+    }
+  }
+  return false;
+}
+
+if (!isBindableHost(HOST)) {
+  console.error(
+    `[remote] refuse to start: REMOTE_HOST=${HOST} is wildcard or not a local interface address.\n` +
+      '[remote] Bind 127.0.0.1 (Tailscale Serve mode) or a specific local/Tailscale IP.',
+  );
+  process.exit(1);
+}
+
+// C07-P0-02：测试后门绝不允许与网络监听同时启用
+if (
+  (process.env.REMOTE_ALLOW_TEST_SEAM === '1' || process.env.NODE_ENV === 'test') &&
+  !['127.0.0.1', 'localhost', '::1'].includes(HOST)
+) {
+  console.error(
+    '[remote] refuse to start: test seam is loopback-only; unset REMOTE_ALLOW_TEST_SEAM/REMOTE_EXECUTOR_CMD for networked runs.',
+  );
+  process.exit(1);
+}
+if (process.env.REMOTE_ALLOW_TEST_SEAM === '1') {
+  console.warn('[remote] WARNING: test seam enabled (loopback only). Never use for acceptance or production.');
 }
 
 server.listen(PORT, HOST, () => {

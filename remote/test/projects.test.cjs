@@ -178,12 +178,14 @@ test('project lock: second acquire fails while the first is held', () => {
     const registry = createProjectRegistry({ home: path.join(root, 'home') });
     const source = makeStaticProject(path.join(root, 'original'));
     registry.importProject({ sourceDir: source, id: 'demo' });
-    registry.acquireLock('demo', { taskId: 'task_1' });
+    const first = registry.acquireLock('demo', { taskId: 'task_1' });
     assert.throws(() => registry.acquireLock('demo', { taskId: 'task_2' }), /占用/);
-    registry.releaseLock('demo');
+    // C07-P0-03：owner token 不匹配时不得释放他人锁
+    assert.equal(registry.releaseLock('demo', 'wrong-token'), false);
+    assert.equal(registry.releaseLock('demo', first.token), true);
     const info = registry.acquireLock('demo', { taskId: 'task_3' });
     assert.equal(info.taskId, 'task_3');
-    registry.releaseLock('demo');
+    assert.equal(registry.releaseLock('demo', info.token), true);
   } finally {
     removeWorkspace(root);
   }

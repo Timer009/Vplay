@@ -18,6 +18,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const { resolveStaticFile } = require('./paths.cjs');
 
@@ -50,6 +51,37 @@ const MIME = {
   '.wasm': 'application/wasm',
 };
 
+// C07-P0-05：预览页脚本级 CSP。允许游戏自身的 inline 脚本与本地资源，
+// 但禁止外部连接、外链脚本、表单、frame/object/worker，降低模型注入后的外连与钓鱼面。
+const PREVIEW_CSP = [
+  "default-src 'none'",
+  "script-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
+  "font-src 'self' data:",
+  "connect-src 'self'",
+  "frame-src 'none'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "worker-src 'none'",
+  "frame-ancestors 'self'",
+].join('; ');
+
+function previewHeaders(ext, length) {
+  return {
+    'Content-Type': MIME[ext] || 'application/octet-stream',
+    'Content-Length': length,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'X-Frame-Options': 'SAMEORIGIN',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+    'Content-Security-Policy': PREVIEW_CSP,
+  };
+}
+
 function sendText(res, status, body, contentType) {
   res.writeHead(status, {
     'Content-Type': contentType || 'text/plain; charset=utf-8',
@@ -70,7 +102,27 @@ function createPreviewServer(options) {
   const projects = options.projects;
   const legacyRoot = options.legacyRoot || null;
   const allowedHosts = options.allowedHosts || null;
+  const previewAccessHash = options.previewAccessHash || null;
   const logger = options.logger || ((line) => console.log(line));
+
+  function previewAuthed(req) {
+    if (!previewAccessHash) return true;
+    const header = String(req.headers.cookie || '');
+    for (const part of header.split(';')) {
+      const index = part.indexOf('=');
+      if (index < 0) continue;
+      if (part.slice(0, index).trim() !== 'vplay_preview') continue;
+      const value = part.slice(index + 1).trim();
+      try {
+        const expected = Buffer.from(previewAccessHash);
+        const actual = Buffer.from(value);
+        return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
 
   const server = http.createServer((req, res) => {
     try {
@@ -93,6 +145,12 @@ function createPreviewServer(options) {
 
       if (method !== 'GET' && method !== 'HEAD') {
         sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        return;
+      }
+
+      // C07-P1-01：可选的预览鉴权（与控制面登录联动）
+      if (pathname !== '/health' && !previewAuthed(req)) {
+        sendJson(res, 401, { ok: false, error: 'preview requires authentication' });
         return;
       }
 
@@ -122,15 +180,7 @@ function createPreviewServer(options) {
             return;
           }
           const ext = path.extname(resolved.file).toLowerCase();
-          res.writeHead(200, {
-            'Content-Type': MIME[ext] || 'application/octet-stream',
-            'Content-Length': data.length,
-            'Cache-Control': 'no-store',
-            'X-Content-Type-Options': 'nosniff',
-            'Referrer-Policy': 'no-referrer',
-            'X-Frame-Options': 'SAMEORIGIN',
-            'Content-Security-Policy': "frame-ancestors 'self'",
-          });
+          res.writeHead(200, previewHeaders(ext, data.length));
           res.end(method === 'HEAD' ? undefined : data);
         });
         return;
@@ -175,15 +225,7 @@ function createPreviewServer(options) {
           return;
         }
         const ext = path.extname(resolved.file).toLowerCase();
-        res.writeHead(200, {
-          'Content-Type': MIME[ext] || 'application/octet-stream',
-          'Content-Length': data.length,
-          'Cache-Control': 'no-store',
-          'X-Content-Type-Options': 'nosniff',
-          'Referrer-Policy': 'no-referrer',
-          'X-Frame-Options': 'SAMEORIGIN',
-          'Content-Security-Policy': "frame-ancestors 'self'",
-        });
+        res.writeHead(200, previewHeaders(ext, data.length));
         res.end(method === 'HEAD' ? undefined : data);
       });
     } catch (error) {

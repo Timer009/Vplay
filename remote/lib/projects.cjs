@@ -21,6 +21,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { spawnSync } = require('child_process');
 
 const {
   DEFAULT_EXCLUDES,
@@ -541,6 +542,13 @@ function createProjectRegistry(options = {}) {
     // 5) 初始快照 = 导入时的状态，可随时回退
     const initial = snapshotInternal(id, 'initial');
 
+    // 6) 预热预览（失败不影响导入；GET 不再按需构建）
+    try {
+      buildPreview(id);
+    } catch {
+      // 忽略
+    }
+
     return {
       project: get(id),
       import: {
@@ -637,23 +645,100 @@ function createProjectRegistry(options = {}) {
     return entryDir === '.' ? dest : path.join(dest, entryDir);
   }
 
+  /** 执行项目构建（Vite 等）。只传系统必需环境，不传任何模型 Key。 */
+  function buildProject(record) {
+    const detected = (record.profile && record.profile.detected) || {};
+    const command = detected.buildCommand || 'npm run build';
+    const env = {};
+    for (const key of [
+      'PATH', 'Path', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'windir', 'ComSpec',
+      'TEMP', 'TMP', 'TMPDIR', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
+      'NODE_ENV', 'LANG', 'LC_ALL',
+    ]) {
+      if (process.env[key]) env[key] = process.env[key];
+    }
+    const nodeDir = path.dirname(process.execPath);
+    env.PATH = `${nodeDir}${path.delimiter}${env.PATH || env.Path || ''}`;
+    if (process.platform === 'win32') env.Path = env.PATH;
+    const shell = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : '/bin/sh';
+    const args = process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-c', command];
+    const result = spawnSync(shell, args, {
+      cwd: record.srcDir,
+      env,
+      timeout: 5 * 60 * 1000,
+      windowsHide: true,
+      encoding: 'utf-8',
+    });
+    return {
+      ok: result.status === 0,
+      status: result.status,
+      command,
+      stderr: String(result.stderr || '').slice(-4000),
+    };
+  }
+
+  /**
+   * 全量预览新鲜度校验（C07-P1-06 / ORD-11）：
+   * 发布清单中的每个文件，其预览哈希必须等于清单哈希，且等于当前源码/构建产物哈希。
+   */
+  function verifyPreview(id, record = requireProject(id)) {
+    const source = previewSourceDir(record);
+    if (!source) return { ok: false, reason: 'SOURCE_MISSING', mismatches: [] };
+    const manifest = readJson(path.join(projectDirOf(id), '.publish-manifest.json'), null);
+    if (!manifest || !manifest.files || typeof manifest.files !== 'object') {
+      return { ok: false, reason: 'MANIFEST_MISSING', mismatches: [] };
+    }
+    const dest = previewDirOf(id);
+    const mismatches = [];
+    for (const [rel, hash] of Object.entries(manifest.files)) {
+      const published = path.join(dest, rel);
+      const sourceFile = path.join(source, rel);
+      if (!fs.existsSync(published)) {
+        mismatches.push({ rel, reason: 'preview-missing' });
+        continue;
+      }
+      if (!fs.existsSync(sourceFile)) {
+        mismatches.push({ rel, reason: 'source-missing' });
+        continue;
+      }
+      const publishedHash = crypto.createHash('sha256').update(fs.readFileSync(published)).digest('hex');
+      const sourceHash = crypto.createHash('sha256').update(fs.readFileSync(sourceFile)).digest('hex');
+      if (publishedHash !== hash) {
+        mismatches.push({ rel, reason: 'preview-hash', expected: hash, actual: publishedHash });
+      }
+      if (publishedHash !== sourceHash) {
+        mismatches.push({ rel, reason: 'source-preview-mismatch' });
+      }
+    }
+    const entryRel = record.kind === 'vite' ? 'index.html' : record.entry || 'index.html';
+    if (!fs.existsSync(path.join(dest, entryRel))) {
+      mismatches.push({ rel: entryRel, reason: 'entry-missing' });
+    }
+    return {
+      ok: mismatches.length === 0,
+      reason: mismatches.length ? 'MISMATCH' : 'OK',
+      mismatches: mismatches.slice(0, 50),
+      checked: Object.keys(manifest.files).length,
+    };
+  }
+
   /**
    * 生成独立预览产物目录（P0-1/P0-3）：
    * 只复制可预览类型、跳过点文件与 node_modules，预览面只读这里，
-   * 永远不直接读 src。
+   * 永远不直接读 src。C07：原子发布 + 全量 manifest 校验。
    */
   function buildPreview(id) {
     const record = requireProject(id);
     const dest = previewDirOf(id);
     const source = previewSourceDir(record);
     if (!source) {
-      fs.rmSync(dest, { recursive: true, force: true });
       return null;
     }
     let result;
     try {
       result = copyPreviewTree(source, dest);
     } catch {
+      // 原子发布失败：旧预览保持不变，不返回半成品
       return null;
     }
     // NEW-04：发布清单落盘，便于审计「发布了什么、跳过了什么」
@@ -667,16 +752,31 @@ function createProjectRegistry(options = {}) {
     }
     const entryRel = record.kind === 'vite' ? 'index.html' : record.entry || 'index.html';
     if (!fs.existsSync(path.join(dest, entryRel))) return null;
+    const check = verifyPreview(id, record);
+    if (!check.ok) {
+      try {
+        writeJson(path.join(projectDirOf(id), '.preview-stale.json'), {
+          at: new Date().toISOString(),
+          ...check,
+        });
+      } catch {
+        // 证据写入失败不影响返回
+      }
+      return null;
+    }
+    try {
+      fs.rmSync(path.join(projectDirOf(id), '.preview-stale.json'), { force: true });
+    } catch {
+      // 忽略
+    }
     return previewRootPath(record, dest);
   }
 
+  /** 读取现有预览；C07-P1-01：GET 不再触发按需构建（避免无鉴权 DoS）。 */
   function previewRoot(id) {
     const record = requireProject(id);
     const dest = previewDirOf(id);
     const entryRel = record.kind === 'vite' ? 'index.html' : record.entry || 'index.html';
-    if (!fs.existsSync(path.join(dest, entryRel))) {
-      buildPreview(id);
-    }
     if (!fs.existsSync(path.join(dest, entryRel))) return null;
     return previewRootPath(record, dest);
   }
@@ -1042,13 +1142,32 @@ function createProjectRegistry(options = {}) {
         throw new ProjectError('回退后完整性校验失败', 500, 'ROLLBACK_VERIFY_FAILED');
       }
 
-      fs.rmSync(journal, { force: true });
-      let preview = null;
-      try {
-        preview = buildPreview(id);
-      } catch {
-        preview = null;
+      // C07-P0-04：Vite 回退后必须重新构建，不能用回退前的旧 dist
+      const record = requireProject(id);
+      let build = null;
+      if (record.kind === 'vite') {
+        build = buildProject(record);
+        if (!build.ok) {
+          throw new ProjectError(
+            `回退后构建失败（${build.command}，exit=${build.status}）`,
+            500,
+            'ROLLBACK_BUILD_FAILED',
+          );
+        }
       }
+
+      const preview = buildPreview(id);
+      const previewCheck = verifyPreview(id, record);
+      if (!preview || !previewCheck.ok) {
+        throw new ProjectError(
+          `回退后预览校验失败（${previewCheck.reason}）`,
+          500,
+          'ROLLBACK_PREVIEW_MISMATCH',
+        );
+      }
+
+      // 全部校验通过后才删除 journal（OBS-C04-01）
+      fs.rmSync(journal, { force: true });
 
       return {
         projectId: id,
@@ -1056,8 +1175,10 @@ function createProjectRegistry(options = {}) {
         backupSeq: backup.seq,
         files: { removed: applied.removed, restored: applied.restored },
         verified: true,
-        previewReady: Boolean(preview),
+        previewReady: true,
         digest: applied.digest,
+        build: build ? { ok: build.ok, command: build.command } : null,
+        previewChecked: previewCheck.checked,
       };
     } catch (error) {
       // 失败恢复：用刚建立的备份把工作区还原，保证不丢文件
@@ -1065,13 +1186,17 @@ function createProjectRegistry(options = {}) {
       try {
         const restoredTree = applyTree(id, backupTree.dir, backupTree.manifest);
         recovered = restoredTree.equal;
+        if (recovered) {
+          // 若回退过程中已重建 dist，必须按还原后的源码再构建一次
+          const current = requireProject(id);
+          if (current.kind === 'vite') {
+            const rebuilt = buildProject(current);
+            if (!rebuilt.ok) recovered = false;
+          }
+          buildPreview(id);
+        }
       } catch {
         recovered = false;
-      }
-      try {
-        buildPreview(id);
-      } catch {
-        // 忽略
       }
       if (!recovered) {
         // 保留 journal，供服务重启时再次恢复
@@ -1205,51 +1330,145 @@ function createProjectRegistry(options = {}) {
     return memory.rounds.length;
   }
 
-  // ---- 项目锁：同一项目同一时间只允许一个任务写入 ----
+  // ---- 项目锁：原子抢锁 + owner token + 崩溃恢复（C07-P0-03）----
+  const PROJECT_LOCK_TTL_MS = 10 * 60 * 1000;
+
   function lockFile(id) {
     return path.join(locksDir, `${id}.lock`);
+  }
+
+  function lockInfoOf(file) {
+    return readJson(file, null);
+  }
+
+  function lockAgeMs(info) {
+    const stamp = info && (info.heartbeatAt || info.at);
+    const parsed = stamp ? Date.parse(stamp) : NaN;
+    return Number.isFinite(parsed) ? Date.now() - parsed : Infinity;
+  }
+
+  /** 只在「持有者已死」或「超过硬 TTL」时隔离锁；隔离后复核归属，避免误删活锁。 */
+  function quarantineLock(file) {
+    const trash = `${file}.stale-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+    try {
+      fs.renameSync(file, trash);
+    } catch {
+      return;
+    }
+    const moved = lockInfoOf(trash);
+    const alive = moved && pidAlive(Number(moved.pid));
+    if (alive && lockAgeMs(moved) <= PROJECT_LOCK_TTL_MS) {
+      try {
+        if (!fs.existsSync(file)) fs.renameSync(trash, file);
+      } catch {
+        // 放回失败则保留隔离文件，交人工处理
+      }
+      return;
+    }
+    try {
+      fs.rmSync(trash, { force: true });
+    } catch {
+      // 忽略
+    }
   }
 
   function readLock(id) {
     const file = lockFile(id);
     if (!fs.existsSync(file)) return null;
-    const info = readJson(file, null);
-    if (!info) return null;
-    const alive = (() => {
+    const info = lockInfoOf(file);
+    if (!info) {
+      // 空/损坏锁：超过 5 秒才视为残留
       try {
-        process.kill(info.pid, 0);
-        return true;
+        if (Date.now() - fs.statSync(file).mtimeMs > 5000) quarantineLock(file);
       } catch {
-        return false;
+        // 忽略
       }
-    })();
-    if (!alive) {
-      fs.rmSync(file, { force: true });
+      return null;
+    }
+    const alive = pidAlive(Number(info.pid));
+    const fresh = lockAgeMs(info) <= PROJECT_LOCK_TTL_MS;
+    if (!alive || !fresh) {
+      quarantineLock(file);
       return null;
     }
     return info;
   }
 
+  /** 原子抢锁：O_EXCL 创建，返回带 owner token 的锁信息；失败 409。 */
   function acquireLock(id, meta = {}) {
     validateProjectId(id);
-    const existing = readLock(id);
-    if (existing) {
-      throw new ProjectError(
-        `项目正在被任务 ${existing.taskId || '?'} 占用`,
-        409,
-        'PROJECT_LOCKED',
-      );
+    const token = crypto.randomBytes(16).toString('hex');
+    const now = new Date().toISOString();
+    const info = {
+      id,
+      pid: process.pid,
+      taskId: meta.taskId || null,
+      token,
+      at: now,
+      heartbeatAt: now,
+    };
+    fs.mkdirSync(locksDir, { recursive: true });
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        const fd = fs.openSync(lockFile(id), 'wx');
+        try {
+          fs.writeSync(fd, JSON.stringify(info, null, 2));
+        } finally {
+          fs.closeSync(fd);
+        }
+        return { ...info };
+      } catch (error) {
+        if (!['EEXIST', 'EPERM', 'EACCES'].includes(error.code)) throw error;
+        const existing = readLock(id);
+        if (existing) {
+          throw new ProjectError(
+            `项目正在被任务 ${existing.taskId || '?'} 占用`,
+            409,
+            'PROJECT_LOCKED',
+          );
+        }
+        sleepSync(10 + Math.floor(Math.random() * 20));
+      }
     }
-    const info = { id, pid: process.pid, taskId: meta.taskId || null, at: new Date().toISOString() };
-    fs.writeFileSync(lockFile(id), JSON.stringify(info, null, 2), 'utf-8');
-    return info;
+    throw new ProjectError('项目锁竞争失败，请重试', 409, 'PROJECT_LOCKED');
   }
 
-  function releaseLock(id) {
+  /** 只释放自己 token 的锁；token 不匹配时绝不删除（C07-P0-03 / ORD-02）。 */
+  function releaseLock(id, token) {
+    if (!token) return false;
+    const file = lockFile(id);
+    const info = lockInfoOf(file);
+    if (!info || info.token !== token) return false;
     try {
-      fs.rmSync(lockFile(id), { force: true });
+      fs.rmSync(file, { force: true });
+      return true;
     } catch {
-      // 忽略
+      return false;
+    }
+  }
+
+  /** 心跳：长任务定期刷新，避免被硬 TTL 误回收。 */
+  function touchLock(id, token) {
+    if (!token) return false;
+    const file = lockFile(id);
+    const info = lockInfoOf(file);
+    if (!info || info.token !== token) return false;
+    const tmp = `${file}.${process.pid}.${crypto.randomBytes(3).toString('hex')}.tmp`;
+    try {
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({ ...info, heartbeatAt: new Date().toISOString() }, null, 2),
+        'utf-8',
+      );
+      fs.renameSync(tmp, file);
+      return true;
+    } catch {
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {
+        // 忽略
+      }
+      return false;
     }
   }
 
@@ -1289,11 +1508,14 @@ function createProjectRegistry(options = {}) {
     previewRoot,
     previewDir: previewDirOf,
     buildPreview,
+    verifyPreview,
+    buildProject,
     memory: (id) => readJson(memoryPath(id), { rounds: [] }),
     appendRound,
     acquireLock,
     releaseLock,
     readLock,
+    touchLock,
     removeProject,
     digestManifest,
   };

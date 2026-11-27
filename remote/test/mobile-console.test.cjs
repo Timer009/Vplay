@@ -95,6 +95,12 @@ test('mobile viewport: projects mode selects a project and opens the isolated pr
 
     await page.waitForSelector('.task-badge[data-s="succeeded"]', { timeout: 30000 });
     await page.click('.task-item');
+    // 详情面板异步渲染；等待目标文本出现，避免读取早一帧（断言保持不变）
+    await page.waitForFunction(
+      () => (document.querySelector('.task-detail')?.textContent || '').includes('demo-game'),
+      undefined,
+      { timeout: 15000 },
+    );
     const detail = await page.textContent('.task-detail');
     assert.match(detail, /demo-game/);
 

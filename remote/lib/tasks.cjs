@@ -130,10 +130,11 @@ function createTaskStore(options) {
     }
     out = out.replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-***');
     out = out.replace(
-      /((?:OPENAI|GEMINI|QWEN|DASHSCOPE|ANTHROPIC)_API_KEY\s*[=:]\s*)\S+/gi,
+      /((?:OPENAI|GEMINI|QWEN|QWEN_VL|DASHSCOPE|ANTHROPIC|DEEPSEEK|VISION|VPLAY_VISION|VPLAY_TEXT)_API_KEY\s*[=:]\s*)\S+/gi,
       '$1***',
     );
     out = out.replace(/(REMOTE_TOKEN(?:_FILE)?\s*[=:]\s*)\S+/gi, '$1***');
+    out = out.replace(/(Authorization\s*:\s*Bearer\s+)\S+/gi, '$1***');
     out = out.replace(/vplay_session=[^;\s"']+/g, 'vplay_session=***');
     return out;
   }
@@ -222,6 +223,7 @@ function createTaskStore(options) {
       text,
       idempotencyKey,
       source: (input && input.source) || 'remote',
+      allowYolo: Boolean(input && input.allowYolo === true),
       status: 'queued',
       createdAt: now,
       updatedAt: now,

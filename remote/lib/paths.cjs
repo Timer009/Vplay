@@ -409,20 +409,28 @@ function unifiedDiff(aDir, bDir, files, options = {}) {
 }
 
 /**
- * 复制「可预览」文件到独立预览目录（P0-1 / P0-3）：
+ * 复制「可预览」文件到独立预览目录（P0-1 / P0-3 / C07-P1-06）：
  * - 跳过任何以 "." 开头的目录/文件（.env/.git/.opengame）
  * - 只复制扩展名白名单内的文件
  * - 保留相对目录结构，便于 ../assets 这类相对引用
+ * - **原子发布**：先构建到同级临时目录，成功后 rename 切换；失败保留旧版本
+ * - 清单记录每个已发布文件的 sha256，供全量新鲜度校验
  */
 function copyPreviewTree(sourceDir, targetDir, options = {}) {
   const root = path.resolve(sourceDir);
   const dest = path.resolve(targetDir);
   const maxFiles = options.maxFiles || 5000;
-  fs.rmSync(dest, { recursive: true, force: true });
-  fs.mkdirSync(dest, { recursive: true });
+  const suffix = `${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  const tmp = `${dest}.tmp-${suffix}`;
+  const old = `${dest}.old-${suffix}`;
+
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.mkdirSync(tmp, { recursive: true });
 
   let copied = 0;
   const skipped = [];
+  const files = {};
 
   function skip(rel, reason) {
     skipped.push({ path: rel, reason });
@@ -475,10 +483,11 @@ function copyPreviewTree(sourceDir, targetDir, options = {}) {
         skip(rel, 'max-files');
         continue;
       }
-      const target = path.join(dest, path.relative(root, full));
+      const target = path.join(tmp, path.relative(root, full));
       fs.mkdirSync(path.dirname(target), { recursive: true });
       try {
         fs.copyFileSync(full, target);
+        files[rel] = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
         copied += 1;
       } catch {
         skip(rel, 'copy-error');
@@ -486,16 +495,52 @@ function copyPreviewTree(sourceDir, targetDir, options = {}) {
     }
   }
 
-  walk(root);
+  try {
+    walk(root);
+  } catch (error) {
+    fs.rmSync(tmp, { recursive: true, force: true });
+    throw error;
+  }
+
+  const manifest = {
+    generatedAt: new Date().toISOString(),
+    published: copied,
+    skipped,
+    files,
+  };
+
+  // 原子切换：旧目录先改名，新目录就位后再删除旧目录；失败则回滚
+  let hadOld = false;
+  try {
+    if (fs.existsSync(dest)) {
+      fs.renameSync(dest, old);
+      hadOld = true;
+    }
+    fs.renameSync(tmp, dest);
+  } catch (error) {
+    if (hadOld) {
+      try {
+        fs.renameSync(old, dest);
+      } catch {
+        // 保留 old 目录，交给人工处理
+      }
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+    throw error;
+  }
+  if (hadOld) {
+    try {
+      fs.rmSync(old, { recursive: true, force: true });
+    } catch {
+      // 旧目录清理失败不影响新版本可用
+    }
+  }
+
   return {
     copied,
     skippedCount: skipped.length,
     skipped,
-    manifest: {
-      generatedAt: new Date().toISOString(),
-      published: copied,
-      skipped,
-    },
+    manifest,
   };
 }
 

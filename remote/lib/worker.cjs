@@ -56,6 +56,17 @@ function resolveExecutorScript(env = process.env) {
 }
 
 
+/**
+ * C07-P0-01：审批模式解析（纯函数，便于测试）。
+ * yolo 需要三者同时成立：非 public、环境显式开启、任务显式 allowYolo。
+ */
+function resolveApprovalMode({ publicMode, allowYolo, task }) {
+  if (publicMode) return 'auto-edit';
+  if (!allowYolo) return 'auto-edit';
+  if (!task || task.allowYolo !== true) return 'auto-edit';
+  return 'yolo';
+}
+
 function readRuntimePhase(dir) {
   try {
     const file = path.join(dir, '.opengame', 'runtime-status.json');
@@ -201,10 +212,8 @@ function createWorker(options) {
     return composePrompt({ text: task.text, project, memory });
   }
 
-  function approvalMode() {
-    if (publicMode) return 'auto-edit';
-    if (!allowYolo) return 'auto-edit';
-    return 'yolo';
+  function approvalMode(task) {
+    return resolveApprovalMode({ publicMode, allowYolo, task });
   }
 
   function finish(taskId, status, patch) {
@@ -241,7 +250,7 @@ function createWorker(options) {
       '-p',
       prompt,
       '--approval-mode',
-      approvalMode(),
+      approvalMode(task),
     ];
     if (useContinue) {
       args.push('--continue', '--chat-recording');
@@ -324,9 +333,10 @@ function createWorker(options) {
 
     // 项目锁 + 修改前快照
     let snapshotSeq = null;
+    let lockToken = null;
     if (project) {
       try {
-        projects.acquireLock(projectId, { taskId: task.id });
+        lockToken = projects.acquireLock(projectId, { taskId: task.id }).token;
       } catch (error) {
         finish(task.id, 'failed', {
           error: { code: error.code || 'PROJECT_LOCKED', message: error.message },
@@ -337,7 +347,7 @@ function createWorker(options) {
       try {
         snapshotSeq = projects.snapshot(projectId, `pre-task-${task.id}`).seq;
       } catch (error) {
-        projects.releaseLock(projectId);
+        projects.releaseLock(projectId, lockToken);
         finish(task.id, 'failed', {
           error: { code: 'SNAPSHOT_FAILED', message: error.message },
         });
@@ -358,7 +368,7 @@ function createWorker(options) {
     store.appendLog(
       task.id,
       `[remote] ${new Date().toISOString()} start project=${projectId} cwd=${dir}\n` +
-        `[remote] approval=${approvalMode()} continue=${useContinue} snapshot=${snapshotSeq ?? '-'}\n`,
+        `[remote] approval=${approvalMode(task)} continue=${useContinue} snapshot=${snapshotSeq ?? '-'}\n`,
     );
     log(`[remote] task ${task.id} started (project ${projectId})`);
 
@@ -366,7 +376,7 @@ function createWorker(options) {
     try {
       child = executorScript ? spawnExecutor(task, dir) : spawnCli(task, dir, prompt, useContinue);
     } catch (error) {
-      if (project) projects.releaseLock(projectId);
+      if (project) projects.releaseLock(projectId, lockToken);
       finish(task.id, 'failed', {
         error: { code: 'SPAWN_FAILED', message: error.message },
       });
@@ -389,6 +399,7 @@ function createWorker(options) {
       store.appendLog(task.id, chunk);
     });
 
+    let lastBeat = Date.now();
     const poll = setInterval(() => {
       const phase = readRuntimePhase(dir);
       if (phase === 'verifying' && store.get(task.id)?.status === 'running') {
@@ -397,6 +408,10 @@ function createWorker(options) {
         } catch {
           // 与退出竞争，忽略
         }
+      }
+      if (project && lockToken && Date.now() - lastBeat > 15000) {
+        lastBeat = Date.now();
+        projects.touchLock(projectId, lockToken);
       }
     }, STATUS_POLL_MS);
 
@@ -470,10 +485,11 @@ function createWorker(options) {
         } catch (error) {
           store.appendLog(task.id, `[remote] post-run bookkeeping failed: ${error.message}\n`);
         }
-        projects.releaseLock(projectId);
       }
 
       currentChild = null;
+      // C07-P1-03：只有 functional verified 才允许发布预览；
+      // C07 ORD-05：发布期间仍持有项目锁，发布完成后再释放。
       if (onFinished) {
         try {
           onFinished({ taskId: task.id, projectId, status, verified });
@@ -481,6 +497,7 @@ function createWorker(options) {
           log(`[remote] onFinished failed: ${error.message}`);
         }
       }
+      if (project) projects.releaseLock(projectId, lockToken);
 
       finish(task.id, status, enriched);
       store.appendLog(task.id, `[remote] ${new Date().toISOString()} finished: ${status}\n`);
@@ -559,5 +576,6 @@ module.exports = {
   composePrompt,
   buildChildEnv,
   resolveExecutorScript,
+  resolveApprovalMode,
   DEFAULT_TIMEOUT_MS,
 };
