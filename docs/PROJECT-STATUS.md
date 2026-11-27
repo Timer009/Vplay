@@ -1,11 +1,11 @@
 # Vplay Studio · 项目状态
 
-> 最后更新：Sprint 03C（B12，2026-11-28）｜分支 `sprint-03-b12-candidate`
+> 最后更新：Sprint 03C（B13，2026-11-28）｜分支 `sprint-03-b13-candidate`
 > 已验收基线：`sprint-01-accepted` → `8058e67`（Sprint 01 真机 13/13 通过）
 > Sprint 02：`sprint-02-c05-fix` @ `fcfd880`（C06 通过，未合并 main）
 > Sprint 03A：`abc8e24`（C07 P0 安全基础）
 > Sprint 03B：`455a187`（Connect L2 候选，C09 复审提出 P0）
-> Sprint 03C：B10 `33523cd` → B11 候选（Vision 0.2.1 + C10 收口）
+> Sprint 03C：B10 `33523cd` → B11 → B12 `64cc53c` → B13 候选（C12-P1-01..07 关闭）
 
 ## 1. 项目定位
 

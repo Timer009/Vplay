@@ -1,37 +1,34 @@
 # Vplay Studio · 当前任务
 
-> Sprint 03C — 最终工程收口与可信实验准备（B12）
-> 分支：`sprint-03-b12-candidate`　基线：`2990837`（B11 候选）
+> Sprint 03C — 参赛候选定向收口（B13）
+> 分支：`sprint-03-b13-candidate`　基线：`64cc53c`（B12 候选）
 > 负责人：唯一开发 Agent（Trae）
 
 ## 1. 本轮目标
 
-以 B11 为唯一基线，关闭 C11 新发现（快照 200 上限裁剪竞态、运行时孤儿回收），
-补齐 Serve/代理 fail-closed 门禁与证据兼容性，准备可信实验环境与真实 Spacer 实验
-（不执行真实模型、不修改正式仓库、不启用 Serve/Funnel）。
+以 B12 候选为唯一基线，读取 B12 / C12 / E09，仅关闭比赛前阻断项：
+Vision 增量校验改为结构化语义比较、修复判定绑定缺陷断言、verify 语义澄清、
+Vision 票据项目绑定、跨源重定向请求前拦截、HMAC 强制验证。不实施新功能。
 
 ## 2. 任务清单
 
-| #   | 任务                                                                  | 状态           |
-| --- | --------------------------------------------------------------------- | -------------- |
-| 1   | C11-01：快照提交与目录删除事务分序；租约保护 diff/rollback/读者       | ✅             |
-| 2   | C11-02：运行时安全回收（写入标记、宽限期、只隔离不删除、幂等、配额）  | ✅             |
-| 3   | 跨越 200 上限压测：10 进程 + 父进程、裁剪期间 diff/rollback、崩溃残留 | ✅             |
-| 4   | 保留记录逐项校验（目录/manifest/uid/文件哈希/可回退）                 | ✅             |
-| 5   | Serve/代理 fail-closed（预览鉴权、HMAC、Host、回环）                  | ✅             |
-| 6   | Secure Cookie 强制；同 host 不同端口边界文档                          | ✅             |
-| 7   | 事件 anchor 兼容旧链；HMAC 降级/独立验证器测试                        | ✅             |
-| 8   | 可信实验环境只读检查与脚本（账号/ACL/Sandbox/VM/容器）                | ✅ 只读 + 脚本 |
-| 9   | 真实 Spacer 实验准备（副本、基线哈希、模型配置、F1–F10、证据流程）    | ✅ 文档/脚本   |
-| 10  | 真实模型 / 手机 T-1..T-10 / Serve 启用                                | ⏳ 需用户批准  |
+| #   | 任务                                                                                     | 状态 |
+| --- | ---------------------------------------------------------------------------------------- | ---- |
+| 1   | 关闭 C12-P1-01..07（跨行标签/协议、结构删除、缺陷绑定、compare、HMAC）                   | ✅   |
+| 2   | 结构化解析 + before/after 语义差分，保留 operations/digest/path 精确检查                 | ✅   |
+| 3   | 修复成功绑定 `defectId` + 断言 `before=false/after=true`；删除/缺失/新增 critical 均拒绝 | ✅   |
+| 4   | `mode:verify` 改为 `verify_passed/verify_failed`，禁止 `repair_verified` 混用            | ✅   |
+| 5   | Vision 票据服务端项目绑定；内部 runner 票据 `admin:false`                                | ✅   |
+| 6   | 跨源重定向：`route.fetch({maxRedirects:0})` 逐跳检查、请求前 abort                       | ✅   |
+| 7   | HMAC：链含 hmac/anchor 时无 key 必须失败；`requireHmac` 构造即拒绝                       | ✅   |
+| 8   | 复用现有实验准备脚本；不预制 Spacer 陆地回收                                             | ✅   |
 
 ## 3. 验收边界
 
-- 未调用真实模型；未复制/修改 Spacer 正式仓库（仅文档与 DryRun 脚本）。
-- 未创建账号、未修改 ACL/防火墙、未安装组件、未启用 Serve/Funnel。
-- **OS_ISOLATION=NOT_IMPLEMENTED**；证据 HMAC 不是不可篡改存储。
-- C10-08（真实 13 文件证据包）仍为 PARTIAL。
+- 未调用真实模型；未启用 Serve/Funnel；未合并 main；未移动正式工程。
+- 临时工作区与依赖优先 G 盘（`G:\AI_GAME\VPLAY-B13-REPRO`）。
+- 未新增游戏功能；未修改系统级配置。
 
 ## 4. 完成后
 
-见 `G:\AI_GAME\VPLAY-SPRINT03-B12-REPORT.md`。停止，等待用户/ChatGPT 审核。
+见 `G:\AI_GAME\VPLAY-SPRINT03-B13-REPORT.md`。停止，等待用户/ChatGPT 审核。
