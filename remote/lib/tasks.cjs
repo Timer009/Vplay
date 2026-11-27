@@ -252,6 +252,16 @@ function createTaskStore(options) {
               .filter((item) => typeof item === 'string' && /\.(html?|css)$/i.test(item))
               .slice(0, 5)
           : null,
+      defectId:
+        input && typeof input.defectId === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(input.defectId)
+          ? input.defectId
+          : null,
+      defectAssertionIds:
+        input && Array.isArray(input.defectAssertionIds)
+          ? input.defectAssertionIds
+              .filter((item) => typeof item === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(item))
+              .slice(0, 10)
+          : null,
       createdBy,
       allowYolo: Boolean(input && input.allowYolo === true),
       status: 'queued',

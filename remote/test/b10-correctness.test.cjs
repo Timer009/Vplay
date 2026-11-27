@@ -412,7 +412,8 @@ test('B10-B: Vision verify mode is functional re-verification, not analyze', asy
     assert.equal(calls.capture, 1);
     assert.equal(calls.analyze, 0, 'verify must not call the model');
     assert.equal(output.result.ok, true);
-    assert.equal(output.result.status, 'verified');
+    assert.equal(output.result.status, 'verify_passed');
+    assert.equal(output.result.repairVerified, false);
     assert.ok(fs.existsSync(output.reportFile));
     assert.equal(registry.readLock('demo'), null, 'vision run must not leak locks');
   } finally {

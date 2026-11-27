@@ -385,11 +385,20 @@ function createWorker(options) {
         allowedFiles: task.allowedFiles || undefined,
         skipLock: true,
         lockToken,
+        defectId: task.defectId || null,
+        defectAssertionIds: task.defectAssertionIds || [],
       });
 
-      const verified = Boolean(
-        output.result && (output.result.validation ? output.result.validation.ok === true : output.result.ok),
-      );
+      // B13：verify 仅是功能复验，不构成“修复已验证”
+      const isRepair = (task.visionMode || 'analyze') === 'repair';
+      const verified = isRepair
+        ? Boolean(
+            output.result &&
+              (output.result.validation
+                ? output.result.validation.ok === true
+                : output.result.ok === true),
+          )
+        : false;
       const status = output.result && output.result.ok ? 'succeeded' : 'failed';
       const result = {
         ok: Boolean(output.result && output.result.ok),

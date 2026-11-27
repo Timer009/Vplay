@@ -17,6 +17,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { assertSemanticDelta } = require('./vision-structured.cjs');
 
 const ALLOWED_EXT = /\.(html?|css)$/i;
 
@@ -32,30 +33,7 @@ function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
-const STRUCTURAL_RULES = [
-  { id: 'script-tag', re: /<script\b/i },
-  { id: 'iframe', re: /<iframe\b/i },
-  { id: 'object-embed', re: /<(object|embed)\b/i },
-  { id: 'link-tag', re: /<link\b/i },
-  { id: 'meta-tag', re: /<meta\b/i },
-  { id: 'form-tag', re: /<form\b/i },
-  { id: 'base-tag', re: /<base\b/i },
-  { id: 'svg-tag', re: /<svg\b/i },
-  { id: 'inline-handler', re: /\son[a-z]{3,}\s*=/i },
-  {
-    id: 'url-attribute',
-    re: /\b(?:src|srcset|href|action|formaction|poster|ping|data|srcdoc|manifest|background|cite|longdesc|usemap|http-equiv)\s*=/i,
-  },
-  { id: 'javascript-url', re: /javascript\s*:/i },
-  { id: 'data-url', re: /\bdata\s*:/i },
-  { id: 'srcdoc', re: /\bsrcdoc\s*=/i },
-  { id: 'css-import', re: /@import\b/i },
-  { id: 'css-url', re: /\burl\s*\(/i },
-  { id: 'css-expression', re: /expression\s*\(|behavior\s*:|-moz-binding/i },
-  { id: 'comment', re: /<!--|<!\[CDATA\[|<!DOCTYPE/i },
-];
-
-function createDeltaPolicy({ policy, contextLines = 2 } = {}) {
+function createDeltaPolicy({ policy } = {}) {
   if (
     !policy ||
     typeof policy.assertSafeRelPath !== 'function' ||
@@ -63,36 +41,7 @@ function createDeltaPolicy({ policy, contextLines = 2 } = {}) {
   ) {
     throw new DeltaPolicyError('createDeltaPolicy requires vision-policy', 'DELTA_CONFIG');
   }
-  const { assertSafeRelPath, scanPatchContent } = policy;
-
-  function expandWindow(text, start, end) {
-    let s = text.lastIndexOf('\n', Math.max(0, start - 1));
-    s = s === -1 ? 0 : s + 1;
-    let e = text.indexOf('\n', end);
-    e = e === -1 ? text.length : e;
-    for (let i = 0; i < contextLines; i += 1) {
-      if (s === 0) break;
-      const previous = text.lastIndexOf('\n', s - 2);
-      s = previous === -1 ? 0 : previous + 1;
-    }
-    for (let i = 0; i < contextLines; i += 1) {
-      if (e >= text.length) break;
-      const next = text.indexOf('\n', e + 1);
-      e = next === -1 ? text.length : next;
-    }
-    return { start: s, end: e, text: text.slice(s, e) };
-  }
-
-  function mergeRanges(ranges) {
-    const sorted = ranges.slice().sort((a, b) => a.start - b.start);
-    const merged = [];
-    for (const range of sorted) {
-      const last = merged[merged.length - 1];
-      if (last && range.start <= last.end) last.end = Math.max(last.end, range.end);
-      else merged.push({ ...range });
-    }
-    return merged;
-  }
+  const { assertSafeRelPath } = policy;
 
   function scanDelta({ before, after, operations, file = '<memory>' }) {
     if (typeof before !== 'string' || typeof after !== 'string') {
@@ -152,32 +101,12 @@ function createDeltaPolicy({ policy, contextLines = 2 } = {}) {
       });
     }
 
-    const findings = [];
-    for (const hunk of hunks) {
-      const scan = scanPatchContent(hunk.after);
-      if (!scan.ok) findings.push({ scope: 'fragment', ...hunk, hits: scan.hits });
-      const structural = STRUCTURAL_RULES.filter((rule) => rule.re.test(hunk.after)).map(
-        (rule) => rule.id,
-      );
-      if (structural.length) {
-        findings.push({ scope: 'fragment-structural', ...hunk, hits: structural });
-      }
-    }
-    const windows = mergeRanges(
-      hunks.map((hunk) => expandWindow(after, hunk.afterStart, hunk.afterEnd)),
-    ).map((range) => ({ ...range, text: after.slice(range.start, range.end) }));
-    for (const window of windows) {
-      const scan = scanPatchContent(window.text);
-      if (!scan.ok) findings.push({ scope: 'window', start: window.start, end: window.end, hits: scan.hits });
-    }
-    if (findings.length) {
-      const hits = [...new Set(findings.flatMap((item) => item.hits))];
-      throw new DeltaPolicyError(
-        `delta content rejected (${hits.join(',')}): ${file}`,
-        'DELTA_CONTENT_REJECTED',
-      );
-    }
-    return { file, hunks, windows: windows.map((item) => ({ start: item.start, end: item.end })) };
+    // B13：结构化语义比较（替代无限扩大正则窗口）
+    //  - 只拒绝 after 相对 before 新增的危险能力；
+    //  - 检查注释/敏感标签/花括号结构是否新增失衡；
+    //  - 精确 operations 重放与 digest 已在上面完成。
+    assertSemanticDelta(before, after, file);
+    return { file, hunks, windows: [] };
   }
 
   function verifyFile({ root, file, content, sha256Before, sha256After, operations }) {
@@ -186,6 +115,9 @@ function createDeltaPolicy({ policy, contextLines = 2 } = {}) {
       throw new DeltaPolicyError(`extension not allowed: ${rel}`, 'DELTA_FILE_NOT_ALLOWED');
     }
     const target = assertSafeRelPath(root, rel);
+    if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
+      throw new DeltaPolicyError(`target file missing: ${rel}`, 'DELTA_TARGET_MISSING');
+    }
     const current = fs.readFileSync(target, 'utf8');
     if (sha256Before && sha256(current) !== sha256Before) {
       throw new DeltaPolicyError(`source changed since patch validation: ${rel}`, 'DELTA_SOURCE_CHANGED');
@@ -344,7 +276,7 @@ function createDeltaPolicy({ policy, contextLines = 2 } = {}) {
     if (journalFile) fs.rmSync(journalFile, { force: true });
   }
 
-  return { scanDelta, applyDelta, finalizeApply, expandWindow };
+  return { scanDelta, applyDelta, finalizeApply };
 }
 
 module.exports = { createDeltaPolicy, DeltaPolicyError, sha256 };

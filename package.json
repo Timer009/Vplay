@@ -21,7 +21,7 @@
     "start": "cross-env node scripts/start.js",
     "remote": "node remote/server.cjs",
     "vplay": "node remote/cli.cjs",
-    "test:remote": "node --test remote/test/tasks.test.cjs remote/test/server.test.cjs remote/test/mobile-console.test.cjs remote/test/projects.test.cjs remote/test/preview.test.cjs remote/test/security.test.cjs remote/test/hardening.test.cjs remote/test/concurrency.test.cjs remote/test/c07-hardening.test.cjs remote/test/b09-connect.test.cjs remote/test/b10-correctness.test.cjs remote/test/b10-connect.test.cjs remote/test/b10-evidence.test.cjs remote/test/b11-security.test.cjs remote/test/b11-vision.test.cjs remote/test/b12-snapshot-gc.test.cjs remote/test/b12-deploy.test.cjs remote/test/b12-evidence-compat.test.cjs remote/test/e2e-agent.test.cjs",
+    "test:remote": "node --test remote/test/tasks.test.cjs remote/test/server.test.cjs remote/test/mobile-console.test.cjs remote/test/projects.test.cjs remote/test/preview.test.cjs remote/test/security.test.cjs remote/test/hardening.test.cjs remote/test/concurrency.test.cjs remote/test/c07-hardening.test.cjs remote/test/b09-connect.test.cjs remote/test/b10-correctness.test.cjs remote/test/b10-connect.test.cjs remote/test/b10-evidence.test.cjs remote/test/b11-security.test.cjs remote/test/b11-vision.test.cjs remote/test/b12-snapshot-gc.test.cjs remote/test/b12-deploy.test.cjs remote/test/b12-evidence-compat.test.cjs remote/test/b13-vision-connect.test.cjs remote/test/e2e-agent.test.cjs",
     "debug": "cross-env DEBUG=1 node --inspect-brk scripts/start.js",
     "generate": "node scripts/generate-git-commit-info.js",
     "build": "node scripts/build.js",

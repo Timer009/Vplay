@@ -39,11 +39,87 @@ export async function installNetworkGuard({
   }
   const allowedOrigins = new Set([previewOrigin, ...allowedExtraOrigins.map((item) => originOf(item)).filter(Boolean)]);
   const blocked = [];
+  const redirects = [];
   let mainPage = null;
 
   const record = (entry) => {
     if (blocked.length < maxBlocked) blocked.push(entry);
   };
+
+  /**
+   * B13 预请求重定向边界：
+   * Playwright route 对“服务端 302 → 外部 origin”不再触发，因此这里用
+   * route.fetch({maxRedirects:0}) 自己检查每一跳；外部 Location 直接 abort，
+   * 浏览器不会发出该请求。最终 URL 检查仍保留作为纵深防御。
+   */
+  async function fetchWithRedirectCheck(route, request) {
+    const method = request.method();
+    const followable = method === 'GET' || method === 'HEAD';
+    const seen = new Set([request.url()]);
+    let response;
+    try {
+      response = await route.fetch({ maxRedirects: 0 });
+    } catch (error) {
+      record({
+        url: request.url(),
+        resourceType: request.resourceType(),
+        isNavigation: request.isNavigationRequest(),
+        reason: `fetch-failed:${error.message}`,
+      });
+      await route.abort('blockedbyclient');
+      return;
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const status = response.status();
+      if (!(status >= 300 && status < 400)) break;
+      const location = response.headers().location;
+      if (!location) {
+        record({ url: request.url(), resourceType: request.resourceType(), isNavigation: request.isNavigationRequest(), reason: 'redirect-without-location' });
+        await route.abort('blockedbyclient');
+        return;
+      }
+      let target;
+      try {
+        target = new URL(location, response.url()).href;
+      } catch {
+        record({ url: request.url(), resourceType: request.resourceType(), isNavigation: request.isNavigationRequest(), reason: 'redirect-invalid' });
+        await route.abort('blockedbyclient');
+        return;
+      }
+      const targetOrigin = originOf(target);
+      if (!followable || !targetOrigin || !allowedOrigins.has(targetOrigin)) {
+        redirects.push({ from: request.url(), to: target, reason: 'origin' });
+        record({
+          url: target,
+          resourceType: request.resourceType(),
+          isNavigation: request.isNavigationRequest(),
+          reason: 'redirect-external',
+        });
+        await route.abort('blockedbyclient');
+        return;
+      }
+      if (seen.has(target)) {
+        record({ url: target, resourceType: request.resourceType(), isNavigation: request.isNavigationRequest(), reason: 'redirect-loop' });
+        await route.abort('blockedbyclient');
+        return;
+      }
+      seen.add(target);
+      try {
+        response = await route.fetch({ url: target, maxRedirects: 0 });
+      } catch {
+        record({ url: target, resourceType: request.resourceType(), isNavigation: request.isNavigationRequest(), reason: 'redirect-fetch-failed' });
+        await route.abort('blockedbyclient');
+        return;
+      }
+      redirects.push({ from: request.url(), to: target, allowed: true, origin: targetOrigin || null });
+    }
+    if (response.status() >= 300 && response.status() < 400) {
+      record({ url: request.url(), resourceType: request.resourceType(), isNavigation: request.isNavigationRequest(), reason: 'redirect-too-many' });
+      await route.abort('blockedbyclient');
+      return;
+    }
+    await route.fulfill({ response });
+  }
 
   await context.addInitScript(() => {
     // Network primitives that are not reliably covered by route interception.
@@ -106,6 +182,11 @@ export async function installNetworkGuard({
       await route.abort('blockedbyclient');
       return;
     }
+    // B13：预览源的每个请求先在宿主侧解析重定向；外部 Location 在请求前阻断
+    if (sameOrigin) {
+      await fetchWithRedirectCheck(route, request);
+      return;
+    }
     // Defense in depth: never forward preview credentials to an allowed
     // non-preview origin (extra origins are rare; preview auth is host-scoped).
     if (stripCookiesFromExtraOrigins && parsed.origin !== previewOrigin) {
@@ -153,6 +234,8 @@ export async function installNetworkGuard({
           const origin = originOf(frame.url());
           if (!origin || !allowedOrigins.has(origin)) {
             record({ url: frame.url(), resourceType: 'document', isNavigation: true, reason: 'frame-navigation' });
+            // 纵深防御：最终 URL 已越界时立即关闭页面，避免继续执行/截图
+            page.close().catch(() => {});
           }
         }
       });
@@ -163,6 +246,9 @@ export async function installNetworkGuard({
         blockedCount: blocked.length,
         blocked: [...blocked],
         navigationBlocked: blocked.filter((entry) => entry.isNavigation).length,
+        redirectChecks: redirects.length,
+        redirectBlocked: redirects.filter((entry) => entry.allowed === false || entry.reason === 'origin').length,
+        redirects: [...redirects],
       };
     },
   };

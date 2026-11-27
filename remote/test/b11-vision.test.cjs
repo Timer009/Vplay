@@ -281,7 +281,16 @@ test('B11-Vision-apply: host uses delta operations, enforces consistency and fin
           afterOk: true,
           resolvedCriticalFailures: [{ id: 'h1-visible' }],
           newCriticalFailures: [],
+          newFailures: [],
           screenshotsChanged: true,
+          viewports: [
+            {
+              viewport: 'desktop',
+              beforeOk: false,
+              afterOk: true,
+              assertions: [{ id: 'h1-visible', before: false, after: true, critical: true }],
+            },
+          ],
         },
       };
     });
@@ -295,7 +304,14 @@ test('B11-Vision-apply: host uses delta operations, enforces consistency and fin
         browserRunner: { runCapture: async () => ({ ok: true, viewports: [], screenshots: [] }) },
       },
     });
-    const output = await service.run({ taskId: 'vision_delta_ok', projectId: 'demo', mode: 'repair', skipLock: false });
+    const output = await service.run({
+      taskId: 'vision_delta_ok',
+      projectId: 'demo',
+      mode: 'repair',
+      skipLock: false,
+      defectId: 'V-001',
+      defectAssertionIds: ['h1-visible'],
+    });
     assert.equal(output.result.ok, true);
     assert.match(fs.readFileSync(path.join(imported.project.srcDir, 'index.html'), 'utf8'), /v2/);
     assert.equal(registry.verifyPreview('demo').ok, true);
@@ -355,7 +371,16 @@ test('B11-Vision-verified: screenshots alone cannot prove a repair', async () =>
         afterOk: true,
         resolvedCriticalFailures: [{ id: 'h1-visible' }],
         newCriticalFailures: [],
+        newFailures: [],
         screenshotsChanged: false,
+        viewports: [
+          {
+            viewport: 'desktop',
+            beforeOk: false,
+            afterOk: true,
+            assertions: [{ id: 'h1-visible', before: false, after: true, critical: true }],
+          },
+        ],
       },
     }));
     const serviceB = createVisionService({
@@ -368,7 +393,14 @@ test('B11-Vision-verified: screenshots alone cannot prove a repair', async () =>
         browserRunner: { runCapture: async () => ({ ok: true, viewports: [], screenshots: [] }) },
       },
     });
-    const strong = await serviceB.run({ taskId: 'vision_strong', projectId: 'demo', mode: 'repair', skipLock: false });
+    const strong = await serviceB.run({
+      taskId: 'vision_strong',
+      projectId: 'demo',
+      mode: 'repair',
+      skipLock: false,
+      defectId: 'V-001',
+      defectAssertionIds: ['h1-visible'],
+    });
     assert.equal(strong.result.ok, true);
     assert.equal(strong.result.status, 'repaired');
   } finally {

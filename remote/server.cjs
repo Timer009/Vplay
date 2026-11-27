@@ -55,6 +55,7 @@ const { createEventStore } = require('./lib/events.cjs');
 const { createEvidenceStore } = require('./lib/evidence.cjs');
 const { createDeviceStore } = require('./lib/devices.cjs');
 const { createVisionService, recoverVisionApplies } = require('./lib/vision-service.cjs');
+const { createPreviewTicketStore } = require('./lib/preview-tickets.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
@@ -175,63 +176,23 @@ const devices = createDeviceStore({
   file: projects ? path.join(projects.home, 'devices.json') : path.join(RUNTIME_DIR, 'devices.json'),
 });
 
-// ---- 预览票据（B10 / C09 B-09）：内存存储、会话绑定、可即时吊销 ----
-const previewTickets = new Map();
+// ---- 预览票据（B13）：内存存储、会话/设备/项目绑定、可即时吊销 ----
+const previewTicketStore = createPreviewTicketStore({
+  enabled: PREVIEW_AUTH_ENABLED,
+  devices,
+  defaultTtlMs: PREVIEW_TICKET_TTL_MS,
+});
 
-function prunePreviewTickets() {
-  const now = Date.now();
-  for (const [value, ticket] of previewTickets) {
-    if (now > ticket.expiresAt) previewTickets.delete(value);
-  }
-}
-
-function issuePreviewTicket({ projectId = null, deviceId = null, admin = false, sessionKey: boundKey = null, ttlMs = PREVIEW_TICKET_TTL_MS } = {}) {
-  if (!PREVIEW_AUTH_ENABLED) return null;
-  prunePreviewTickets();
-  const value = crypto.randomBytes(32).toString('base64url');
-  previewTickets.set(value, {
-    projectId,
-    deviceId,
-    admin: admin === true,
-    sessionKey: boundKey,
-    expiresAt: Date.now() + Number(ttlMs || PREVIEW_TICKET_TTL_MS),
-  });
-  return value;
+function issuePreviewTicket(options = {}) {
+  return previewTicketStore.issue(options);
 }
 
 function revokePreviewTickets(predicate) {
-  let removed = 0;
-  for (const [value, ticket] of previewTickets) {
-    if (!predicate || predicate(ticket)) {
-      previewTickets.delete(value);
-      removed += 1;
-    }
-  }
-  return removed;
+  return previewTicketStore.revoke(predicate);
 }
 
-/**
- * 预览面授权：票据有效 + 设备未被吊销 + 项目授权。
- * 设备吊销后，下一次请求立即 401（不依赖票据过期）。
- */
 function authorizePreview(value, projectId) {
-  if (!PREVIEW_AUTH_ENABLED) return true;
-  if (!value) return false;
-  const ticket = previewTickets.get(value);
-  if (!ticket) return false;
-  if (Date.now() > ticket.expiresAt) {
-    previewTickets.delete(value);
-    return false;
-  }
-  if (ticket.admin) return true;
-  if (ticket.deviceId) {
-    const device = devices.get(ticket.deviceId);
-    if (!device || device.revoked) return false;
-    if (projectId && !devices.isProjectAllowed(device, projectId)) return false;
-    return true;
-  }
-  if (ticket.projectId && projectId && ticket.projectId !== projectId) return false;
-  return true;
+  return previewTicketStore.authorize(value, projectId);
 }
 
 const store = createTaskStore({
@@ -247,11 +208,11 @@ const visionService = createVisionService({
   logger: (line) => console.log(line),
   deps: {
     previewPort: PREVIEW_PORT,
-    // 短期票据只存在于本进程内存，注入浏览器 context 后立即失效；不写盘、不进模型上下文
+    // B13：Vision 内部票据必须绑定项目，不再使用 admin:true
     previewTicketProvider: ({ projectId, taskId }) =>
       issuePreviewTicket({
         projectId,
-        admin: true,
+        admin: false,
         ttlMs: 5 * 60 * 1000,
         sessionKey: `vision:${taskId}`,
       }),
@@ -859,7 +820,8 @@ const server = http.createServer(async (req, res) => {
             `vplay_preview=${encodeURIComponent(previewTicket)}`,
             'HttpOnly',
             'SameSite=Strict',
-            'Path=/',
+            // B13：预览票据只作用于预览路径，不随控制面请求发送
+            'Path=/p/',
             `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
             ...(secure ? ['Secure'] : []),
           ].join('; '),
@@ -896,7 +858,7 @@ const server = http.createServer(async (req, res) => {
       const cookies = [
         cookie,
         // B10：登出立即吊销预览票据（服务端），并清除客户端 Cookie
-        ['vplay_preview=', 'HttpOnly', 'SameSite=Strict', 'Path=/', 'Max-Age=0'].join('; '),
+        ['vplay_preview=', 'HttpOnly', 'SameSite=Strict', 'Path=/p/', 'Max-Age=0'].join('; '),
       ];
       res.writeHead(
         200,
@@ -1382,6 +1344,16 @@ const server = http.createServer(async (req, res) => {
       const allowedFiles = (Array.isArray(payload.allowedFiles) ? payload.allowedFiles : [])
         .filter((item) => typeof item === 'string' && /\.(html?|css)$/i.test(item))
         .slice(0, 5);
+      const defectId =
+        typeof payload.defectId === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(payload.defectId)
+          ? payload.defectId
+          : null;
+      const defectAssertionIds = (Array.isArray(payload.defectAssertionIds)
+        ? payload.defectAssertionIds
+        : []
+      )
+        .filter((item) => typeof item === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(item))
+        .slice(0, 10);
       try {
         const { task, duplicate } = store.create({
           text: `Vision ${mode} · ${projectId}`,
@@ -1391,6 +1363,8 @@ const server = http.createServer(async (req, res) => {
           kind: 'vision',
           visionMode: mode,
           allowedFiles,
+          defectId,
+          defectAssertionIds,
           createdBy: (auth && auth.deviceId) || 'admin',
           allowYolo: false,
         });

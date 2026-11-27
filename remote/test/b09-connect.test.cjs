@@ -367,6 +367,16 @@ function makeFakeVision() {
             resolvedCriticalFailures: [{ id: 'hud-visible' }],
             newCriticalFailures: [],
             screenshotsChanged: true,
+            viewports: [
+              {
+                viewport: 'desktop',
+                beforeOk: false,
+                afterOk: true,
+                assertions: [
+                  { id: 'hud-visible', before: false, after: true, critical: true },
+                ],
+              },
+            ],
           },
           diff,
         };
@@ -448,7 +458,14 @@ test('Sprint03B / P0-05: vision host wiring applies safe patches atomically and 
     deps: { vision: makeFakeVision(), consent: true, previewUrl: 'http://127.0.0.1:1/p/demo/' },
   });
 
-  const output = await service.run({ taskId: 'vision_ok', projectId: 'demo', mode: 'repair', skipLock: false });
+  const output = await service.run({
+    taskId: 'vision_ok',
+    projectId: 'demo',
+    mode: 'repair',
+    skipLock: false,
+    defectId: 'V-001',
+    defectAssertionIds: ['hud-visible'],
+  });
   assert.equal(output.result.ok, true);
   assert.match(fs.readFileSync(path.join(imported.project.srcDir, 'index.html'), 'utf-8'), /fixed/);
   assert.equal(registry.verifyPreview('demo').ok, true);

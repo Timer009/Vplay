@@ -51,6 +51,12 @@ function createEventStore(options = {}) {
   const anchorFile = path.join(dir, 'events.anchor.json');
   const lockFile = path.join(dir, 'events.lock');
   const hmacKey = options.hmacKey || null;
+  const requireHmac = options.requireHmac === true;
+  if (requireHmac && !hmacKey) {
+    const error = new Error('EVIDENCE_HMAC_KEY is required when requireHmac=true');
+    error.code = 'HMAC_KEY_MISSING';
+    throw error;
+  }
   const logger = options.logger || (() => {});
   const keyFingerprint = hmacKey ? sha256(hmacKey).slice(0, 16) : null;
   fs.mkdirSync(dir, { recursive: true });
@@ -313,7 +319,7 @@ function createEventStore(options = {}) {
    * 离线/运行期校验：逐条重算 hash、检查 seq/id、prevHash 连续性、HMAC 与 anchor。
    * 不修改文件；anchor 缺失或 count 不一致都会报问题（尾删/截断可检出）。
    */
-  function verify() {
+  function verify(options = {}) {
     const problems = [];
     let records = [];
     lastBroken = 0;
@@ -324,6 +330,11 @@ function createEventStore(options = {}) {
       if (totalCount > 0) problems.push('EVENTS_UNREADABLE');
     }
     const currentAnchor = readAnchor();
+    const chainUsesHmac =
+      records.some((record) => Boolean(record.hmac)) ||
+      Boolean(currentAnchor && currentAnchor.alg === 'hmac-sha256');
+    const mustHaveKey = options.requireHmac === true || requireHmac || chainUsesHmac;
+    if (mustHaveKey && !hmacKey) problems.push('HMAC_KEY_MISSING');
     let prev = 'GENESIS';
     let lastIdValue = null;
     for (const record of records) {
@@ -332,7 +343,7 @@ function createEventStore(options = {}) {
       const body = recordBody(record);
       const expected = sha256(`${prev}\n${body}`);
       if (record.hash !== expected) problems.push(`HASH_MISMATCH:${record.id}`);
-      if (hmacKey && record.hashAlg === HASH_ALG) {
+      if (record.hmac && hmacKey) {
         const expectedMac = hmac(hmacKey, record.hash);
         if (record.hmac !== expectedMac) problems.push(`HMAC_MISMATCH:${record.id}`);
       }

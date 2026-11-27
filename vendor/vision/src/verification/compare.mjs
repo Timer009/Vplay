@@ -65,13 +65,16 @@ export function compareVerification({ before = null, after = null, defect = null
         if (afterAssertion.ok) resolvedFailures.push(entry);
         else newFailures.push(entry);
       } else if (afterAssertion && afterAssertion.ok === false) {
-        persistingFailures.push({
+        const entry = {
           viewport: viewportName,
           id,
           ...failureOf(afterAssertion),
           before: beforeAssertion ? beforeAssertion.ok : null,
           after: false,
-        });
+        };
+        // B13：仅 after 存在且失败的断言是“新增失败”，不能归入 persisting
+        if (beforeAssertion) persistingFailures.push(entry);
+        else newFailures.push(entry);
       }
       if (beforeAssertion || afterAssertion) {
         entries.push({

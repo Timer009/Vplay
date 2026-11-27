@@ -14,6 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { assertSemanticDelta } = require('./vision-structured.cjs');
 
 class VisionPolicyError extends Error {
   constructor(message, code = 'VISION_POLICY') {
@@ -158,15 +159,22 @@ function validatePatchIncremental(root, files, allowedFiles) {
     if (!allowed.has(rel)) {
       throw new VisionPolicyError(`file not allowed: ${rel}`, 'PATCH_FILE_NOT_ALLOWED');
     }
+    if (!/\.(html?|css)$/i.test(rel)) {
+      throw new VisionPolicyError(`extension not allowed: ${rel}`, 'PATCH_FILE_NOT_ALLOWED');
+    }
     if (seen.has(rel)) {
       throw new VisionPolicyError(`duplicate file in patch: ${rel}`, 'PATCH_DUPLICATE');
     }
     seen.add(rel);
     const target = assertSafeRelPath(root, rel);
+    // B13 / E09：目标必须已存在，禁止借“新建文件”把 .html/.css 之外的内容带进来
+    if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
+      throw new VisionPolicyError(`target file missing: ${rel}`, 'PATCH_TARGET_MISSING');
+    }
     if (typeof item.content !== 'string') {
       throw new VisionPolicyError(`content must be string: ${rel}`, 'PATCH_CONTENT_TYPE');
     }
-    const before = fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : '';
+    const before = fs.readFileSync(target, 'utf8');
     const shaBefore = sha256(before);
     const shaAfter = sha256(item.content);
     if (typeof item.sha256Before === 'string' && item.sha256Before && item.sha256Before !== shaBefore) {
@@ -175,14 +183,15 @@ function validatePatchIncremental(root, files, allowedFiles) {
     if (typeof item.sha256After === 'string' && item.sha256After && item.sha256After !== shaAfter) {
       throw new VisionPolicyError(`materialized digest mismatch: ${rel}`, 'PATCH_DIGEST_MISMATCH');
     }
-    const added = addedLines(before, item.content);
-    if (added.length === 0) {
+    if (item.content === before) {
       throw new VisionPolicyError(`patch makes no change: ${rel}`, 'PATCH_NO_CHANGE');
     }
-    const scan = scanPatchContent(added.join('\n'));
-    if (!scan.ok) {
+    // B13：结构化语义比较（新增危险能力/结构失衡），不再做新增行/窗口黑名单
+    try {
+      assertSemanticDelta(before, item.content, rel);
+    } catch (error) {
       throw new VisionPolicyError(
-        `unsafe content in ${rel}: ${scan.hits.join(',')}`,
+        `unsafe content in ${rel}: ${error.code || 'SEMANTIC_REJECTED'}`,
         'PATCH_CONTENT_REJECTED',
       );
     }

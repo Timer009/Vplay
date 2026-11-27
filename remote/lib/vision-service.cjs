@@ -132,32 +132,65 @@ function createVisionService(options = {}) {
   }
 
   /**
-   * B11：修复成功的宿主硬门禁。
-   * 仅「截图变化」不算修复：必须有缺陷专属功能断言被解决
-   * （resolvedCriticalFailures>0，或修复前有 critical 失败且修复后通过），
-   * 且不能引入新的 critical 失败。
+   * B11/B13：修复成功的宿主硬门禁。
+   *
+   * 必须绑定稳定 defectId 与缺陷断言 ID：
+   *  - 同一断言在 before=false、after=true（至少一个视口，且该 id 的所有出现都不允许缺失/失败）；
+   *  - 删除缺陷断言、after 缺失该断言、出现任何新增失败（含 critical）→ 不通过；
+   *  - 截图变化、before 整体失败、无关断言 resolved 都不能替代缺陷断言。
    */
-  function strictRepairVerification(result) {
+  function strictRepairVerification(result, defectId, defectAssertionIds) {
     const comparison = result && result.comparison;
+    const id = defectId || (result && result.defect && result.defect.id) || null;
+    const assertionIds = (Array.isArray(defectAssertionIds) ? defectAssertionIds : [])
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+      .slice(0, 10);
     if (!comparison || typeof comparison !== 'object') {
-      return { ok: false, reason: 'comparison-missing', resolvedCritical: 0 };
+      return { ok: false, reason: 'comparison-missing', defectId: id, defectAssertionIds: assertionIds };
     }
-    const resolved = Array.isArray(comparison.resolvedCriticalFailures)
-      ? comparison.resolvedCriticalFailures
-      : [];
+    if (!id || assertionIds.length === 0) {
+      return {
+        ok: false,
+        reason: 'defect-binding-missing',
+        defectId: id,
+        defectAssertionIds: assertionIds,
+      };
+    }
+    const entries = [];
+    for (const viewport of Array.isArray(comparison.viewports) ? comparison.viewports : []) {
+      for (const assertion of Array.isArray(viewport.assertions) ? viewport.assertions : []) {
+        if (assertionIds.includes(assertion.id)) {
+          entries.push({ viewport: viewport.viewport, ...assertion });
+        }
+      }
+    }
+    const details = assertionIds.map((assertionId) => {
+      const found = entries.filter((item) => item.id === assertionId);
+      const missing = found.length === 0;
+      const fixed = found.length > 0 && found.every((item) => item.before === false && item.after === true);
+      return { id: assertionId, missing, fixed, occurrences: found.length };
+    });
+    const allFixed = details.every((item) => !item.missing && item.fixed);
+    const newFailures = Array.isArray(comparison.newFailures) ? comparison.newFailures : [];
     const newCritical = Array.isArray(comparison.newCriticalFailures)
       ? comparison.newCriticalFailures
       : [];
-    const beforeOk = comparison.beforeOk !== false;
     const afterOk = comparison.afterOk !== false && result.ok !== false;
-    const defectAssertionResolved = resolved.length > 0 || (beforeOk === false && afterOk === true);
-    const ok = Boolean(
-      comparison.ok && afterOk && newCritical.length === 0 && defectAssertionResolved,
-    );
+    const ok = Boolean(comparison.ok && afterOk && allFixed && newFailures.length === 0 && newCritical.length === 0);
     return {
       ok,
-      reason: ok ? null : 'no-defect-specific-assertion',
-      resolvedCritical: resolved.length,
+      reason: ok
+        ? null
+        : !allFixed
+          ? 'defect-assertion-not-fixed'
+          : newFailures.length || newCritical.length
+            ? 'new-failure'
+            : 'comparison-not-ok',
+      defectId: id,
+      defectAssertionIds: assertionIds,
+      defectAssertions: details,
+      newFailures: newFailures.length,
       newCritical: newCritical.length,
       beforeOk: comparison.beforeOk,
       afterOk: comparison.afterOk,
@@ -231,6 +264,8 @@ function createVisionService(options = {}) {
       lockToken: providedLockToken = null,
       previewUrl: previewUrlOverride = null,
       scenario = 'default',
+      defectId = null,
+      defectAssertionIds = [],
     } = input || {};
 
     const vision = await loadVision();
@@ -334,9 +369,11 @@ function createVisionService(options = {}) {
         const ok = summary.ok;
         const result = {
           ok,
-          status: ok ? 'verified' : 'verify_failed',
+          status: ok ? 'verify_passed' : 'verify_failed',
           mode: 'verify',
-          validation: { ok },
+          verificationKind: 'functional_recheck',
+          repairVerified: false,
+          validation: { ok, kind: 'functional_recheck' },
           verification: summary,
           screenshots: summary.screenshots,
           browserVersion: capture && capture.browserVersion ? capture.browserVersion : null,
@@ -485,7 +522,11 @@ function createVisionService(options = {}) {
       });
       report.verificationPolicy = 'confirmed';
       if (mode === 'repair') {
-        const strict = strictRepairVerification(result);
+        const strict = strictRepairVerification(
+          result,
+          defectId || (result && result.defect && result.defect.id) || null,
+          defectAssertionIds,
+        );
         report.strictVerification = strict;
         result.strictVerification = strict;
         if (result.ok && !strict.ok) {
