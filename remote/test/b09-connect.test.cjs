@@ -342,6 +342,52 @@ function makeFakeVision() {
   };
 }
 
+test('C08 D/restart: interrupted task is marked and emits task.interrupted after restart', async () => {
+  const root = makeWorkspace('vplay-b09-restart-');
+  const home = path.join(root, 'home');
+  createProjectRegistry({ home }).importProject({
+    sourceDir: makeStaticProject(path.join(root, 'src')),
+    id: 'demo',
+  });
+  const first = await startServer({
+    workspace: path.join(root, 'workspace'),
+    home,
+    token: TOKEN,
+    env: { REMOTE_EXECUTOR_CMD: EXECUTOR },
+  });
+  let taskId = null;
+  try {
+    const created = await submit(first.port, TOKEN, { text: 'SLOW background restart', projectId: 'demo' });
+    taskId = created.json.task.id;
+    await waitFor(async () => {
+      const res = await request(first.port, 'GET', `/tasks/${taskId}`, { headers: jsonHeaders(TOKEN) });
+      return res.json && res.json.task && res.json.task.status === 'running';
+    }, { timeout: 10000 });
+  } finally {
+    await first.stop();
+  }
+  await new Promise((resolve) => setTimeout(resolve, 2200));
+
+  const second = await startServer({
+    workspace: path.join(root, 'workspace'),
+    home,
+    token: TOKEN,
+    env: { REMOTE_EXECUTOR_CMD: EXECUTOR },
+  });
+  try {
+    const detail = await request(second.port, 'GET', `/tasks/${taskId}`, { headers: jsonHeaders(TOKEN) });
+    assert.equal(detail.json.task.status, 'interrupted');
+    const replay = openSse(second.port, TOKEN, 0);
+    await replay.connected;
+    const event = await replay.waitFor((item) => item.taskId === taskId && item.type === 'task.interrupted');
+    assert.ok(event.id);
+    replay.close();
+  } finally {
+    await second.stop();
+    removeWorkspace(root);
+  }
+});
+
 test('Vision 0.2.0 vendored package is importable without npm registry', async () => {
   const { pathToFileURL } = require('url');
   const entry = path.join(__dirname, '..', '..', 'vendor', 'vision', 'src', 'index.mjs');
