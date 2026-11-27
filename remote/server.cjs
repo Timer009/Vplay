@@ -963,9 +963,10 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/artifact' && method === 'GET') {
       if (!requireAuth(req, res)) return;
+      const auth = authState(req);
       const projectId = params.get('projectId') || (projects ? null : 'default');
       if (projects && !projectId) {
-        const all = projects.list();
+        const all = projects.list().filter((item) => projectAllowed(auth, item.id));
         sendJson(res, 200, {
           ok: true,
           mode: 'projects',
@@ -975,6 +976,10 @@ const server = http.createServer(async (req, res) => {
       }
       if (projectId && !projectExists(projectId)) {
         sendJson(res, 404, { ok: false, error: 'unknown projectId' });
+        return;
+      }
+      if (projectId && !projectAllowed(auth, projectId)) {
+        sendJson(res, 403, { ok: false, error: 'device is not authorized for this project' });
         return;
       }
       const link = previewLink(req, projects ? projectId : null);

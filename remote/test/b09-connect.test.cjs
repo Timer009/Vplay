@@ -250,6 +250,10 @@ test('C07-P1-04: device tokens are project-scoped and only see their own tasks',
       headers: { Cookie: deviceCookie },
     });
     assert.equal(hidden.status, 403);
+    const artifact = await request(server.port, 'GET', '/artifact?projectId=secret-demo', {
+      headers: { Cookie: deviceCookie },
+    });
+    assert.equal(artifact.status, 403);
 
     const own = await submit(server.port, deviceCookie, { text: 'BACKGROUND device task', projectId: 'demo' });
     assert.equal(own.status, 202);
