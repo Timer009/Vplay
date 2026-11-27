@@ -8,7 +8,7 @@
   "controlPort": 18787,
   "previewPort": 18788,
   "bindHost": "127.0.0.1",
-  "publicMode": true,
+  "publicMode": false,
   "trustProxy": false,
   "previewAuthRequired": true,
   "hmacRequired": true,

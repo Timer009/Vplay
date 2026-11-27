@@ -100,7 +100,7 @@ test('B13-C12-P1-01/02/03: cross-line tags, javascript scheme and broken structu
           op(before, '-->', ''),
           op(before, '<div id="safe">ok</div>', '<div id="safe">ok</div><div id="new">safe</div>'),
         ]),
-      'DELTA_STRUCTURE_REJECTED',
+      'DELTA_CONTENT_REJECTED',
     );
 
     // P1-03 删除 </style> + 无害新增
@@ -116,7 +116,7 @@ test('B13-C12-P1-01/02/03: cross-line tags, javascript scheme and broken structu
           op(before, '</style>', ''),
           op(before, '<div>x</div>', '<div>x</div><div id="new">safe</div>'),
         ]),
-      'DELTA_STRUCTURE_REJECTED',
+      'DELTA_CONTENT_REJECTED',
     );
   } finally {
     removeWorkspace(root);
@@ -232,12 +232,31 @@ function makeFakeVision(comparison) {
     createSpacerAdapter: () => ({ id: 'fake', viewports: [], ready: async () => {}, assert: async () => [] }),
     redactSource: (text) => ({ text, findings: [], truncated: false }),
     redactObject: (value) => value,
-    runVisionTask: async () => ({
-      ok: true,
-      status: 'repaired',
-      validation: { ok: true },
-      comparison,
-    }),
+    runVisionTask: async ({ defectAssertionIds = [] } = {}) => {
+      const hasIds = Array.isArray(defectAssertionIds) && defectAssertionIds.length > 0;
+      const defect = comparison && comparison.defect ? comparison.defect : null;
+      const newFailures = (comparison && comparison.newFailures) || [];
+      const newCritical = (comparison && comparison.newCriticalFailures) || [];
+      const verified = Boolean(
+        hasIds &&
+        comparison && comparison.ok &&
+        defect && defect.ok &&
+        newFailures.length === 0 &&
+        newCritical.length === 0,
+      );
+      const reason = !hasIds
+        ? 'defect-binding-missing'
+        : verified
+          ? null
+          : (defect && defect.reason) || 'new-failure';
+      return {
+        ok: verified,
+        status: verified ? 'repair_verified' : 'repair_unconfirmed',
+        validation: { ok: verified, reason },
+        strictVerification: { ok: verified, reason },
+        comparison,
+      };
+    },
   };
 }
 
@@ -260,6 +279,7 @@ test('B13-C12-P1-04: repair requires the same defect assertion before=false/afte
       newFailures: [],
       newCriticalFailures: [],
       screenshotsChanged: true,
+      defect: { ok: true, reason: null },
       ...viewport([{ id: 'hud', before: false, after: true, critical: true }]),
     };
     const run = async (comparison, extra = {}) => {
@@ -290,15 +310,17 @@ test('B13-C12-P1-04: repair requires the same defect assertion before=false/afte
     // 删除缺陷断言（after 缺失）→ 不通过
     const deleted = await run({
       ...base,
+      defect: { ok: false, reason: 'defect-assertion-missing' },
       ...viewport([{ id: 'other', before: false, after: true, critical: true }]),
     });
     assert.equal(deleted.result.ok, false);
     assert.equal(deleted.result.status, 'repair_unconfirmed');
-    assert.equal(deleted.result.strictVerification.reason, 'defect-assertion-not-fixed');
+    assert.equal(deleted.result.strictVerification.reason, 'defect-assertion-missing');
 
     // 同一断言 before=true/after=true（缺陷不存在）→ 不通过
     const notFixed = await run({
       ...base,
+      defect: { ok: false, reason: 'defect-not-reproduced-before' },
       ...viewport([{ id: 'hud', before: true, after: true, critical: true }]),
     });
     assert.equal(notFixed.result.ok, false);
@@ -412,57 +434,38 @@ test('B13-C12-P1-07: HMAC chain cannot verify without the key', () => {
   }
 });
 
-test('B13-redirect: cross-origin redirect is blocked before the browser follows it', async () => {
+test('B13-redirect: CDP guard blocks external documents and subresources before the network', async () => {
   const mod = await import(
     pathToFileURL(path.join(__dirname, '..', '..', 'vendor', 'vision', 'src', 'browser', 'guard.mjs')).href
   );
-  let handler = null;
-  const calls = { fetched: [], fulfilled: 0, aborted: 0 };
-  const fakeContext = {
-    async addInitScript() {},
-    async route(_pattern, fn) {
-      handler = fn;
+  const sent = [];
+  const listeners = {};
+  const cdp = {
+    async send(cmd, params) {
+      sent.push({ cmd, params });
     },
-    on() {},
+    on(event, fn) {
+      listeners[event] = fn;
+    },
   };
   const guard = await mod.installNetworkGuard({
-    context: fakeContext,
+    context: { addInitScript: async () => {}, route: async () => {}, on: () => {} },
     previewUrl: 'http://127.0.0.1:8788/p/demo/',
   });
-  const request = {
-    url: () => 'http://127.0.0.1:8788/p/demo/',
-    method: () => 'GET',
-    resourceType: () => 'document',
-    isNavigationRequest: () => true,
-    frame: () => null,
-    allHeaders: async () => ({}),
-  };
-  const route = {
-    request: () => request,
-    async fetch(options = {}) {
-      calls.fetched.push(options.url || request.url());
-      if (!options.url) {
-        return {
-          status: () => 302,
-          url: () => 'http://127.0.0.1:8788/p/demo/',
-          headers: () => ({ location: 'https://evil.example/steal' }),
-        };
-      }
-      return { status: () => 200, url: () => options.url, headers: () => ({}) };
-    },
-    async fulfill() {
-      calls.fulfilled += 1;
-    },
-    async abort() {
-      calls.aborted += 1;
-    },
-    async continue() {
-      calls.fulfilled += 1;
-    },
-  };
-  await handler(route);
-  assert.equal(calls.aborted, 1);
-  assert.equal(calls.fulfilled, 0);
-  assert.equal(calls.fetched.some((url) => url.includes('evil.example')), false);
-  assert.ok(guard.summary().redirectBlocked >= 1);
+  await guard.enableRedirectGuard(cdp);
+  assert.equal(sent[0].cmd, 'Fetch.enable');
+  const paused = listeners['Fetch.requestPaused'];
+  assert.equal(typeof paused, 'function');
+  await paused({ requestId: 'doc-evil', resourceType: 'Document', request: { url: 'https://evil.example/steal' } });
+  await paused({ requestId: 'doc-other', resourceType: 'Document', request: { url: 'http://127.0.0.1:8788/p/other/' } });
+  await paused({ requestId: 'img-evil', resourceType: 'Image', request: { url: 'https://evil.example/x.png' } });
+  await paused({ requestId: 'img-ok', resourceType: 'Image', request: { url: 'http://127.0.0.1:8788/p/demo/pixel.png' } });
+
+  const failed = sent.filter((entry) => entry.cmd === 'Fetch.failRequest').map((entry) => entry.params.requestId);
+  const continued = sent.filter((entry) => entry.cmd === 'Fetch.continueRequest').map((entry) => entry.params.requestId);
+  assert.deepEqual(failed, ['doc-evil', 'doc-other', 'img-evil']);
+  assert.deepEqual(continued, ['img-ok']);
+  const summary = guard.summary();
+  assert.ok(summary.blocked.some((entry) => entry.reason === 'redirect-document'));
+  assert.ok(summary.blocked.some((entry) => entry.reason === 'redirect-subresource'));
 });

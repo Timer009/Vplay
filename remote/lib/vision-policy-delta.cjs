@@ -1,23 +1,26 @@
 'use strict';
 
 /**
- * 宿主侧 Vision delta 校验与 digest 绑定（B11，移植自 E07 参考实现）。
+ * 宿主侧 Vision delta 校验与 digest 绑定（B14，移植 E10 `host/vision-policy-delta.cjs`）。
  *
- * 与 B10 `applyPatchAtomically`（整文件 + 新增行扫描）的分工：
- *  - Vision 0.2.1 会通过 `host.applyFiles(files, { operations, plan, round })`
- *    提供精确的 operation 列表（start/end/oldString/newString）；
- *  - 本模块按 operation 逐段重放，验证「模型看到的源文件」与「宿主当前文件」一致，
- *    并对新增片段 + 上下文窗口做宿主独立扫描；
- *  - 若调用方没有 operations（旧适配层/降级路径），vision-service 回退到 B10 增量校验。
+ * 与 Vision 0.2.2 的关系：
+ *  - `validatePatchPlan` 已返回 `structure` 并拒绝结构破坏；本模块是宿主的
+ *    独立 backstop（防止适配层/传输层绕过），规则使用同一 CJS 参考
+ *    `vision-structure.cjs`，不再维护第二套窗口规则。
+ *  - 保留 B12/B13 的精确检查：operations 重放、before/after digest、
+ *    路径边界、目标必须是已存在的普通文件、journal 与原子写。
  *
  * 不提供任何客户端「跳过校验/prevalidated」开关。
- * 结构化 HTML/CSS allowlist 仍由 Vision 包负责；本模块是宿主 backstop。
  */
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { assertSemanticDelta } = require('./vision-structured.cjs');
+const {
+  structuralFindings,
+  changedRangesFromOperations,
+  unclosedFindings,
+} = require('./vision-structure.cjs');
 
 const ALLOWED_EXT = /\.(html?|css)$/i;
 
@@ -33,6 +36,20 @@ function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
+function overlaps(a, b) {
+  return a.start < b.end && a.end > b.start;
+}
+
+function styleRanges(text) {
+  const ranges = [];
+  const re = /<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    ranges.push({ start: match.index + match[0].indexOf('>') + 1, end: match.index + match[0].length - 8 });
+  }
+  return ranges;
+}
+
 function createDeltaPolicy({ policy } = {}) {
   if (
     !policy ||
@@ -41,7 +58,7 @@ function createDeltaPolicy({ policy } = {}) {
   ) {
     throw new DeltaPolicyError('createDeltaPolicy requires vision-policy', 'DELTA_CONFIG');
   }
-  const { assertSafeRelPath } = policy;
+  const { assertSafeRelPath, scanPatchContent } = policy;
 
   function scanDelta({ before, after, operations, file = '<memory>' }) {
     if (typeof before !== 'string' || typeof after !== 'string') {
@@ -56,17 +73,10 @@ function createDeltaPolicy({ policy } = {}) {
       if (!Number.isInteger(operation.start) || !Number.isInteger(operation.end)) {
         throw new DeltaPolicyError(`operation offsets must be integers: ${file}`, 'DELTA_OPERATION');
       }
-      if (
-        operation.start < cursor ||
-        operation.end <= operation.start ||
-        operation.end > before.length
-      ) {
-        throw new DeltaPolicyError(`operation overlaps or out of range: ${file}`, 'DELTA_OPERATION');
+      if (operation.start < cursor || operation.end <= operation.start || operation.end > before.length) {
+        throw new DeltaPolicyError(`operation overlaps or is out of range: ${file}`, 'DELTA_OPERATION');
       }
-      if (
-        typeof operation.oldString !== 'string' ||
-        before.slice(operation.start, operation.end) !== operation.oldString
-      ) {
+      if (typeof operation.oldString !== 'string' || before.slice(operation.start, operation.end) !== operation.oldString) {
         throw new DeltaPolicyError(`operation oldString mismatch: ${file}`, 'DELTA_SOURCE_CHANGED');
       }
       cursor = operation.end;
@@ -74,22 +84,18 @@ function createDeltaPolicy({ policy } = {}) {
 
     let computed = before;
     for (const operation of ordered.slice().reverse()) {
-      computed =
-        computed.slice(0, operation.start) + operation.newString + computed.slice(operation.end);
+      computed = computed.slice(0, operation.start) + operation.newString + computed.slice(operation.end);
     }
     if (computed !== after) {
-      throw new DeltaPolicyError(
-        `materialized content does not match operations: ${file}`,
-        'DELTA_DIGEST_MISMATCH',
-      );
+      throw new DeltaPolicyError(`materialized content does not match operations: ${file}`, 'DELTA_DIGEST_MISMATCH');
     }
 
     const hunks = [];
     let delta = 0;
     for (const operation of ordered) {
       const afterStart = operation.start + delta;
-      const afterEnd = afterStart + operation.newString.length;
-      delta += operation.newString.length - operation.oldString.length;
+      const afterEnd = afterStart + String(operation.newString).length;
+      delta += String(operation.newString).length - String(operation.oldString).length;
       hunks.push({
         file,
         start: operation.start,
@@ -101,12 +107,58 @@ function createDeltaPolicy({ policy } = {}) {
       });
     }
 
-    // B13：结构化语义比较（替代无限扩大正则窗口）
-    //  - 只拒绝 after 相对 before 新增的危险能力；
-    //  - 检查注释/敏感标签/花括号结构是否新增失衡；
-    //  - 精确 operations 重放与 digest 已在上面完成。
-    assertSemanticDelta(before, after, file);
-    return { file, hunks, windows: [] };
+    const changedRanges = changedRangesFromOperations(ordered);
+    const violations = [];
+    const addFindings = (scope, ids, detail = {}) => {
+      for (const id of ids) violations.push({ scope, id, ...detail });
+    };
+
+    // 1) 新增片段：宿主内容规则 + 去空白/实体的结构规则（跨行安全）。
+    for (const hunk of hunks) {
+      const raw = scanPatchContent(hunk.after);
+      if (!raw.ok) addFindings('fragment', raw.hits, { range: { start: hunk.afterStart, end: hunk.afterEnd } });
+      addFindings('fragment-normalized', structuralFindings(hunk.after), { range: { start: hunk.afterStart, end: hunk.afterEnd } });
+    }
+
+    // 2) AFTER 中被修改的 tag：覆盖“基线上下文 + 一行新增”的拼接绕过，
+    //    不扫描未变化的邻近 <script src>（修复 C12-P1-06 误拒）。
+    const tagRe = /<[^>]*>/g;
+    let tag;
+    while ((tag = tagRe.exec(after)) !== null) {
+      const range = { start: tag.index, end: tag.index + tag[0].length };
+      if (!changedRanges.some((item) => overlaps(item, range))) continue;
+      const raw = scanPatchContent(tag[0]);
+      if (!raw.ok) addFindings('changed-tag', raw.hits, { range });
+      addFindings('changed-tag-normalized', structuralFindings(tag[0]), { range });
+    }
+
+    // 3) <style> 内被修改的 CSS 区域。
+    for (const block of styleRanges(after)) {
+      for (const range of changedRanges) {
+        if (!overlaps(range, block)) continue;
+        const start = Math.max(range.start, block.start);
+        const end = Math.min(range.end, block.end);
+        if (end <= start) continue;
+        const text = after.slice(start, end);
+        const raw = scanPatchContent(text);
+        if (!raw.ok) addFindings('css-changed', raw.hits, { range: { start, end } });
+        addFindings('css-changed-normalized', structuralFindings(text), { range: { start, end } });
+      }
+    }
+
+    // 4) 未闭合注释/style/script（完整平衡块删除仍合法）。
+    addFindings('structure', unclosedFindings(after));
+
+    if (violations.length) {
+      const ids = [...new Set(violations.map((item) => item.id))];
+      const error = new DeltaPolicyError(
+        `delta content rejected (${ids.join(',')}): ${file}`,
+        'DELTA_CONTENT_REJECTED',
+      );
+      error.violations = violations;
+      throw error;
+    }
+    return { file, hunks, changedRanges, violations: [] };
   }
 
   function verifyFile({ root, file, content, sha256Before, sha256After, operations }) {
@@ -166,9 +218,7 @@ function createDeltaPolicy({ policy } = {}) {
     if (!Array.isArray(files) || files.length === 0) {
       throw new DeltaPolicyError('no files to apply', 'DELTA_INPUT');
     }
-    const allowed = new Set(
-      (allowedFiles || []).map((item) => String(item).replace(/\\/g, '/')),
-    );
+    const allowed = new Set((allowedFiles || []).map((item) => String(item).replace(/\\/g, '/')));
     const byFile = new Map();
     for (const operation of operations || []) {
       const rel = String(operation.file || '').replace(/\\/g, '/');
@@ -255,7 +305,7 @@ function createDeltaPolicy({ policy } = {}) {
           sha256Before: item.sha256Before,
           sha256After: item.sha256After,
           hunks: item.delta.hunks.length,
-          windows: item.delta.windows,
+          changedRanges: item.delta.changedRanges,
         })),
         journalFile,
         journalState: journalFile ? (keepJournal ? 'verified' : 'deleted') : null,
@@ -279,4 +329,10 @@ function createDeltaPolicy({ policy } = {}) {
   return { scanDelta, applyDelta, finalizeApply };
 }
 
-module.exports = { createDeltaPolicy, DeltaPolicyError, sha256 };
+module.exports = {
+  createDeltaPolicy,
+  DeltaPolicyError,
+  sha256,
+  structuralFindings,
+  changedRangesFromOperations,
+};

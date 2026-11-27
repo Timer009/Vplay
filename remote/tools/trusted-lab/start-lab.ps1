@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$LabRoot = "$env:USERPROFILE\vplay-lab",
   [int]$ControlPort = 18787,
   [int]$PreviewPort = 18788,
@@ -47,6 +47,17 @@ $preview = Require-Env 'PREVIEW_ACCESS_KEY' 16
 $hmac = Require-Env 'EVIDENCE_HMAC_KEY' 16
 
 New-Item -ItemType Directory -Force -Path $config.workspace, $config.home, $config.logs | Out-Null
+
+# B14 / C13 L-1：cleanup-lab.ps1 只认「配置 labRoot + marker」；
+# marker 记录规范化后的实验根，防止误删其他目录。
+$marker = Join-Path $config.root '.vplay-lab-marker'
+$markerPayload = @{
+  schemaVersion = 1
+  labRoot = [System.IO.Path]::GetFullPath($config.root)
+  createdAt = (Get-Date).ToUniversalTime().ToString('o')
+  createdBy = 'start-lab.ps1'
+} | ConvertTo-Json
+Set-Content -LiteralPath $marker -Value $markerPayload -Encoding UTF8
 
 $env:VPLAY_HOME = $config.home
 $env:OPENGAME_WORKSPACE = $config.workspace

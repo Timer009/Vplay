@@ -340,7 +340,7 @@ test('B10-B1: incremental validation ignores unchanged Spacer-style unsafe basel
           ],
           allowedFiles: ['index.html'],
         }),
-      /unsafe content/i,
+      /unsafe content|delta content rejected/i,
     );
 
     // 基线摘要不匹配（补丁基于旧内容）必须拒绝

@@ -16,7 +16,7 @@ function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
 }
 
-test('B12-compat: legacy v1 event chain is adopted and stays verifiable', () => {
+test('B12-compat: legacy v1 event chain requires explicit opt-in before anchor adoption', () => {
   const root = makeWorkspace('vplay-b12-legacy-');
   const file = path.join(root, 'events', 'events.jsonl');
   try {
@@ -40,16 +40,39 @@ test('B12-compat: legacy v1 event chain is adopted and stays verifiable', () => 
     }
     fs.writeFileSync(file, `${lines.join('\n')}\n`);
 
+    // C13-P1-02：默认不得自动收养（无 key 也要显式 opt-in）
     const store = createEventStore({ file });
     const first = store.verify();
-    assert.equal(first.ok, true, first.problems.join(','));
-    assert.equal(first.count, 3);
+    assert.equal(first.ok, false);
+    assert.ok(first.problems.includes('ANCHOR_MISSING'), first.problems.join(','));
+    assert.equal(
+      store.append({ type: 'task.running', taskId: 't4', projectId: 'demo', status: 'running' }),
+      null,
+      'append must be refused while the signed chain has no anchor',
+    );
+    assert.equal(fs.existsSync(path.join(root, 'events', 'events.anchor.json')), false);
 
-    store.append({ type: 'task.running', taskId: 't4', projectId: 'demo', status: 'running' });
-    const second = store.verify();
-    assert.equal(second.ok, true, second.problems.join(','));
-    assert.equal(second.count, 4);
+    // 显式 opt-in（无 HMAC key）才允许收养；verify 必须报告 ANCHOR_ADOPTED
+    process.env.VPLAY_ALLOW_ANCHOR_ADOPT = '1';
+    let adopted;
+    try {
+      adopted = createEventStore({ file });
+    } finally {
+      delete process.env.VPLAY_ALLOW_ANCHOR_ADOPT;
+    }
     assert.ok(fs.existsSync(path.join(root, 'events', 'events.anchor.json')));
+    const second = adopted.verify();
+    assert.equal(second.ok, false, 'adoption itself is a downgrade signal');
+    assert.ok(second.problems.includes('ANCHOR_ADOPTED'), second.problems.join(','));
+    assert.equal(second.count, 3);
+    const appended = adopted.append({
+      type: 'task.running',
+      taskId: 't4',
+      projectId: 'demo',
+      status: 'running',
+    });
+    assert.ok(appended);
+    assert.equal(adopted.verify().count, 4);
   } finally {
     removeWorkspace(root);
   }

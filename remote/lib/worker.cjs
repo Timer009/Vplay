@@ -389,16 +389,13 @@ function createWorker(options) {
         defectAssertionIds: task.defectAssertionIds || [],
       });
 
-      // B13：verify 仅是功能复验，不构成“修复已验证”
+      // B14：verify 仅是功能复验；repair 只有 Vision `repair_verified` 才算已验证
       const isRepair = (task.visionMode || 'analyze') === 'repair';
-      const verified = isRepair
-        ? Boolean(
-            output.result &&
-              (output.result.validation
-                ? output.result.validation.ok === true
-                : output.result.ok === true),
-          )
-        : false;
+      const verified = isRepair && Boolean(
+        output.result &&
+          output.result.status === 'repair_verified' &&
+          output.result.repairVerified === true,
+      );
       const status = output.result && output.result.ok ? 'succeeded' : 'failed';
       const result = {
         ok: Boolean(output.result && output.result.ok),

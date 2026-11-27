@@ -488,7 +488,7 @@ test('Sprint03B / P0-05: vision host wiring applies safe patches atomically and 
   const before = fs.readFileSync(path.join(imported.project.srcDir, 'index.html'), 'utf-8');
   await assert.rejects(
     () => service2.run({ taskId: 'vision_bad', projectId: 'demo', mode: 'repair', skipLock: false }),
-    /unsafe content/i,
+    /unsafe content|delta content rejected/i,
   );
   assert.equal(fs.readFileSync(path.join(imported.project.srcDir, 'index.html'), 'utf-8'), before);
 

@@ -45,6 +45,18 @@ function recordBody(record) {
   return JSON.stringify(base);
 }
 
+/**
+ * Anchor HMAC material.
+ * v2（B14）覆盖 alg，防止把 alg 降级为 sha256 后重写 count/head；
+ * v1（B12 及更早）仍按旧材料校验，保证已存在证据可读。
+ */
+function anchorMaterial(anchor) {
+  if (Number(anchor.version) >= 2) {
+    return `v2\n${anchor.alg}\n${anchor.count}\n${anchor.lastId}\n${anchor.head || ''}`;
+  }
+  return `${anchor.count}\n${anchor.lastId}\n${anchor.head || ''}`;
+}
+
 function createEventStore(options = {}) {
   const file = path.resolve(options.file);
   const dir = path.dirname(file);
@@ -67,6 +79,7 @@ function createEventStore(options = {}) {
   let totalCount = 0;
   let lastSize = 0;
   let anchor = null;
+  let anchorAdopted = false;
   const listeners = new Set();
   let lastBroken = 0;
 
@@ -118,11 +131,23 @@ function createEventStore(options = {}) {
     }
     anchor = readAnchor();
     if (!anchor && totalCount > 0) {
-      // B12：旧版本（无 anchor）升级时自动建立锚点，保证独立验证器兼容；
-      // 若升级前已发生尾删，无法追溯，只能从当前状态开始检测。
-      writeAnchor();
-      logger('[events] anchor adopted from existing chain (legacy compatibility)');
-      anchor = readAnchor();
+      // C13-P1-02：已签名证据链缺失 anchor 时不得自动收养。
+      // 仅允许「无 HMAC key 的旧链」在显式 VPLAY_ALLOW_ANCHOR_ADOPT=1 下收养，
+      // 并永久标记 adopted，verify() 必须报告 ANCHOR_ADOPTED。
+      const canAdopt = !hmacKey && process.env.VPLAY_ALLOW_ANCHOR_ADOPT === '1';
+      if (canAdopt) {
+        anchorAdopted = true;
+        writeAnchor({ adopted: true });
+        anchor = readAnchor();
+        logger('[events] anchor adopted from existing unsigned chain (explicit opt-in)');
+      } else {
+        logger(
+          '[events] anchor missing for non-empty chain; refusing automatic adoption ' +
+          '(set VPLAY_ALLOW_ANCHOR_ADOPT=1 only for unsigned legacy chains)',
+        );
+      }
+    } else if (anchor && anchor.adopted === true) {
+      anchorAdopted = true;
     }
     if (anchor && Number.isFinite(Number(anchor.count)) && Number(anchor.count) > totalCount) {
       logger(
@@ -203,10 +228,10 @@ function createEventStore(options = {}) {
     }
   }
 
-  function writeAnchor() {
+  function writeAnchor(options = {}) {
     const head = events.length ? events[events.length - 1].hash : null;
     const payload = {
-      version: 1,
+      version: 2,
       count: totalCount,
       lastId: String(nextId - 1),
       head,
@@ -215,8 +240,12 @@ function createEventStore(options = {}) {
       keyFingerprint,
       updatedAt: new Date().toISOString(),
     };
+    if (options.adopted === true || anchorAdopted) payload.adopted = true;
     if (hmacKey) {
-      payload.hmac = hmac(hmacKey, `${payload.count}\n${payload.lastId}\n${payload.head || ''}`);
+      payload.hmac = hmac(
+        hmacKey,
+        anchorMaterial(payload),
+      );
     }
     const tmp = `${anchorFile}.${process.pid}.${crypto.randomBytes(3).toString('hex')}.tmp`;
     try {
@@ -230,6 +259,11 @@ function createEventStore(options = {}) {
 
   function append(input) {
     return withLock(() => {
+      // C13-P1-02：非空链缺 anchor 且未显式收养时，拒绝写入（否则会用新 anchor 掩盖尾删）
+      if (!anchor && totalCount > 0 && !anchorAdopted) {
+        logger('[events] append refused: anchor missing for existing chain (tamper evidence)');
+        return null;
+      }
       // 其它进程可能已追加：按文件实际大小同步内存状态
       try {
         if (fs.statSync(file).size !== lastSize) reloadFromDisk();
@@ -334,7 +368,14 @@ function createEventStore(options = {}) {
       records.some((record) => Boolean(record.hmac)) ||
       Boolean(currentAnchor && currentAnchor.alg === 'hmac-sha256');
     const mustHaveKey = options.requireHmac === true || requireHmac || chainUsesHmac;
-    if (mustHaveKey && !hmacKey) problems.push('HMAC_KEY_MISSING');
+    if (mustHaveKey && !hmacKey) {
+      // HMAC_KEY_REQUIRED 为 C13 语义；HMAC_KEY_MISSING 保留为 B13 兼容别名
+      problems.push('HMAC_KEY_REQUIRED');
+      problems.push('HMAC_KEY_MISSING');
+    }
+    if (anchorAdopted || (currentAnchor && currentAnchor.adopted === true)) {
+      problems.push('ANCHOR_ADOPTED');
+    }
     let prev = 'GENESIS';
     let lastIdValue = null;
     for (const record of records) {
@@ -343,6 +384,10 @@ function createEventStore(options = {}) {
       const body = recordBody(record);
       const expected = sha256(`${prev}\n${body}`);
       if (record.hash !== expected) problems.push(`HASH_MISMATCH:${record.id}`);
+      if (hmacKey && !record.hmac) {
+        // C13-P1-03：持 key/强制签名时，缺失签名同样不可接受
+        problems.push(`RECORD_HMAC_MISSING:${record.id}`);
+      }
       if (record.hmac && hmacKey) {
         const expectedMac = hmac(hmacKey, record.hash);
         if (record.hmac !== expectedMac) problems.push(`HMAC_MISMATCH:${record.id}`);
@@ -360,12 +405,21 @@ function createEventStore(options = {}) {
       if ((currentAnchor.head || null) !== (records.length ? records[records.length - 1].hash : null)) {
         problems.push('ANCHOR_HEAD_MISMATCH');
       }
-      if (currentAnchor.alg === 'hmac-sha256' && hmacKey) {
-        const expected = hmac(
-          hmacKey,
-          `${currentAnchor.count}\n${currentAnchor.lastId}\n${currentAnchor.head || ''}`,
-        );
-        if (currentAnchor.hmac !== expected) problems.push('ANCHOR_HMAC_MISMATCH');
+      if (hmacKey) {
+        // C13-P1-03：有 key 时 anchor 必须保持 hmac-sha256，且 HMAC 覆盖 alg
+        if (currentAnchor.alg !== 'hmac-sha256') problems.push('ANCHOR_ALG_DOWNGRADE');
+        if (!currentAnchor.hmac) {
+          problems.push('ANCHOR_HMAC_MISSING');
+        } else if (currentAnchor.hmac !== hmac(hmacKey, anchorMaterial(currentAnchor))) {
+          problems.push('ANCHOR_HMAC_MISMATCH');
+        }
+        if (
+          currentAnchor.keyFingerprint &&
+          keyFingerprint &&
+          currentAnchor.keyFingerprint !== keyFingerprint
+        ) {
+          problems.push('ANCHOR_KEY_MISMATCH');
+        }
       }
     }
     if (lastBroken > 0) problems.push(`BROKEN_LINES:${lastBroken}`);

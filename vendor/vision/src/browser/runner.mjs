@@ -172,6 +172,9 @@ export function createBrowserRunner({
         guard.setMainPage(page);
         page.setDefaultTimeout(timeoutMs);
         const cdp = await context.newCDPSession(page);
+        // E10: server-side redirects bypass context.route; CDP Fetch pauses
+        // document requests (including redirect targets) and fails closed.
+        await guard.enableRedirectGuard(cdp);
         const diagnostics = { console: [], pageErrors: [], requestFailures: [] };
         page.on('console', (msg) => {
           if (msg.type() === 'error' || msg.type() === 'warning') {
@@ -184,7 +187,35 @@ export function createBrowserRunner({
           failure: request.failure()?.errorText || 'unknown',
         }));
 
-        await page.goto(url, { waitUntil: 'load', timeout: timeoutMs });
+        try {
+          await page.goto(url, { waitUntil: 'load', timeout: timeoutMs });
+        } catch (error) {
+          const redirect = guard.summary().blocked.find((entry) => entry.reason === 'redirect-document');
+          if (redirect) {
+            throw new VisionError('navigation was blocked: redirect left the preview origin', {
+              category: ERROR_CATEGORIES.BROWSER,
+              code: 'REDIRECT_OUT_OF_SCOPE',
+              details: { blocked: redirect },
+            });
+          }
+          throw error;
+        }
+        const expected = new URL(url);
+        const finalUrl = new URL(page.url());
+        const previewPath = guard.summary().previewPath;
+        if (finalUrl.origin !== expected.origin || !finalUrl.pathname.startsWith(previewPath)) {
+          guard.recordNavigation({
+            url: page.url(),
+            resourceType: 'document',
+            isNavigation: true,
+            reason: 'navigation-path',
+          });
+          throw new VisionError('navigation left the preview project path', {
+            category: ERROR_CATEGORIES.BROWSER,
+            code: 'NAVIGATION_OUT_OF_SCOPE',
+            details: { url: page.url(), expectedPrefix: previewPath },
+          });
+        }
         await adapter.ready(page, { viewport, scenario });
         if (typeof adapter.setup === 'function') await adapter.setup(page, { viewport, scenario });
         const screenshot = path.join(outDir, `${safeName(adapter.id || 'adapter')}-${safeName(viewport.name)}-${safeName(scenario)}${captureId ? `-${safeName(captureId)}` : ''}.png`);

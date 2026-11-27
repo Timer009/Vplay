@@ -158,3 +158,24 @@ Reference: `docs/DELTA-CONTRACT.md`, E07 `host/vision-policy-delta.cjs`.
 of change. The full `comparison` object is returned and emitted. `after-only`
 remains the default for compatibility; new hosts should use `confirmed` plus a
 defect-specific predicate. See `docs/VERIFY-SEMANTICS.md`.
+
+## 12. 0.2.2 additions — strict repair and structure
+
+- `verificationPolicy` now accepts `after-only` | `confirmed` | `strict-repair`.
+  `confirmed` and `strict-repair` require `comparison.defect.ok` (stable
+  `defectAssertionIds`); `strict-repair` also rejects any new failure.
+- `runVisionTask` accepts `defectAssertionIds` and optional `defectKey`.
+  Results include `comparison`, `strictVerification`, `defect.defectKey`.
+  Gate failure with a passing after capture returns `repair_unconfirmed` and
+  calls `host.rollback`; success is `repair_verified` (confirmed/strict) or
+  legacy `repaired` (after-only).
+- `validatePatchPlan` now performs structural/differential validation and returns
+  `structure`; a plan that deletes a comment/style closer, leaves unbalanced
+  tokens, or introduces a cross-line `<script>`/`javascript:` fails.
+- The browser runner enables a CDP Fetch document guard: cross-origin redirects
+  are failed before the network, and the final URL must stay inside
+  `/p/<projectId>/`.
+- Host delta: do not scan ±2-line windows (false rejects). Use the exported
+  `normalizeStructural`/`validateStructureDelta`/`changedRangesFromOperations`
+  or the pinned CJS reference. See `docs/STRUCTURE-CONTRACT.md` and
+  `docs/B13-INTEGRATION-GUIDE.md`.

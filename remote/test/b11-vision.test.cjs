@@ -21,7 +21,7 @@ const visionPolicy = require('../lib/vision-policy.cjs');
 const { makeWorkspace, removeWorkspace } = require('./helpers.cjs');
 
 const SPACER = 'G:\\AI_GAME\\Vplay-Vision-POC\\e05\\spacer-latest\\vector-lander\\index.html';
-const policy = createDeltaPolicy({ policy: visionPolicy, contextLines: 2 });
+const policy = createDeltaPolicy({ policy: visionPolicy });
 
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
@@ -334,9 +334,9 @@ test('B11-Vision-verified: screenshots alone cannot prove a repair', async () =>
     registry.importProject({ sourceDir: path.join(root, 'src'), id: 'demo' });
 
     const screenshotsOnly = makeFakeVision(async () => ({
-      ok: true,
-      status: 'repaired',
-      validation: { ok: true },
+      ok: false,
+      status: 'repair_unconfirmed',
+      validation: { ok: false, reason: 'defect-binding-missing' },
       comparison: {
         ok: true,
         beforeOk: true,
@@ -363,8 +363,9 @@ test('B11-Vision-verified: screenshots alone cannot prove a repair', async () =>
 
     const confirmed = makeFakeVision(async () => ({
       ok: true,
-      status: 'repaired',
+      status: 'repair_verified',
       validation: { ok: true },
+      strictVerification: { ok: true },
       comparison: {
         ok: true,
         beforeOk: false,
@@ -402,7 +403,7 @@ test('B11-Vision-verified: screenshots alone cannot prove a repair', async () =>
       defectAssertionIds: ['h1-visible'],
     });
     assert.equal(strong.result.ok, true);
-    assert.equal(strong.result.status, 'repaired');
+    assert.equal(strong.result.status, 'repair_verified');
   } finally {
     removeWorkspace(root);
   }

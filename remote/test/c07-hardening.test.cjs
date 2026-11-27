@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 /**
  * C07 定向回归（Sprint03A 安全基础）。
@@ -202,7 +202,7 @@ test('C07-P0-05/P1-05/P1-11: patch policy rejects bypasses, links and non-atomic
     );
     assert.throws(
       () => validatePatchFiles(project, [{ file: 'index.html', content: '<iframe></iframe>' }], allowed),
-      /unsafe content/i,
+      /unsafe content|delta content rejected/i,
     );
 
     const outside = path.join(root, 'outside.txt');
@@ -231,7 +231,7 @@ test('C07-P0-05/P1-05/P1-11: patch policy rejects bypasses, links and non-atomic
         files: [{ file: 'index.html', content: '<script>fetch("https://evil.example")</script>' }],
         allowedFiles: allowed,
       }),
-      /unsafe content/i,
+      /unsafe content|delta content rejected/i,
     );
     assert.equal(fs.readFileSync(path.join(project, 'index.html'), 'utf8'), '<h1>ok</h1>', 'rejected patch must not write');
 

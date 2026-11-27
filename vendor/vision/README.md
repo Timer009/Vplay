@@ -1,6 +1,6 @@
-# @vplay/vision 0.2.1 — E07 integration candidate
+# @vplay/vision 0.2.2 — E10 targeted fixes
 
-> 独立集成候选：0.2.0 的补丁白名单/出站限制/脱敏之上，新增内存级预览认证注入、delta+digest 宿主契约、修复前后验证对照、捕获证据脱敏。0.1.0/0.2.0 包保持不变。
+> 定向修复：跨源重定向请求边界、comparison 新增/缺失断言分类、稳定 defectKey、strict-repair 语义、HTML/CSS 结构差分校验。0.2.1/E07 交付物保持不变。
 
 Vplay Studio 的可移植视觉验证模块包。它把 E02 已验证的真实双模型闭环整理为可集成组件：
 

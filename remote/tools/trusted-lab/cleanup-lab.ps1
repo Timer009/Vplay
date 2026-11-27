@@ -1,34 +1,92 @@
-param(
-  [string]$LabRoot = "$env:USERPROFILE\vplay-lab",
+﻿param(
+  [string]$LabRoot = '',
+  [string]$Config = (Join-Path $PSScriptRoot 'lab-config.json'),
   [switch]$Approve
 )
 
-# B12：默认 DryRun；只清理 LabRoot 内部，不触碰用户工程或 VPLAY_HOME 之外的数据。
-$root = [System.IO.Path]::GetFullPath($LabRoot)
-$userHome = [System.IO.Path]::GetFullPath($env:USERPROFILE)
-if (-not $root.StartsWith($userHome, [System.StringComparison]::OrdinalIgnoreCase) -and
-    -not $root.StartsWith('G:\AI_GAME\', [System.StringComparison]::OrdinalIgnoreCase)) {
-  throw "refuse to clean labRoot outside user profile or G:\AI_GAME: $root"
+# B14 / C13 L-1：只允许清理「配置中精确声明的 labRoot」。
+# 额外要求 .vplay-lab-marker 与路径规范化；任何重解析点（symlink/junction）一律拒绝。
+# 默认 DryRun；-Approve 才删除，且删除前先调用 stop-lab.ps1。
+$ErrorActionPreference = 'Stop'
+
+function Normalize-Dir([string]$value) {
+  if (-not $value) { return '' }
+  return [System.IO.Path]::GetFullPath($value).TrimEnd('\', '/')
 }
-if ($root -eq $userHome -or $root -eq 'G:\AI_GAME') {
+
+if (-not (Test-Path -LiteralPath $Config)) {
+  throw "lab config not found: $Config (copy lab-config.example.json to lab-config.json first)"
+}
+$cfg = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
+if (-not $cfg.labRoot) {
+  throw "lab config must define labRoot: $Config"
+}
+
+$configured = Normalize-Dir ([string]$cfg.labRoot)
+$requested = if ($LabRoot) { Normalize-Dir $LabRoot } else { $configured }
+if (-not [string]::Equals($requested, $configured, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw "refuse to clean: LabRoot must exactly equal configured labRoot ($configured)"
+}
+
+$root = $requested
+$userHome = Normalize-Dir $env:USERPROFILE
+$driveRoot = Normalize-Dir ([System.IO.Path]::GetPathRoot($root))
+if ($root -eq $userHome -or $root -eq $driveRoot -or $root -eq (Normalize-Dir 'G:\AI_GAME')) {
   throw "refuse to clean broad root: $root"
 }
 
+function Assert-NoReparse([string]$target) {
+  $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop
+  if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+    throw "refuse to clean through reparse point: $target"
+  }
+}
+
+# 父目录链也必须是普通目录，避免经由 junction 把删除重定向到正式工程。
+$parent = Split-Path -Parent $root
+while ($parent) {
+  Assert-NoReparse $parent
+  $next = Split-Path -Parent $parent
+  if (-not $next -or $next -eq $parent) { break }
+  $parent = $next
+}
+
 Write-Output "labRoot = $root"
-if (-not (Test-Path $root)) {
+if (-not (Test-Path -LiteralPath $root)) {
   Write-Output "nothing to clean"
   exit 0
 }
-Get-ChildItem $root -Force | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+
+Assert-NoReparse $root
+$marker = Join-Path $root '.vplay-lab-marker'
+if (-not (Test-Path -LiteralPath $marker)) {
+  throw "refuse to clean: marker missing ($marker)"
+}
+$markerInfo = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+if (-not $markerInfo.schemaVersion -or -not $markerInfo.labRoot) {
+  throw "refuse to clean: invalid lab marker ($marker)"
+}
+if (-not [string]::Equals((Normalize-Dir ([string]$markerInfo.labRoot)), $root, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw "refuse to clean: marker labRoot does not match ($($markerInfo.labRoot))"
+}
+
+# 删除前扫描整棵实验树；任何重解析点都拒绝，不跟随、不删除。
+Get-ChildItem -LiteralPath $root -Recurse -Force | ForEach-Object {
+  if ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+    throw "refuse to clean: reparse point inside lab tree: $($_.FullName)"
+  }
+}
+
+Get-ChildItem -LiteralPath $root -Force | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
 
 if (-not $Approve) {
-  Write-Output "DRY RUN. Re-run with -Approve to remove the lab directory."
+  Write-Output "DRY RUN. Re-run with -Approve to remove the configured lab directory."
   exit 0
 }
 
 # 先停 lab 进程（如果 PID 文件存在）
 $stop = Join-Path $PSScriptRoot 'stop-lab.ps1'
-if (Test-Path $stop) { & $stop -LabRoot $root }
+if (Test-Path -LiteralPath $stop) { & $stop -LabRoot $root }
 
-Remove-Item $root -Recurse -Force
+Remove-Item -LiteralPath $root -Recurse -Force
 Write-Output "removed $root"

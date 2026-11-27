@@ -61,7 +61,7 @@ function createVisionService(options = {}) {
   const home = options.home;
   const eventStore = options.eventStore || null;
   const deps = options.deps || {};
-  const deltaPolicy = createDeltaPolicy({ policy: visionPolicy, contextLines: 2 });
+  const deltaPolicy = createDeltaPolicy({ policy: visionPolicy });
 
   async function loadVision() {
     if (deps.vision) return deps.vision;
@@ -128,73 +128,6 @@ function createVisionService(options = {}) {
       value: String(ticket.value),
       // 项目级路径：只把票据发往本项目的预览前缀，不做全局 Path=/
       path: `/p/${projectId}/`,
-    };
-  }
-
-  /**
-   * B11/B13：修复成功的宿主硬门禁。
-   *
-   * 必须绑定稳定 defectId 与缺陷断言 ID：
-   *  - 同一断言在 before=false、after=true（至少一个视口，且该 id 的所有出现都不允许缺失/失败）；
-   *  - 删除缺陷断言、after 缺失该断言、出现任何新增失败（含 critical）→ 不通过；
-   *  - 截图变化、before 整体失败、无关断言 resolved 都不能替代缺陷断言。
-   */
-  function strictRepairVerification(result, defectId, defectAssertionIds) {
-    const comparison = result && result.comparison;
-    const id = defectId || (result && result.defect && result.defect.id) || null;
-    const assertionIds = (Array.isArray(defectAssertionIds) ? defectAssertionIds : [])
-      .map((item) => String(item || '').trim())
-      .filter(Boolean)
-      .slice(0, 10);
-    if (!comparison || typeof comparison !== 'object') {
-      return { ok: false, reason: 'comparison-missing', defectId: id, defectAssertionIds: assertionIds };
-    }
-    if (!id || assertionIds.length === 0) {
-      return {
-        ok: false,
-        reason: 'defect-binding-missing',
-        defectId: id,
-        defectAssertionIds: assertionIds,
-      };
-    }
-    const entries = [];
-    for (const viewport of Array.isArray(comparison.viewports) ? comparison.viewports : []) {
-      for (const assertion of Array.isArray(viewport.assertions) ? viewport.assertions : []) {
-        if (assertionIds.includes(assertion.id)) {
-          entries.push({ viewport: viewport.viewport, ...assertion });
-        }
-      }
-    }
-    const details = assertionIds.map((assertionId) => {
-      const found = entries.filter((item) => item.id === assertionId);
-      const missing = found.length === 0;
-      const fixed = found.length > 0 && found.every((item) => item.before === false && item.after === true);
-      return { id: assertionId, missing, fixed, occurrences: found.length };
-    });
-    const allFixed = details.every((item) => !item.missing && item.fixed);
-    const newFailures = Array.isArray(comparison.newFailures) ? comparison.newFailures : [];
-    const newCritical = Array.isArray(comparison.newCriticalFailures)
-      ? comparison.newCriticalFailures
-      : [];
-    const afterOk = comparison.afterOk !== false && result.ok !== false;
-    const ok = Boolean(comparison.ok && afterOk && allFixed && newFailures.length === 0 && newCritical.length === 0);
-    return {
-      ok,
-      reason: ok
-        ? null
-        : !allFixed
-          ? 'defect-assertion-not-fixed'
-          : newFailures.length || newCritical.length
-            ? 'new-failure'
-            : 'comparison-not-ok',
-      defectId: id,
-      defectAssertionIds: assertionIds,
-      defectAssertions: details,
-      newFailures: newFailures.length,
-      newCritical: newCritical.length,
-      beforeOk: comparison.beforeOk,
-      afterOk: comparison.afterOk,
-      screenshotsChanged: Boolean(comparison.screenshotsChanged),
     };
   }
 
@@ -419,7 +352,10 @@ function createVisionService(options = {}) {
         gateway,
         events,
         mode: mode === 'repair' ? 'repair' : 'analyze',
-        verificationPolicy: 'confirmed',
+        // B14：唯一的修复成功判定由 Vision 0.2.2 strict-repair 提供
+        verificationPolicy: 'strict-repair',
+        defectAssertionIds,
+        defectKey: defectId || undefined,
         scenario,
         allowedFiles,
         sourceProvider: async () => {
@@ -520,26 +456,35 @@ function createVisionService(options = {}) {
           ticket: ticket ? 'ephemeral-memory-only' : null,
         },
       });
-      report.verificationPolicy = 'confirmed';
+      // B14：只映射 Vision 0.2.2 的 strict-repair 结果，不再维护第二套判定。
+      report.verificationPolicy = result.verificationPolicy || 'strict-repair';
+      report.strictVerification = result.strictVerification || null;
+      report.comparison = result.comparison || null;
       if (mode === 'repair') {
-        const strict = strictRepairVerification(
-          result,
-          defectId || (result && result.defect && result.defect.id) || null,
-          defectAssertionIds,
+        const repairVerified = Boolean(
+          result.ok === true &&
+            result.status === 'repair_verified' &&
+            result.strictVerification &&
+            result.strictVerification.ok === true,
         );
-        report.strictVerification = strict;
-        result.strictVerification = strict;
-        if (result.ok && !strict.ok) {
+        result.repairVerified = repairVerified;
+        result.publishEligible = repairVerified;
+        report.repairVerified = repairVerified;
+        if (!repairVerified && result.status === 'repair_verified') {
+          // 状态与证据不一致时失败关闭（不发布、不当作已验证）
           result.ok = false;
           result.status = 'repair_unconfirmed';
-          result.validation = { ok: false, reason: strict.reason };
         }
       }
       const written = writeRedactedReport(vision, report);
       emit(taskId, projectId, 'completed', {
         status: result.status || (result.ok ? 'succeeded' : 'failed'),
         ok: result.ok,
-        verified: result.validation ? result.validation.ok : result.ok,
+        verified: result.publishEligible === true
+          ? true
+          : result.validation
+            ? result.validation.ok
+            : result.ok,
       });
       return { result, reportFile: written.file, artifactId: written.artifactId, outDir };
     } finally {

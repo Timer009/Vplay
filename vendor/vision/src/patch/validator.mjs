@@ -1,6 +1,11 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import {
+  changedRangesFromOperations,
+  validateFragmentStructure,
+  validateStructureDelta,
+} from './structure.mjs';
 
 /**
  * E05 / C07-P0-05: structured allowlist, not a keyword blacklist.
@@ -268,6 +273,12 @@ export function validatePatchPlan({ plan, root, allowedFiles = ['index.html'], m
       maxChars,
     });
     errors.push(...contentErrors.map((item) => `${prefix}: ${item}`));
+    if (newString.trim()) {
+      const fragment = validateFragmentStructure(newString);
+      if (!fragment.ok) {
+        errors.push(...fragment.violations.map((item) => `${prefix}: ${item.code}${item.id ? `(${item.id})` : ''}`));
+      }
+    }
     operations.push({
       file: resolved.rel,
       absolute: resolved.absolute,
@@ -292,7 +303,26 @@ export function validatePatchPlan({ plan, root, allowedFiles = ['index.html'], m
       if (list[i].start < list[i - 1].end) errors.push(`overlapping patches in ${path.basename(absolute)}`);
     }
   }
-  return { ok: errors.length === 0, errors, operations, files };
+  const structure = [];
+  if (errors.length === 0) {
+    for (const [absolute, list] of byFile) {
+      const before = files[absolute].content;
+      let after = before;
+      for (const operation of [...list].sort((a, b) => b.start - a.start)) {
+        after = after.slice(0, operation.start) + operation.newString + after.slice(operation.end);
+      }
+      const check = validateStructureDelta({
+        before,
+        after,
+        changedRanges: changedRangesFromOperations(list),
+      });
+      structure.push({ file: files[absolute].file, ...check });
+      if (!check.ok) {
+        errors.push(...check.violations.map((item) => `structure(${files[absolute].file}): ${item.code}`));
+      }
+    }
+  }
+  return { ok: errors.length === 0, errors, operations, files, structure };
 }
 
 /** Compute exact post-patch contents in memory. No writes/snapshots. */

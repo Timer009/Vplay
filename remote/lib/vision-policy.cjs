@@ -14,7 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { assertSemanticDelta } = require('./vision-structured.cjs');
+const { structuralFindings, unclosedFindings } = require('./vision-structure.cjs');
 
 class VisionPolicyError extends Error {
   constructor(message, code = 'VISION_POLICY') {
@@ -143,6 +143,26 @@ function addedLines(before, after) {
   return added;
 }
 
+/**
+ * 降级路径（没有 operations 时）的内容差分：
+ * 使用与 Vision 0.2.2 相同的 CJS 结构规则，只扫描新增行与 after 未闭合结构。
+ */
+function assertContentDelta(before, after, rel) {
+  const hits = new Set();
+  for (const line of addedLines(before, after)) {
+    const scan = scanPatchContent(line);
+    if (!scan.ok) for (const id of scan.hits) hits.add(id);
+    for (const id of structuralFindings(line)) hits.add(id);
+  }
+  for (const id of unclosedFindings(after)) hits.add(id);
+  if (hits.size) {
+    throw new VisionPolicyError(
+      `delta content rejected (${[...hits].slice(0, 8).join(',')}): ${rel}`,
+      'PATCH_CONTENT_REJECTED',
+    );
+  }
+}
+
 function validatePatchIncremental(root, files, allowedFiles) {
   if (!Array.isArray(files) || files.length === 0) {
     throw new VisionPolicyError('patch has no files', 'PATCH_EMPTY');
@@ -186,10 +206,11 @@ function validatePatchIncremental(root, files, allowedFiles) {
     if (item.content === before) {
       throw new VisionPolicyError(`patch makes no change: ${rel}`, 'PATCH_NO_CHANGE');
     }
-    // B13：结构化语义比较（新增危险能力/结构失衡），不再做新增行/窗口黑名单
+    // B14：与 Vision 0.2.2 相同的结构/差分规则（不再维护 B13 第二套语义）
     try {
-      assertSemanticDelta(before, item.content, rel);
+      assertContentDelta(before, item.content, rel);
     } catch (error) {
+      if (error instanceof VisionPolicyError) throw error;
       throw new VisionPolicyError(
         `unsafe content in ${rel}: ${error.code || 'SEMANTIC_REJECTED'}`,
         'PATCH_CONTENT_REJECTED',

@@ -189,14 +189,21 @@ function withHomeLock(home, fn, options = {}) {
         throw error;
       }
 
+      // C13-P1-01：deadline 必须在每次重试（含 stale 抢占失败后的 continue）之前检查，
+      // 否则残留 released 标记会让调用方绕过 20s 上限而活锁。
+      if (Date.now() > deadline) {
+        throw new ProjectError('registry is busy', 409, 'REGISTRY_LOCKED');
+      }
+
       const observed = observeLock(file);
       const info = observed.info;
       let stale = false;
       if (info) {
         const pid = Number(info.pid);
         if (!Number.isFinite(pid) || pid <= 0) {
-          // 损坏的 pid：只有文件稳定存在够久才回收
-          stale = observed.stableSame && observed.fileAgeMs > LOCK_EMPTY_GRACE_MS;
+          // pid<=0 只可能来自 released 兜底标记或损坏内容，绝不可能是活持有者；
+          // 内容稳定（两次读取一致）即可立即回收，不再等 5s 空文件宽限。
+          stale = observed.stableSame;
         } else if (!pidAlive(pid)) {
           stale = true; // 持有者已退出（含 SIGKILL）
         } else if (observed.ageMs > LOCK_HARD_TTL_MS) {
@@ -242,6 +249,7 @@ function withHomeLock(home, fn, options = {}) {
         const stillStale = !moved
           ? true
           : !Number.isFinite(Number(moved.pid)) ||
+            Number(moved.pid) <= 0 ||
             !pidAlive(Number(moved.pid)) ||
             Date.now() - Number(moved.at || 0) > LOCK_HARD_TTL_MS;
         if (!matchesObserved || !stillStale) {

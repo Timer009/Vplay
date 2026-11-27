@@ -1,8 +1,18 @@
-# 可信实验环境（B12 准备件）
+# 可信实验环境（B12 准备件 / B14 加固）
 
 > 本目录只包含**可审阅**的检查/启动/停止/清理/恢复脚本与配置样例。
-> B12 **未执行**任何管理员操作、账号创建、ACL/防火墙修改、系统组件安装或 Serve/Funnel。
+> B12/B14 **未执行**任何管理员操作、账号创建、ACL/防火墙修改、系统组件安装或 Serve/Funnel。
 > 当前隔离状态：**NOT_IMPLEMENTED**（见 `docs/TRUST-BOUNDARY-B11.md`）。
+
+## B14 变更（C13 L-1/L-2）
+
+- `cleanup-lab.ps1` 只允许清理 `lab-config.json` 中**精确声明的 `labRoot`**；必须存在
+  `.vplay-lab-marker`（由 `start-lab.ps1` 创建，含 schemaVersion/labRoot），路径会规范化；
+  根目录、父目录链或实验树内出现任何重解析点（symlink/junction）一律拒绝。
+  默认 DryRun，`-Approve` 才删除。
+- `lab-config.example.json` 的 `publicMode` 改为 `false`，与 `start-lab.ps1`
+  （`VPLAY_PUBLIC_MODE=0`）一致；不再提供无法启动的配置样例。
+- 未创建真实 lab、未执行真实清理；负对照只用 G 盘临时虚拟目录验证。
 
 ## 文件
 
@@ -39,3 +49,26 @@
 5) 负对照：模型进程不可读 EVIDENCE_HMAC_KEY、不可写 evidence、不可访问正式工程
 6) 任一失败 → stop-lab.ps1 / cleanup-lab.ps1，并标记 NOT_IMPLEMENTED
 ```
+
+## 最小隔离实施方案（B14 提案，未执行）
+
+阶段 0（当前，零系统改动）：仅回环、无真实模型、无 Serve/Funnel；证据用 HMAC 链 +
+外部保存的 anchor 副本证明未被改写；隔离状态保持 `NOT_IMPLEMENTED`。
+
+阶段 1（需管理员）：创建标准本地用户 `vplay-lab`（不加 Administrators/Remote Desktop Users）；
+实验根放在仓库之外（例如 `C:\vplay-lab`）；ACL 只授予该用户 lab 根，拒绝读取正式工程与
+操作员目录；`cleanup-lab.ps1` 已按精确 `labRoot` + marker + 重解析点拒绝执行。
+
+阶段 2（进程与凭据）：整个 lab 以 `vplay-lab` 启动；`EVIDENCE_HMAC_KEY` 只在 lab 会话内
+一次性注入并在启动后移除；操作员账号不设置该 key；`node` 使用绝对路径 + 版本断言；
+PID 文件记录 `{pid, startedAt, exePath}`，停止时校验后再 `taskkill /T`；
+进程约束使用 Job Object kill-on-close、单任务墙钟上限、并发 1、`REMOTE_AUTORUN=0`。
+
+阶段 3（网络）：优先把模型调用放到另一台机器/Windows Sandbox/VM（NAT 仅放行模型端点），
+本机 lab 保持离线；若必须本机联网，只能经本地审计代理并记录目的域名/IP，
+在报告中继续标注「出站隔离 NOT_IMPLEMENTED」，不得声称已隔离。
+
+阶段 4（证据）：证据目录由 lab 身份可写，封存副本写到操作员目录并对 lab 身份拒绝写入；
+运行结束生成递归哈希清单 + `events.verify()`（持 key）+ anchor 副本 + seal.json 签名；
+负对照至少各一条：lab 身份读正式工程被拒、写封存目录被拒、读操作员目录被拒、
+`whoami /groups` 不含 S-1-5-32-544。

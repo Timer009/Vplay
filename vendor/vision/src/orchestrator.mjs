@@ -3,7 +3,7 @@ import { selectDefect } from './patch/defect.mjs';
 import { validatePatchPlan, materializePatch } from './patch/validator.mjs';
 import { VisionError, ERROR_CATEGORIES } from './errors.mjs';
 import { redactSource, redactObject } from './redaction.mjs';
-import { compareVerification } from './verification/compare.mjs';
+import { compareVerification, defectKeyOf } from './verification/compare.mjs';
 
 function captureArtifacts(capture) {
   return (capture?.screenshots || []).map((shot) => ({
@@ -73,6 +73,8 @@ export async function runVisionTask({
   maxRepairRounds = 2,
   minConfidence = 0.5,
   verificationPolicy = 'after-only',
+  defectAssertionIds = [],
+  defectKey = null,
   context = '',
   userPrompt = '',
   outDir,
@@ -82,8 +84,11 @@ export async function runVisionTask({
   if (!outDir) throw new Error('runVisionTask requires outDir');
   if (!browserRunner || !gateway) throw new Error('browserRunner and gateway are required');
   if (!['analyze', 'repair'].includes(mode)) throw new Error(`unknown vision mode: ${mode}`);
-  if (!['after-only', 'confirmed'].includes(verificationPolicy)) {
+  if (!['after-only', 'confirmed', 'strict-repair'].includes(verificationPolicy)) {
     throw new Error(`unknown verificationPolicy: ${verificationPolicy}`);
+  }
+  if (!Array.isArray(defectAssertionIds) || defectAssertionIds.some((id) => typeof id !== 'string' || !id.trim())) {
+    throw new Error('defectAssertionIds must be an array of non-empty strings');
   }
   if (mode === 'repair' && !host) throw new Error('repair mode requires host hooks');
   const sink = events || createEventSink({ taskId, projectId });
@@ -272,10 +277,40 @@ export async function runVisionTask({
         sink.emit(EVENT_TYPES.DIFF_COMPLETED, { round, diff: { counts: diff?.counts || null, files: diff?.files?.length ?? null } });
       }
       const changes = totalChanges(diff);
-      const comparison = compareVerification({ before: baseline, after, defect });
-      const verified = after.ok
-        && (changes === null || changes > 0)
-        && (verificationPolicy === 'confirmed' ? comparison.ok : true);
+      // Stable defect key: host may supply one; otherwise derived semantically.
+      const defectContext = defect
+        ? { ...defect, defectKey: defectKey || defectKeyOf(defect) }
+        : defect;
+      const comparison = compareVerification({
+        before: baseline,
+        after,
+        defect: defectContext,
+        defectAssertionIds,
+      });
+      const baseVerified = after.ok && (changes === null || changes > 0);
+      const gateRequired = verificationPolicy !== 'after-only';
+      const confirmedGate = Boolean(comparison.ok && comparison.defect?.ok);
+      const strictGate = Boolean(confirmedGate && comparison.newFailures.length === 0);
+      const gateOk = verificationPolicy === 'strict-repair'
+        ? strictGate
+        : (verificationPolicy === 'confirmed' ? confirmedGate : true);
+      const verified = baseVerified && gateOk;
+      const gateReason = !gateOk
+        ? (comparison.defect?.reason
+          || (verificationPolicy === 'strict-repair' && comparison.newFailures.length ? 'new-failures'
+            : 'comparison-gate-failed'))
+        : null;
+      const strictVerification = {
+        ok: Boolean(baseVerified && gateOk),
+        policy: verificationPolicy,
+        reason: !baseVerified ? 'after-failed-or-no-change' : gateReason,
+        defect: comparison.defect,
+        defectKey: comparison.defectKey,
+        missingAssertions: comparison.missingAssertions,
+        newFailures: comparison.newFailures.map((item) => item.id),
+        newCriticalFailures: comparison.newCriticalFailures.map((item) => item.id),
+        resolvedCriticalFailures: comparison.resolvedCriticalFailures.map((item) => item.id),
+      };
       sink.emit(EVENT_TYPES.VERIFICATION_COMPLETED, {
         round,
         verified,
@@ -288,18 +323,61 @@ export async function runVisionTask({
           screenshotsChanged: comparison.screenshotsChanged,
           newCriticalFailures: comparison.newCriticalFailures.map((item) => item.id),
           resolvedCriticalFailures: comparison.resolvedCriticalFailures.map((item) => item.id),
+          missingAssertions: comparison.missingAssertions,
+          defect: comparison.defect,
+          defectKey: comparison.defectKey,
         },
+        strictVerification,
         assertions: assertionSummary(after),
       }, captureArtifacts(after));
+
+      // A patch that passes generic assertions but fails the confirmed/strict
+      // gate must not be published or retried as a "fix"; roll back now.
+      if (!verified && gateRequired && baseVerified) {
+        await host.rollback(snapshot.seq);
+        pendingSnapshot = null;
+        sink.emit(EVENT_TYPES.ROLLBACK_COMPLETED, {
+          round,
+          seq: snapshot.seq,
+          reason: strictVerification.reason,
+        });
+        sink.emit(EVENT_TYPES.TASK_FAILED, {
+          stage: 'verification',
+          status: 'repair_unconfirmed',
+          reason: strictVerification.reason,
+        });
+        return {
+          ...baseResult,
+          ok: false,
+          status: 'repair_unconfirmed',
+          report: analysis.report,
+          analysis: analysis.meta,
+          defect: defectContext,
+          patch: patch.plan,
+          patchMeta: patch.meta,
+          validation: { ok: false, reason: strictVerification.reason },
+          materialized: materialized.files.map((file) => ({ file: file.file, bytes: file.bytes, sha256After: file.sha256After })),
+          snapshot,
+          rollback: { ok: true, seq: snapshot.seq },
+          diff,
+          comparison,
+          strictVerification,
+          verificationPolicy,
+          before,
+          after,
+          budget: gateway.summary(),
+          durationMs: Date.now() - started,
+        };
+      }
 
       if (verified) {
         const result = {
           ...baseResult,
           ok: true,
-          status: 'repaired',
+          status: verificationPolicy === 'after-only' ? 'repaired' : 'repair_verified',
           report: analysis.report,
           analysis: analysis.meta,
-          defect,
+          defect: defectContext,
           patch: patch.plan,
           patchMeta: patch.meta,
           validation: { ok: true, operations: validation.operations.length, files: [...new Set(validation.operations.map((item) => item.file))] },
@@ -307,6 +385,7 @@ export async function runVisionTask({
           snapshot,
           diff,
           comparison,
+          strictVerification,
           verificationPolicy,
           before,
           after,
