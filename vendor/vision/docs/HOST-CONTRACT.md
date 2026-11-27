@@ -113,3 +113,48 @@ if (!rollback.verified || !rollback.previewReady)
 - Vision patches: `.html/.htm/.css` only; safe UI tags/attrs; no script/JS/URL/frames/forms; no new files.
 - Full Agent source development (new game logic, arbitrary JS) uses the normal Vplay Agent/edit path with its own approval/policy; it must **not** reuse or loosen Vision's allowlist.
 - Do not pass `allowedFiles` containing `.js`/`.mjs`/`.cjs` to Vision. If a task requires JS, it is not a Vision repair task.
+
+## 8. 0.2.1 additions — applyFiles second argument
+
+`runVisionTask` now calls:
+
+```js
+await host.applyFiles(materialized.files, { operations, plan, round });
+```
+
+- `materialized.files`: `[{ file, content, sha256Before, sha256After }]`
+- `operations`: exact `{ file, start, end, oldString, newString }` from
+  `validatePatchPlan`; needed for digest-bound delta scanning
+- one-argument hosts keep working; use the second argument for `applyDelta`
+
+## 9. 0.2.1 additions — preview auth
+
+`createBrowserRunner({ previewAuth })` / `runCapture({ previewAuth })` injects
+one in-memory cookie scoped to the preview origin+path (see `PREVIEW-AUTH.md`).
+
+- pass `PREVIEW_ACCESS_HASH`, never the raw key;
+- never persist/log/echo it; results only expose `{cookieName, path, injected}`;
+- cross-origin requests are aborted, and allowed extra origins get no cookie;
+- auth failure must happen before analysis/snapshot/write.
+
+## 10. 0.2.1 additions — delta validation + digest binding
+
+Host policy should not scan a whole file for a Vision patch, and must not skip
+scanning. Use `describeDelta` (Vision) + a host `applyDelta` that:
+
+1. re-checks path/allowlist/extension;
+2. verifies `sha256Before` and each operation against the current file, and the
+   materialized `sha256After`;
+3. scans every new fragment **and** line-expanded windows with the host rules;
+4. writes atomically (fsync+rename), verifies the digest, journals
+   `applying`→`verified`.
+
+Reference: `docs/DELTA-CONTRACT.md`, E07 `host/vision-policy-delta.cjs`.
+
+## 11. 0.2.1 additions — verification comparison
+
+`runVisionTask({ verificationPolicy: 'confirmed' })` additionally requires
+`compareVerification().ok`: after passes, no new critical failures, and evidence
+of change. The full `comparison` object is returned and emitted. `after-only`
+remains the default for compatibility; new hosts should use `confirmed` plus a
+defect-specific predicate. See `docs/VERIFY-SEMANTICS.md`.

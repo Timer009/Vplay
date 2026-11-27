@@ -68,9 +68,17 @@ async function main() {
   if (scope === 'device') {
     const devices = createDeviceStore({ file: path.join(home, 'devices.json') });
     if (action === 'add') {
+      const projects = flag(argv, 'projects');
+      if (!projects) {
+        throw new ProjectError(
+          'device add 需要 --projects=<id,...>（显式 "*" 才允许全部项目）',
+          400,
+          'DEVICE_PROJECTS_REQUIRED',
+        );
+      }
       const created = devices.createDevice({
         name: flag(argv, 'name') || target || 'device',
-        projects: flag(argv, 'projects') || '*',
+        projects,
       });
       print({ ok: true, device: created.device, token: created.token });
       return;

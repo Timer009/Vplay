@@ -17,6 +17,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { recordBody } = require('./events.cjs');
 
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
@@ -188,15 +189,7 @@ function createEvidenceStore(options = {}) {
           reasons.push('EVENT_PARSE');
           break;
         }
-        const body = JSON.stringify({
-          id: record.id,
-          type: record.type,
-          taskId: record.taskId,
-          projectId: record.projectId,
-          status: record.status,
-          at: record.at,
-          data: record.data,
-        });
+        const body = recordBody(record);
         if (record.prevHash !== prev) {
           reasons.push('EVENT_CHAIN_BROKEN');
           break;

@@ -7,6 +7,7 @@ import { sanitizeBrowserEnv } from './env.mjs';
 import { elementState, hitTest, clickAndWait, readText } from '../verification/assertions.mjs';
 import { installNetworkGuard } from './guard.mjs';
 import { VisionError, ERROR_CATEGORIES } from '../errors.mjs';
+import { redactObject } from '../redaction.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -37,6 +38,73 @@ function safeName(value) {
   return String(value).replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 80);
 }
 
+const COOKIE_NAME = /^[A-Za-z0-9_]+$/;
+const COOKIE_VALUE = /^[^\s;,\u0000-\u001f\u007f]+$/;
+
+/**
+ * Minimal-privilege preview authentication (E07).
+ *
+ * The caller passes a single cookie value in memory (normally the preview
+ * access hash, never the raw key). It is scoped to the preview origin and the
+ * preview path, never exposed as an option to Playwright `storageState` files,
+ * never written to disk, and never included in results/errors/logs.
+ */
+export function normalizePreviewAuth(previewAuth, previewUrl) {
+  if (!previewAuth) return null;
+  let parsed;
+  try {
+    parsed = new URL(String(previewUrl));
+  } catch {
+    throw new VisionError('previewUrl must be a valid http(s) URL for preview auth', {
+      category: ERROR_CATEGORIES.CONFIG,
+      code: 'INVALID_PREVIEW_URL',
+    });
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new VisionError('preview auth requires an http(s) preview origin', {
+      category: ERROR_CATEGORIES.CONFIG,
+      code: 'INVALID_PREVIEW_URL',
+    });
+  }
+  const name = String(previewAuth.name || 'vplay_preview');
+  if (!COOKIE_NAME.test(name)) {
+    throw new VisionError('preview auth cookie name is invalid', {
+      category: ERROR_CATEGORIES.CONFIG,
+      code: 'PREVIEW_AUTH_INVALID',
+    });
+  }
+  const value = String(previewAuth.value ?? '');
+  if (!value || !COOKIE_VALUE.test(value)) {
+    // Deliberately never echo the value.
+    throw new VisionError('preview auth cookie value is missing or contains invalid characters', {
+      category: ERROR_CATEGORIES.CONFIG,
+      code: 'PREVIEW_AUTH_INVALID',
+    });
+  }
+  const scope = String(previewAuth.path || parsed.pathname || '/');
+  if (!scope.startsWith('/') || scope.includes('..') || scope.includes('\\')) {
+    throw new VisionError('preview auth path must be an absolute preview path without dot segments', {
+      category: ERROR_CATEGORIES.CONFIG,
+      code: 'PREVIEW_AUTH_INVALID',
+    });
+  }
+  const path = scope.endsWith('/') ? scope : `${scope}/`;
+  return {
+    name,
+    value,
+    // `url` scopes the cookie to this exact origin + path; no domain wildcard.
+    url: `${parsed.origin}${path}`,
+    sameSite: 'Strict',
+    httpOnly: true,
+    secure: parsed.protocol === 'https:',
+    path,
+  };
+}
+
+function redactCapture(value) {
+  return redactObject(value);
+}
+
 /**
  * Create a browser runner. The caller supplies a URL (Vplay's preview server),
  * an adapter, and an output directory. No static/project server is created here.
@@ -50,7 +118,7 @@ export function createBrowserRunner({
   launchArgs = [],
   env = process.env,
   timeoutMs = 30000,
-  cookies = [],
+  previewAuth = null,
 } = {}) {
   const resolved = executablePath || findBrowserExecutable({ env });
   if (!resolved) {
@@ -60,7 +128,7 @@ export function createBrowserRunner({
     );
   }
 
-  async function runCapture({ url, adapter, scenario = 'default', outDir, captureId = '', allowedExtraOrigins = [] }) {
+  async function runCapture({ url, adapter, scenario = 'default', outDir, captureId = '', allowedExtraOrigins = [], previewAuth: perCaptureAuth = null }) {
     if (!url) throw new Error('runCapture requires url');
     if (!adapter || !Array.isArray(adapter.viewports) || !adapter.viewports.length) {
       throw new Error('adapter.viewports is required');
@@ -68,6 +136,8 @@ export function createBrowserRunner({
     if (typeof adapter.ready !== 'function' || typeof adapter.assert !== 'function') {
       throw new Error('adapter.ready and adapter.assert are required');
     }
+    // Resolve once; the raw value never leaves this closure.
+    const auth = normalizePreviewAuth(perCaptureAuth || previewAuth, url);
     const { chromium } = loadPlaywrightCore();
     const started = Date.now();
     const browserEnv = sanitizeBrowserEnv(env);
@@ -86,9 +156,16 @@ export function createBrowserRunner({
           serviceWorkers: 'block',
           acceptDownloads: false,
         });
-        // B10 / E06 B2：短期预览票据只注入浏览器内存上下文，不落盘、不进入页面文本。
-        if (Array.isArray(cookies) && cookies.length) {
-          await context.addCookies(cookies);
+        if (auth) {
+          // In-memory, host+path scoped cookie; no storageState file.
+          await context.addCookies([{
+            name: auth.name,
+            value: auth.value,
+            url: auth.url,
+            sameSite: auth.sameSite,
+            httpOnly: auth.httpOnly,
+            secure: auth.secure,
+          }]);
         }
         const guard = await installNetworkGuard({ context, previewUrl: url, allowedExtraOrigins });
         const page = await context.newPage();
@@ -170,10 +247,17 @@ export function createBrowserRunner({
           screenshot,
           bytes: buffer.length,
           sha256: crypto.createHash('sha256').update(buffer).digest('hex'),
-          assertions,
-          diagnostics,
-          network,
-          redaction: { selectors: redaction.selectors || [], regions: redaction.regions || [], maskedSelectors: masks.length },
+          // Redact diagnostics/URLs: console errors and blocked URLs can carry
+          // secrets or preview cookies and must not reach evidence files.
+          assertions: redactCapture(assertions),
+          diagnostics: redactCapture(diagnostics),
+          network: redactCapture(network),
+          redaction: {
+            selectors: redaction.selectors || [],
+            regions: redaction.regions || [],
+            maskedSelectors: masks.length,
+            previewAuth: auth ? { cookieName: auth.name, path: auth.path, injected: true } : null,
+          },
           ok: criticalFailures.length === 0 && diagnostics.pageErrors.length === 0,
           durationMs: Date.now() - viewportStarted,
         });
@@ -195,6 +279,7 @@ export function createBrowserRunner({
         executablePath: resolved,
         durationMs: Date.now() - started,
         browserEnvKeys: Object.keys(browserEnv).sort(),
+        previewAuth: auth ? { cookieName: auth.name, path: auth.path, injected: true } : null,
       };
     } finally {
       await browser.close().catch(() => {});

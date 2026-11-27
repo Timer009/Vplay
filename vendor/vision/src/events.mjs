@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { redactObject } from './redaction.mjs';
 
 export const EVENT_TYPES = Object.freeze({
   TASK_STARTED: 'vision.task.started',
@@ -18,20 +19,24 @@ export const EVENT_TYPES = Object.freeze({
   TASK_FAILED: 'vision.task.failed',
 });
 
-const SECRET_KEY = /^(api[_-]?key|authorization|token|secret|password|credential|headers)$/i;
-const SECRET_VALUE = /\bsk-[A-Za-z0-9._-]{20,}\b/g;
+const SECRET_KEY = /^(api[_-]?key|authorization|cookie|set-cookie|token|secret|password|credential|headers)$/i;
 
+/**
+ * Event payload redaction (E07).
+ *
+ * 0.2.0 only replaced `sk-*` and secret-named keys; free text such as
+ * `password = "..."` or a `Set-Cookie` header survived into JSONL/SSE.
+ * 0.2.1 runs the full redaction rule set on every string value.
+ */
 export function redact(value) {
-  if (typeof value === 'string') return value.replace(SECRET_VALUE, '<redacted>');
-  if (Array.isArray(value)) return value.map(redact);
-  if (value && typeof value === 'object') {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
     const out = {};
     for (const [key, item] of Object.entries(value)) {
       out[key] = SECRET_KEY.test(key) ? '<redacted>' : redact(item);
     }
     return out;
   }
-  return value;
+  return redactObject(value);
 }
 
 /**

@@ -15,8 +15,8 @@
 const fs = require('fs');
 const path = require('path');
 
-const DEFAULT_VERIFY_RUN =
-  'G:\\AI_GAME\\VPLAY-SECURITY-C08\\evidence\\verify-run.cjs';
+// B11：默认加载仓库内 vendored 校验器，保证可移植；可用 QODER_VERIFY_RUN 覆盖。
+const DEFAULT_VERIFY_RUN = path.join(__dirname, '..', 'tools', 'qoder', 'verify-run.cjs');
 
 function resolveVerifyRun() {
   return process.env.QODER_VERIFY_RUN || DEFAULT_VERIFY_RUN;

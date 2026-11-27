@@ -128,7 +128,9 @@ function appendChain(records, state, entry) {
 }
 
 async function runRecorder(afterDir, pkgDir) {
-  const recorder = path.join(path.dirname(path.dirname(resolveVerifyRun())), 'recorder', 'host-recorder.cjs');
+  const recorder =
+    process.env.QODER_RECORDER ||
+    path.join(__dirname, '..', 'tools', 'qoder', 'recorder', 'host-recorder.cjs');
   if (!fs.existsSync(recorder)) return false;
   await new Promise((resolve) => {
     const child = spawn(

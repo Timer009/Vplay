@@ -325,3 +325,66 @@ export function materializePatch({ operations, files }) {
   }
   return { files: result };
 }
+
+/**
+ * E07: describe the exact changed hunks for host-side delta scanning.
+ *
+ * The host must not scan a full file with a keyword blacklist (it rejects
+ * legitimate inline scripts), and must not skip scanning either. This helper
+ * returns:
+ *   - sha256Before / sha256After per file (digest binding),
+ *   - the exact old/new fragments and offsets of every operation,
+ *   - the fully materialized `after` content (self-checked).
+ *
+ * The host verifies the file on disk still matches `sha256Before`, then scans
+ * the changed fragments (plus their surrounding lines) before writing.
+ */
+export function describeDelta({ operations, files, materialized = null }) {
+  const expected = new Map();
+  if (Array.isArray(materialized)) {
+    for (const item of materialized) expected.set(item.file, item);
+  }
+  const byFile = new Map();
+  for (const operation of operations) {
+    const list = byFile.get(operation.absolute) || [];
+    list.push(operation);
+    byFile.set(operation.absolute, list);
+  }
+  const result = [];
+  for (const [absolute, list] of byFile) {
+    const source = files[absolute]?.content;
+    if (typeof source !== 'string') throw new Error(`missing source content for ${absolute}`);
+    const sha256Before = hashContent(source);
+    let content = source;
+    for (const operation of [...list].sort((a, b) => b.start - a.start)) {
+      if (content.slice(operation.start, operation.end) !== operation.oldString) {
+        throw new Error(`source changed under patch: ${operation.file}`);
+      }
+      content = content.slice(0, operation.start) + operation.newString + content.slice(operation.end);
+    }
+    const sha256After = hashContent(content);
+    const item = expected.get(list[0].file);
+    if (item && (item.sha256After !== sha256After || item.sha256Before !== sha256Before)) {
+      throw new Error(`materialized digest mismatch: ${list[0].file}`);
+    }
+    result.push({
+      file: list[0].file,
+      absolute,
+      sha256Before,
+      sha256After,
+      bytes: Buffer.byteLength(content),
+      hunks: list
+        .map((operation) => ({
+          start: operation.start,
+          end: operation.end,
+          before: operation.oldString,
+          after: operation.newString,
+          reason: operation.reason || '',
+        }))
+        .sort((a, b) => a.start - b.start),
+      content,
+      after: content,
+    });
+  }
+  return { files: result };
+}

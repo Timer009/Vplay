@@ -18,6 +18,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const { resolveStaticFile } = require('./paths.cjs');
 
@@ -229,6 +230,26 @@ function createPreviewServer(options) {
         if (error) {
           sendJson(res, 404, { ok: false, error: 'not found' });
           return;
+        }
+        // B11 / C10 N-15：非入口资源也必须与发布 manifest 一致，防止篡改后仍 200
+        const manifest = typeof projects.previewManifest === 'function'
+          ? projects.previewManifest(projectId)
+          : null;
+        if (manifest) {
+          const rel = path
+            .relative(projects.previewDir(projectId), resolved.file)
+            .split(path.sep)
+            .join('/');
+          const expected = manifest.files[rel];
+          if (!expected) {
+            sendJson(res, 404, { ok: false, error: 'resource is not in the published manifest' });
+            return;
+          }
+          const actual = crypto.createHash('sha256').update(data).digest('hex');
+          if (actual !== expected) {
+            sendJson(res, 503, { ok: false, error: 'preview integrity check failed' });
+            return;
+          }
         }
         const ext = path.extname(resolved.file).toLowerCase();
         res.writeHead(200, previewHeaders(ext, data.length));

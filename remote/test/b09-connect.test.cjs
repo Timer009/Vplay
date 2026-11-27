@@ -356,7 +356,20 @@ function makeFakeVision() {
         const snapshot = await host.snapshot('pre-vision-fake');
         await host.applyFiles([{ file: 'index.html', content: '<style>:root{--bg:#222222}</style><h1>fixed</h1>' }]);
         const diff = await host.diff(snapshot.seq);
-        return { ok: true, status: 'repaired', validation: { ok: true }, diff };
+        return {
+          ok: true,
+          status: 'repaired',
+          validation: { ok: true },
+          comparison: {
+            ok: true,
+            beforeOk: false,
+            afterOk: true,
+            resolvedCriticalFailures: [{ id: 'hud-visible' }],
+            newCriticalFailures: [],
+            screenshotsChanged: true,
+          },
+          diff,
+        };
       }
       return { ok: true, status: 'analyzed', before: { ok: true, screenshots: [] } };
     },

@@ -1,24 +1,25 @@
-# Vendored `@vplay/vision` 0.2.0 — 宿主补丁说明（B10）
+# Vendored `@vplay/vision` — 版本与宿主说明
 
-- 交付包：`vplay-vision-0.2.0.tgz`
-- SHA256：`96795b68b38355b4ad6f05c3af2e802c673bd810093ff3683a3fc661da355ca7`
-- 上游源码包：`d7c01ab9d9e979ddeedc2c4b0ae5ad415d55d4d96959cf987192ce2021f40470`
+## 当前使用版本：0.2.1（B11）
 
-## 唯一补丁
+| 交付物                                   | SHA256                                                             |
+| ---------------------------------------- | ------------------------------------------------------------------ |
+| `vplay-vision-0.2.1.tgz`                 | `d463ba3fdb40883bf19f3c406122546fffe73b19427b3a2e8ba227f6415499d4` |
+| `vplay-vision-0.2.1-source.tgz`          | `302659f52fc0b2ec813365d63c8bd68c4add8dd19a33729cf56352837a889dcd` |
+| `vplay-vision-0.2.0.tgz`（历史，仅溯源） | `96795b68b38355b4ad6f05c3af2e802c673bd810093ff3683a3fc661da355ca7` |
 
-文件：`src/browser/runner.mjs`
+来源：ZCode E07 候选包（`G:\AI_GAME\Vplay-Vision-POC\e07\dist\`）。
 
-- `createBrowserRunner({ ..., cookies = [] })`
-- `browser.newContext(...)` 之后：`if (cookies.length) await context.addCookies(cookies)`
+## B11 采用方式
 
-原因（E06 §9 B2）：受保护预览（`PREVIEW_ACCESS_KEY`）下，Vision 截图需要把短期票据注入
-独立浏览器 context；0.2.0 公开 API 没有 Cookie 注入点，导致 capture 全部 401。
+- `src/` 直接使用 0.2.1 上游源码，**不再打宿主补丁**；
+- B10 对 0.2.0 的本地 `cookies` 补丁已删除：0.2.1 原生提供
+  `createBrowserRunner({ previewAuth })`（单 Cookie、origin+path 作用域、值不回显）；
+- 宿主继续保留自己的能力：短期可吊销预览票据、项目锁、全工程 hashTree、
+  快照/回退、evidence、journal 复核；
+- 未把短期票据退回静态全局 hash；未引入客户端跳过校验的参数。
 
-约束：
+## 与上游的差异
 
-- Cookie 只存在于宿主内存与本进程浏览器 context，**不落盘、不进入截图、不进入模型上下文**；
-- 票据由宿主 `previewTicketProvider` 生成，5 分钟最小权限，任务结束即失效；
-- 未修改 Vision 的补丁白名单、网络守卫、脱敏或模型契约。
-
-> 该补丁只作用于本仓库 vendored 副本；上游包哈希不变，升级 0.2.1 时应移除本补丁并以
-> 上游 `cookies/storageState` 能力替代。
+无源码差异。`vendor/vision/src` 与 0.2.1 候选包 `src/` 逐文件一致。
+若未来需要宿主补丁，必须在本文件记录并同时更新 `SHA256SUMS` 与报告。

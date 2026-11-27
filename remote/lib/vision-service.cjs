@@ -23,7 +23,13 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { pathToFileURL } = require('url');
-const { applyPatchAtomically, isAllowedBrowserUrl } = require('./vision-policy.cjs');
+const {
+  applyPatchAtomically,
+  isAllowedBrowserUrl,
+  assertSafeRelPath,
+} = require('./vision-policy.cjs');
+const visionPolicy = require('./vision-policy.cjs');
+const { createDeltaPolicy } = require('./vision-policy-delta.cjs');
 const { hashTree, compareManifests, sha256File } = require('./paths.cjs');
 
 const VENDOR_ENTRY = path.join(__dirname, '..', '..', 'vendor', 'vision', 'src', 'index.mjs');
@@ -55,6 +61,7 @@ function createVisionService(options = {}) {
   const home = options.home;
   const eventStore = options.eventStore || null;
   const deps = options.deps || {};
+  const deltaPolicy = createDeltaPolicy({ policy: visionPolicy, contextLines: 2 });
 
   async function loadVision() {
     if (deps.vision) return deps.vision;
@@ -113,18 +120,49 @@ function createVisionService(options = {}) {
     return url;
   }
 
-  /** 预览鉴权票据只存在宿主内存，注入浏览器 context 的 Cookie，不写盘。 */
-  function previewCookies(previewUrl, ticket) {
-    if (!ticket || !ticket.name || !ticket.value) return [];
-    return [
-      {
-        name: String(ticket.name),
-        value: String(ticket.value),
-        url: `${new URL(previewUrl).origin}/`,
-        httpOnly: true,
-        sameSite: 'Strict',
-      },
-    ];
+  /** 预览鉴权票据只存在宿主内存，按 0.2.1 `previewAuth` 注入独立 context。 */
+  function previewAuthOf(projectId, ticket) {
+    if (!ticket || !ticket.value) return null;
+    return {
+      name: ticket.name || 'vplay_preview',
+      value: String(ticket.value),
+      // 项目级路径：只把票据发往本项目的预览前缀，不做全局 Path=/
+      path: `/p/${projectId}/`,
+    };
+  }
+
+  /**
+   * B11：修复成功的宿主硬门禁。
+   * 仅「截图变化」不算修复：必须有缺陷专属功能断言被解决
+   * （resolvedCriticalFailures>0，或修复前有 critical 失败且修复后通过），
+   * 且不能引入新的 critical 失败。
+   */
+  function strictRepairVerification(result) {
+    const comparison = result && result.comparison;
+    if (!comparison || typeof comparison !== 'object') {
+      return { ok: false, reason: 'comparison-missing', resolvedCritical: 0 };
+    }
+    const resolved = Array.isArray(comparison.resolvedCriticalFailures)
+      ? comparison.resolvedCriticalFailures
+      : [];
+    const newCritical = Array.isArray(comparison.newCriticalFailures)
+      ? comparison.newCriticalFailures
+      : [];
+    const beforeOk = comparison.beforeOk !== false;
+    const afterOk = comparison.afterOk !== false && result.ok !== false;
+    const defectAssertionResolved = resolved.length > 0 || (beforeOk === false && afterOk === true);
+    const ok = Boolean(
+      comparison.ok && afterOk && newCritical.length === 0 && defectAssertionResolved,
+    );
+    return {
+      ok,
+      reason: ok ? null : 'no-defect-specific-assertion',
+      resolvedCritical: resolved.length,
+      newCritical: newCritical.length,
+      beforeOk: comparison.beforeOk,
+      afterOk: comparison.afterOk,
+      screenshotsChanged: Boolean(comparison.screenshotsChanged),
+    };
   }
 
   function captureSummary(capture) {
@@ -197,13 +235,27 @@ function createVisionService(options = {}) {
 
     const vision = await loadVision();
     const project = registry.get(projectId);
-    const allowedFiles = (requestedFiles && requestedFiles.length
+    const requested = (requestedFiles && requestedFiles.length
       ? requestedFiles
       : [project.entry && SAFE_FILE.test(project.entry) ? project.entry : 'index.html']
-    ).map(normalizeRel);
+    )
+      .map(normalizeRel)
+      .slice(0, 5);
 
-    if (!allowedFiles.length || !allowedFiles.every(isSafeAllowedFile)) {
-      const error = new Error('Vision 只允许修复 HTML/CSS 文件，拒绝 JS/其他类型');
+    // C10-05：宿主独立路径归一化 + 边界/链接校验，sourceProvider 绝不直接 join 用户输入
+    const allowedFiles = [];
+    for (const rel of requested) {
+      if (!isSafeAllowedFile(rel)) {
+        const error = new Error('Vision 只允许修复 HTML/CSS 文件，拒绝 JS/其他类型');
+        error.code = 'VISION_FILE_NOT_ALLOWED';
+        throw error;
+      }
+      if (!rel || allowedFiles.includes(rel)) continue;
+      assertSafeRelPath(project.srcDir, rel);
+      allowedFiles.push(rel);
+    }
+    if (allowedFiles.length === 0) {
+      const error = new Error('Vision allowedFiles 为空');
       error.code = 'VISION_FILE_NOT_ALLOWED';
       throw error;
     }
@@ -246,14 +298,14 @@ function createVisionService(options = {}) {
       const ticket = deps.previewTicketProvider
         ? deps.previewTicketProvider({ projectId, taskId })
         : null;
-      const cookies = previewCookies(previewUrl, ticket);
+      const previewAuth = previewAuthOf(projectId, ticket);
 
       const browserRunner =
         deps.browserRunner ||
         vision.createBrowserRunner({
           executablePath: process.env.VPLAY_BROWSER_EXECUTABLE || null,
           headless: process.env.VPLAY_BROWSER_HEADLESS !== 'false',
-          cookies,
+          ...(previewAuth ? { previewAuth } : {}),
         });
       const adapter = deps.adapter || vision.createSpacerAdapter();
       const maskSelectors = String(process.env.VPLAY_VISION_MASK_SELECTORS || '')
@@ -330,6 +382,7 @@ function createVisionService(options = {}) {
         gateway,
         events,
         mode: mode === 'repair' ? 'repair' : 'analyze',
+        verificationPolicy: 'confirmed',
         scenario,
         allowedFiles,
         sourceProvider: async () => {
@@ -339,7 +392,7 @@ function createVisionService(options = {}) {
         },
         host: {
           snapshot: (label) => registry.snapshot(projectId, label),
-          applyFiles: async (files) => {
+          applyFiles: async (files, meta = {}) => {
             const normalized = (files || []).map((item) => ({
               file: normalizeRel(item.file),
               content: item.content,
@@ -352,12 +405,30 @@ function createVisionService(options = {}) {
             }
             const beforeTree = hashTree(project.srcDir);
             const journal = path.join(home, 'evidence', projectId, taskId, 'apply-journal.json');
-            const applied = applyPatchAtomically({
-              root: project.srcDir,
-              files: normalized,
-              allowedFiles,
-              journalFile: journal,
-            });
+            const operations = meta && Array.isArray(meta.operations) ? meta.operations : [];
+            let applied = null;
+            let deltaMode = false;
+            if (operations.length > 0) {
+              // 0.2.1 + E07 delta：精确 operation 重放 + 前后 digest 绑定 + 上下文窗口扫描
+              const result = deltaPolicy.applyDelta({
+                root: project.srcDir,
+                files: normalized,
+                operations,
+                allowedFiles,
+                journalFile: journal,
+                keepJournal: true,
+              });
+              applied = result.files;
+              deltaMode = true;
+            } else {
+              // 旧适配层/降级路径：B10 增量校验（仍不跳过扫描）
+              applied = applyPatchAtomically({
+                root: project.srcDir,
+                files: normalized,
+                allowedFiles,
+                journalFile: journal,
+              });
+            }
 
             // 最终文件一致性：只允许声明过的文件发生变化，且内容摘要必须匹配
             const afterTree = hashTree(project.srcDir);
@@ -382,9 +453,11 @@ function createVisionService(options = {}) {
               const build = await registry.buildProjectAsync(project);
               if (!build.ok) throw new Error(`VISION_BUILD_FAILED: ${build.command}`);
             }
-            const root = registry.buildPreview(projectId);
+            const previewRoot = registry.buildPreview(projectId);
             const check = registry.verifyPreview(projectId);
-            if (!root || !check.ok) throw new Error(`VISION_PREVIEW_STALE: ${check.reason}`);
+            if (!previewRoot || !check.ok) throw new Error(`VISION_PREVIEW_STALE: ${check.reason}`);
+            // 发布与全量校验都通过后才 finalize journal
+            if (deltaMode) deltaPolicy.finalizeApply(journal);
           },
           diff: (seq) => registry.diff(projectId, seq, 'current'),
           rollback: async (seq) => {
@@ -410,6 +483,17 @@ function createVisionService(options = {}) {
           ticket: ticket ? 'ephemeral-memory-only' : null,
         },
       });
+      report.verificationPolicy = 'confirmed';
+      if (mode === 'repair') {
+        const strict = strictRepairVerification(result);
+        report.strictVerification = strict;
+        result.strictVerification = strict;
+        if (result.ok && !strict.ok) {
+          result.ok = false;
+          result.status = 'repair_unconfirmed';
+          result.validation = { ok: false, reason: strict.reason };
+        }
+      }
       const written = writeRedactedReport(vision, report);
       emit(taskId, projectId, 'completed', {
         status: result.status || (result.ok ? 'succeeded' : 'failed'),
@@ -452,7 +536,7 @@ function recoverVisionApplies({ home, logger = () => {} } = {}) {
   walk(root, 0);
   for (const journal of journals) {
     const info = readJson(journal, null);
-    if (!info || !Array.isArray(info.files) || info.state !== 'applying') continue;
+    if (!info || !Array.isArray(info.files) || !['applying', 'verified'].includes(info.state)) continue;
     let intact = Boolean(info.root);
     for (const item of info.files) {
       if (!item.sha256After) {

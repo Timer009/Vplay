@@ -206,6 +206,7 @@ export async function postJson({
         status: response.status,
         provider,
         requestId: responseId || requestId,
+        code: 'INVALID_JSON',
         rawContent: text.slice(0, 2000),
         details: { attempt },
       });

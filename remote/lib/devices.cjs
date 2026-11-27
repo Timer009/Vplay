@@ -34,36 +34,115 @@ function createDeviceStore(options = {}) {
     fs.renameSync(tmp, file);
   }
 
+  function sleepSync(ms) {
+    const buffer = new SharedArrayBuffer(4);
+    Atomics.wait(new Int32Array(buffer), 0, 0, ms);
+  }
+
+  /** B11 / C10-06：设备存储的读-改-写互斥，避免 revoke 与 create 互相覆盖。 */
+  function withLock(fn) {
+    const lockFile = `${file}.lock`;
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      try {
+        const fd = fs.openSync(lockFile, 'wx');
+        try {
+          fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+        } finally {
+          fs.closeSync(fd);
+        }
+        break;
+      } catch (error) {
+        if (!['EEXIST', 'EPERM', 'EACCES'].includes(error.code)) throw error;
+        let info = null;
+        try {
+          info = JSON.parse(fs.readFileSync(lockFile, 'utf-8'));
+        } catch {
+          info = null;
+        }
+        let stale = false;
+        if (info) {
+          try {
+            process.kill(Number(info.pid), 0);
+            stale = Date.now() - Number(info.at || 0) > 30000;
+          } catch {
+            stale = true;
+          }
+        } else {
+          try {
+            stale = Date.now() - fs.statSync(lockFile).mtimeMs > 5000;
+          } catch {
+            stale = false;
+          }
+        }
+        if (stale) {
+          try {
+            fs.rmSync(lockFile, { force: true });
+          } catch {
+            // 忽略
+          }
+          continue;
+        }
+        if (Date.now() > deadline) {
+          const error2 = new Error('device store is busy');
+          error2.code = 'DEVICE_STORE_BUSY';
+          throw error2;
+        }
+        sleepSync(20);
+      }
+    }
+    try {
+      return fn();
+    } finally {
+      try {
+        fs.rmSync(lockFile, { force: true });
+      } catch {
+        // 忽略
+      }
+    }
+  }
+
   function tokenHash(token) {
     return crypto.createHash('sha256').update(String(token)).digest('hex');
   }
 
   function normalizeProjects(projects) {
-    if (!projects) return ['*'];
+    if (!projects) return [];
     const list = Array.isArray(projects)
       ? projects
       : String(projects)
           .split(',')
           .map((item) => item.trim())
           .filter(Boolean);
-    return list.length ? list : ['*'];
+    return [...new Set(list)];
   }
 
   function createDevice({ name, projects } = {}) {
-    const state = read();
-    const token = `vdt_${crypto.randomBytes(24).toString('base64url')}`;
-    const device = {
-      id: `dev_${crypto.randomBytes(6).toString('hex')}`,
-      name: String(name || 'device').slice(0, 60),
-      tokenHash: tokenHash(token),
-      projects: normalizeProjects(projects),
-      createdAt: new Date().toISOString(),
-      lastSeen: null,
-      revoked: false,
-    };
-    state.devices.push(device);
-    write(state);
-    return { device: { ...device, tokenHash: undefined }, token };
+    const scoped = normalizeProjects(projects);
+    // C10-09：无项目参数不再 fail-open 到全部项目；必须显式给出 '*'。
+    if (scoped.length === 0) {
+      const error = new Error(
+        'device must be scoped to at least one project (pass --projects=<id,...> or explicit "*")',
+      );
+      error.code = 'DEVICE_PROJECTS_REQUIRED';
+      throw error;
+    }
+    return withLock(() => {
+      const state = read();
+      const token = `vdt_${crypto.randomBytes(24).toString('base64url')}`;
+      const device = {
+        id: `dev_${crypto.randomBytes(6).toString('hex')}`,
+        name: String(name || 'device').slice(0, 60),
+        tokenHash: tokenHash(token),
+        projects: scoped,
+        createdAt: new Date().toISOString(),
+        lastSeen: null,
+        revoked: false,
+      };
+      state.devices.push(device);
+      write(state);
+      return { device: { ...device, tokenHash: undefined }, token };
+    });
   }
 
   function list() {
@@ -83,27 +162,28 @@ function createDeviceStore(options = {}) {
   }
 
   function revoke(id) {
-    const state = read();
-    const device = state.devices.find((item) => item.id === id);
-    if (!device) return false;
-    device.revoked = true;
-    device.revokedAt = new Date().toISOString();
-    write(state);
-    return true;
+    return withLock(() => {
+      const state = read();
+      const device = state.devices.find((item) => item.id === id);
+      if (!device) return false;
+      device.revoked = true;
+      device.revokedAt = new Date().toISOString();
+      write(state);
+      return true;
+    });
   }
 
+  /**
+   * C10-06：鉴权只读，不做整表回写。
+   * 过去每次 authenticate 都 read-modify-write lastSeen，可能把并发 revoke 的结果覆盖回
+   * `revoked:false`；现在 lastSeen 不再在鉴权路径持久化（需要时由运维/日志统计）。
+   */
   function authenticate(token) {
     if (!token || !String(token).startsWith('vdt_')) return null;
     const hash = tokenHash(token);
     const state = read();
     const device = state.devices.find((item) => !item.revoked && item.tokenHash === hash);
     if (!device) return null;
-    device.lastSeen = new Date().toISOString();
-    try {
-      write(state);
-    } catch {
-      // lastSeen 写入失败不影响鉴权
-    }
     return { id: device.id, name: device.name, projects: device.projects.slice() };
   }
 

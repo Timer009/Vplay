@@ -1,11 +1,11 @@
 # Vplay Studio · 项目状态
 
-> 最后更新：Sprint 03C（2026-11-27）｜分支 `sprint-03-connected-agent`
+> 最后更新：Sprint 03C（B11，2026-11-27）｜分支 `sprint-03-b11-candidate`
 > 已验收基线：`sprint-01-accepted` → `8058e67`（Sprint 01 真机 13/13 通过）
 > Sprint 02：`sprint-02-c05-fix` @ `fcfd880`（C06 通过，未合并 main）
 > Sprint 03A：`abc8e24`（C07 P0 安全基础）
 > Sprint 03B：`455a187`（Connect L2 候选，C09 复审提出 P0）
-> Sprint 03C：B10 收口候选（见 `VPLAY-SPRINT03-B10-REPORT.md`）
+> Sprint 03C：B10 `33523cd` → B11 候选（Vision 0.2.1 + C10 收口）
 
 ## 1. 项目定位
 
@@ -15,28 +15,32 @@ Vplay Studio 以 OpenGame（Apache-2.0，源自 gemini-cli）为内核，目标�
 
 ## 2. 当前能力
 
-| 能力                                                     | 状态                 | 证据                                            |
-| -------------------------------------------------------- | -------------------- | ----------------------------------------------- |
-| Create Mode：从零生成（模板脚手架 + post-verify）        | 可用                 | Sprint 01 报告                                  |
-| Remote：Token 鉴权、任务状态机、去重、串行、持久化       | 可用                 | 33 个 remote 测试                               |
-| 真机：iPhone Safari + OPPO Android                       | 已验收               | Sprint 01 报告第 13 节                          |
-| **Adopt Mode：导入已有工程（静态 / 子目录入口 / Vite）** | Sprint 02 新增       | `remote/lib/projects.cjs`                       |
-| **项目预览独立源（预览面 ≠ 控制面）**                    | Sprint 02 新增       | `remote/lib/preview.cjs`                        |
-| **修改前快照 / 差异 / 回退（含备份）**                   | Sprint 02 新增       | `remote/lib/projects.cjs` + 测试                |
-| **孤儿 CLI 进程收敛**                                    | Sprint 02 新增       | `cli-runner.cjs` + `leases.cjs`                 |
-| 项目记忆与连续多轮                                       | Sprint 02 新增（P1） | `memory.json` + `-c` 续接                       |
-| **SSE 任务事件流（持久化 / 补发 / 心跳 / 去重）**        | Sprint 03B 新增      | `remote/lib/events.cjs` + 测试                  |
-| **设备身份 / 项目授权 / 任务 owner 过滤**                | Sprint 03B 新增      | `remote/lib/devices.cjs` + CLI                  |
-| **统一 versionId / artifactId / 项目外证据 + HMAC**      | Sprint 03B 新增      | `remote/lib/evidence.cjs`                       |
-| **Vision 0.2.0 集成（analyze / verify / 受限 repair）**  | Sprint 03B 新增      | `remote/lib/vision-service.cjs`                 |
-| **注册表锁/快照一致性（C09 B-01）**                      | Sprint 03C 修复      | `remote/lib/projects.cjs` + B10 测试            |
-| **预览 staging 校验后原子发布（C09 B-02）**              | Sprint 03C 修复      | `copyPreviewTreeStaged` + B10 测试              |
-| **Vite 构建摘要绑定源码（C09 B-03）**                    | Sprint 03C 修复      | `.build-stamp.json` + `srcDigest`               |
-| **回退持项目锁 + 异步构建（C09 B-04）**                  | Sprint 03C 修复      | `projects.rollback`(async)                      |
-| **Vision 增量校验 / 预览票据 / verify 语义**             | Sprint 03C 修复      | `vision-policy.cjs`、`vision-service.cjs`       |
-| **Connect 共享可见性 + 即时吊销**                        | Sprint 03C 修复      | `server.cjs`、`devices.cjs`                     |
-| **证据 manifest/HMAC/链校验 + Qoder 契约适配**           | Sprint 03C 新增      | `remote/lib/evidence.cjs`、`qoder-evidence.cjs` |
-| 跨互联网协同（Tailscale）                                | 已安装，未登录       | 未发布 Runtime，等待认证                        |
+| 能力                                                            | 状态                     | 证据                                             |
+| --------------------------------------------------------------- | ------------------------ | ------------------------------------------------ |
+| Create Mode：从零生成（模板脚手架 + post-verify）               | 可用                     | Sprint 01 报告                                   |
+| Remote：Token 鉴权、任务状态机、去重、串行、持久化              | 可用                     | 33 个 remote 测试                                |
+| 真机：iPhone Safari + OPPO Android                              | 已验收                   | Sprint 01 报告第 13 节                           |
+| **Adopt Mode：导入已有工程（静态 / 子目录入口 / Vite）**        | Sprint 02 新增           | `remote/lib/projects.cjs`                        |
+| **项目预览独立源（预览面 ≠ 控制面）**                           | Sprint 02 新增           | `remote/lib/preview.cjs`                         |
+| **修改前快照 / 差异 / 回退（含备份）**                          | Sprint 02 新增           | `remote/lib/projects.cjs` + 测试                 |
+| **孤儿 CLI 进程收敛**                                           | Sprint 02 新增           | `cli-runner.cjs` + `leases.cjs`                  |
+| 项目记忆与连续多轮                                              | Sprint 02 新增（P1）     | `memory.json` + `-c` 续接                        |
+| **SSE 任务事件流（持久化 / 补发 / 心跳 / 去重）**               | Sprint 03B 新增          | `remote/lib/events.cjs` + 测试                   |
+| **设备身份 / 项目授权 / 任务 owner 过滤**                       | Sprint 03B 新增          | `remote/lib/devices.cjs` + CLI                   |
+| **统一 versionId / artifactId / 项目外证据 + HMAC**             | Sprint 03B 新增          | `remote/lib/evidence.cjs`                        |
+| **Vision 0.2.0 集成（analyze / verify / 受限 repair）**         | Sprint 03B 新增          | `remote/lib/vision-service.cjs`                  |
+| **注册表锁/快照一致性（C09 B-01）**                             | Sprint 03C 修复          | `remote/lib/projects.cjs` + B10 测试             |
+| **预览 staging 校验后原子发布（C09 B-02）**                     | Sprint 03C 修复          | `copyPreviewTreeStaged` + B10 测试               |
+| **Vite 构建摘要绑定源码（C09 B-03）**                           | Sprint 03C 修复          | `.build-stamp.json` + `srcDigest`                |
+| **回退持项目锁 + 异步构建（C09 B-04）**                         | Sprint 03C 修复          | `projects.rollback`(async)                       |
+| **Vision 增量校验 / 预览票据 / verify 语义**                    | Sprint 03C 修复          | `vision-policy.cjs`、`vision-service.cjs`        |
+| **Connect 共享可见性 + 即时吊销**                               | Sprint 03C 修复          | `server.cjs`、`devices.cjs`                      |
+| **证据 manifest/HMAC/链校验 + Qoder 契约适配**                  | Sprint 03C 新增          | `remote/lib/evidence.cjs`、`qoder-evidence.cjs`  |
+| **Vision 0.2.1 + 精确 delta + 严格 verified**                   | Sprint 03C（B11）        | `vendor/vision` 0.2.1、`vision-policy-delta.cjs` |
+| **C10 收口：/status、幂等作用域、证据 owner、设备 fail-closed** | Sprint 03C（B11）        | `server.cjs`、`tasks.cjs`、`devices.cjs`         |
+| **事件 seq 入哈希 + anchor 尾删检测 + 跨进程追加**              | Sprint 03C（B11）        | `remote/lib/events.cjs`                          |
+| **非入口预览资源完整性校验**                                    | Sprint 03C（B11）        | `preview.cjs` + manifest                         |
+| 跨互联网协同（Tailscale）                                       | 三端已接入，未启用 Serve | 见 `docs/CONNECT-L2-ACCEPTANCE.md`               |
 
 ## 3. 安全加固状态（Qoder 审计 8058e67）
 
@@ -55,6 +59,25 @@ Vplay Studio 以 OpenGame（Apache-2.0，源自 gemini-cli）为内核，目标�
 | P2-1～P2-8               | 全部处理                                                                |
 
 详见 `docs/reports/SPRINT-02-SECURITY-FIX.md`。独立复审仍由 Qoder 进行。
+
+### 3.2 Sprint 03C（B11：C10 收口 + E07 集成）
+
+| C10 编号                   | 状态       | 实现要点                                                            |
+| -------------------------- | ---------- | ------------------------------------------------------------------- |
+| C10-01 SSE 跨项目/吊销     | 已关闭     | 项目过滤 + 每次发送/心跳重验 + 连接上限 + `gap` 截断提示            |
+| C10-02 `/status` 泄漏      | 已关闭     | 按 auth 过滤项目/任务；非管理员不回显 prompt                        |
+| C10-03 幂等跨用户          | 已关闭     | 作用域 `(createdBy, projectId)`；跨域 409 且不回显任务              |
+| C10-04 Vision 证据越权     | 已关闭     | 报告/截图仅创建者或管理员                                           |
+| C10-05 allowedFiles 穿越   | 已关闭     | `assertSafeRelPath` 归一化后才读取                                  |
+| C10-06 设备 lastSeen 竞态  | 已关闭     | 鉴权只读；写操作加锁；revoke 不被覆盖                               |
+| C10-07 seq 未入哈希/尾删   | 已关闭     | `hashAlg=seq-in-body-v2` + anchor(count/lastId/head) + `verify()`   |
+| C10-08 证据与 C08 契约     | 部分       | 可移植 Qoder 校验器/记录器 + 合成包契约测试；真实 12 文件包仍未产出 |
+| C10-09 设备默认 `*`        | 已关闭     | 无 projects 拒绝创建；显式 `*` 才全项目                             |
+| C10-10 Spacer 合法补丁被拒 | 已关闭     | delta operation 重放 + 新增片段/窗口扫描；真实 Spacer 正负对照通过  |
+| C10-11 预览认证截图 401    | 已关闭     | Vision 0.2.1 `previewAuth` + 项目级路径                             |
+| E07 严格 verified          | 已关闭     | `confirmed` + 宿主硬门禁：必须有缺陷专属断言                        |
+| B-11 防火墙                | **未关闭** | 4 条 node Any/Any 仍在；按用户要求未修改                            |
+| B-15 OS 隔离               | **未实现** | 见 `docs/TRUST-BOUNDARY-B11.md`                                     |
 
 ### 3.1 Sprint 03C 收口（C09 → B10）
 
@@ -87,6 +110,11 @@ Vplay Studio 以 OpenGame（Apache-2.0，源自 gemini-cli）为内核，目标�
 10. **无 OS 沙箱/独立账号隔离**：预览与控制面同进程，模型可写 `VPLAY_HOME`（B-15 未关闭）。
 11. Vision 真实模型调用仍需授权与预算；本轮只验证离线契约与真实 Spacer 文件策略。
 12. 预览鉴权仅在设置 `PREVIEW_ACCESS_KEY` 时启用；tailnet 模式必须开启并配置 `REMOTE_TRUST_PROXY=1`。
+13. **OS 隔离未实现**：模型进程与宿主同账号同权限；环境白名单/浏览器守卫不是沙箱
+    （`docs/TRUST-BOUNDARY-B11.md`）。
+14. **防火墙未收敛**：node.exe 仍有 4 条 Public Any/Any 入站规则；B11 按用户要求未修改。
+15. **C10-08 部分**：Qoder 校验器/记录器已可移植并有合成包负对照，但真实 12 文件证据包未产出。
+16. **Tailscale Serve 未启用**：三端已接入，但正式 Runtime 发布需 Qoder 门禁与用户确认。
 
 ## 5. 风险登记
 

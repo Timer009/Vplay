@@ -3,6 +3,7 @@ import { selectDefect } from './patch/defect.mjs';
 import { validatePatchPlan, materializePatch } from './patch/validator.mjs';
 import { VisionError, ERROR_CATEGORIES } from './errors.mjs';
 import { redactSource, redactObject } from './redaction.mjs';
+import { compareVerification } from './verification/compare.mjs';
 
 function captureArtifacts(capture) {
   return (capture?.screenshots || []).map((shot) => ({
@@ -71,6 +72,7 @@ export async function runVisionTask({
   extraPatchInstructions = '',
   maxRepairRounds = 2,
   minConfidence = 0.5,
+  verificationPolicy = 'after-only',
   context = '',
   userPrompt = '',
   outDir,
@@ -80,6 +82,9 @@ export async function runVisionTask({
   if (!outDir) throw new Error('runVisionTask requires outDir');
   if (!browserRunner || !gateway) throw new Error('browserRunner and gateway are required');
   if (!['analyze', 'repair'].includes(mode)) throw new Error(`unknown vision mode: ${mode}`);
+  if (!['after-only', 'confirmed'].includes(verificationPolicy)) {
+    throw new Error(`unknown verificationPolicy: ${verificationPolicy}`);
+  }
   if (mode === 'repair' && !host) throw new Error('repair mode requires host hooks');
   const sink = events || createEventSink({ taskId, projectId });
   const started = Date.now();
@@ -102,6 +107,7 @@ export async function runVisionTask({
       outDir,
       captureId: mode === 'repair' ? 'before-r0' : 'before',
     });
+    let baseline = before;
     sink.emit(EVENT_TYPES.CAPTURE_COMPLETED, {
       phase: 'before',
       ok: before.ok,
@@ -184,6 +190,7 @@ export async function runVisionTask({
           ok: refreshed.ok,
           assertions: assertionSummary(refreshed),
         }, captureArtifacts(refreshed));
+        baseline = refreshed;
       }
       const patch = await gateway.proposePatchPlan({
         report: {
@@ -235,7 +242,14 @@ export async function runVisionTask({
       if (!snapshot || !Number.isFinite(Number(snapshot.seq))) throw new Error('host.snapshot must return { seq }');
       sink.emit(EVENT_TYPES.SNAPSHOT_CREATED, { round, seq: snapshot.seq });
       pendingSnapshot = snapshot;
-      await host.applyFiles(materialized.files);
+      // The second argument is new in 0.2.1: hosts that want digest-bound delta
+      // scanning need the exact operations, not just the materialized files.
+      // Existing hosts that take one argument keep working unchanged.
+      await host.applyFiles(materialized.files, {
+        operations: validation.operations,
+        plan: patch.plan,
+        round,
+      });
       sink.emit(EVENT_TYPES.PATCH_APPLIED, { round, seq: snapshot.seq, files: materialized.files.map((file) => file.file) });
 
       const after = await browserRunner.runCapture({
@@ -258,11 +272,23 @@ export async function runVisionTask({
         sink.emit(EVENT_TYPES.DIFF_COMPLETED, { round, diff: { counts: diff?.counts || null, files: diff?.files?.length ?? null } });
       }
       const changes = totalChanges(diff);
-      const verified = after.ok && (changes === null || changes > 0);
+      const comparison = compareVerification({ before: baseline, after, defect });
+      const verified = after.ok
+        && (changes === null || changes > 0)
+        && (verificationPolicy === 'confirmed' ? comparison.ok : true);
       sink.emit(EVENT_TYPES.VERIFICATION_COMPLETED, {
         round,
         verified,
         changes,
+        verificationPolicy,
+        comparison: {
+          ok: comparison.ok,
+          beforeOk: comparison.beforeOk,
+          afterOk: comparison.afterOk,
+          screenshotsChanged: comparison.screenshotsChanged,
+          newCriticalFailures: comparison.newCriticalFailures.map((item) => item.id),
+          resolvedCriticalFailures: comparison.resolvedCriticalFailures.map((item) => item.id),
+        },
         assertions: assertionSummary(after),
       }, captureArtifacts(after));
 
@@ -280,6 +306,8 @@ export async function runVisionTask({
           materialized: materialized.files.map((file) => ({ file: file.file, bytes: file.bytes, sha256After: file.sha256After })),
           snapshot,
           diff,
+          comparison,
+          verificationPolicy,
           before,
           after,
           budget: gateway.summary(),
@@ -294,7 +322,7 @@ export async function runVisionTask({
       await host.rollback(snapshot.seq);
       pendingSnapshot = null;
       sink.emit(EVENT_TYPES.ROLLBACK_COMPLETED, { round, seq: snapshot.seq, reason: feedback });
-      last = { ...failure('verification', new VisionError(feedback, { category: ERROR_CATEGORIES.BROWSER, code: 'VERIFY_FAILED' })), patch, validation, snapshot, diff, after };
+      last = { ...failure('verification', new VisionError(feedback, { category: ERROR_CATEGORIES.BROWSER, code: 'VERIFY_FAILED' })), patch, validation, snapshot, diff, comparison, after };
     }
 
     const result = {

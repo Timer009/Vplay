@@ -30,7 +30,9 @@
 | `.opengame/leases/*.json`              | CLI 子进程租约                                   | 启动时回收孤儿进程               |
 | `evidence/<project>/<task>/`           | 项目外证据（meta/events/report/anchor/manifest） | 只读校验；HMAC 仅证明宿主生成    |
 | `evidence/**/apply-journal*.json`      | Vision 写入 journal                              | 启动时复核，标记 needs-review    |
-| `events/events.jsonl`                  | SSE 事件哈希链                                   | 追加；损坏行跳过，不影响新事件   |
+| `events/events.jsonl`                  | SSE 事件哈希链（seq 入哈希）                     | 追加；B11 校验 anchor            |
+| `events/events.anchor.json`            | count/lastId/head + HMAC                         | 尾删/截断检测；不自动修复        |
+| `events/events.lock`                   | 跨进程追加互斥                                   | pid 死亡/30s 后可回收            |
 
 ## 2.1 锁恢复语义（B10 / C09 B-01）
 
@@ -53,11 +55,20 @@
 
 - apply 前写 `evidence/<project>/<task>/apply-journal.json`（含 root 与 before/after 摘要）；
 - 写入使用临时文件 + fsync + rename，崩溃不会留下半写目标文件；
+- 0.2.1 delta 路径：journal `applying → verified`；只有 `buildPreview + verifyPreview` 通过后才 finalize；
 - 失败/异常必须调用 `registry.rollback` 并检查 `verified/previewReady`；
-- 启动时 `recoverVisionApplies` 复核 journal：内容与 after 摘要一致 →
-  `apply-journal.completed-unverified.json`；否则 → `apply-journal.needs-review.json`；
+- 启动时 `recoverVisionApplies` 复核 `applying`/`verified` 残留：
+  内容与 after 摘要一致 → `apply-journal.completed-unverified.json`；否则 → `apply-journal.needs-review.json`；
   **不自动改写源码**，交给快照与人工；
 - Vision 不另行实现快照/回退系统。
+
+## 3.1 事件链（B11）
+
+- 每次 append 在 `events.lock` 内执行；发现文件大小变化会先重读，避免多进程重复 seq；
+- 每条记录 `hash = sha256(prevHash + "\n" + body)`，body **包含 seq**（`hashAlg=seq-in-body-v2`）；
+- 每次 append 更新 `events.anchor.json`（count/lastId/head + 可选 HMAC）；
+- `createEventStore().verify()` 可检出 seq 篡改、链断、尾删、anchor 不一致；
+- SSE 补发窗口被截断时发送 `event: gap`，不静默丢历史。
 
 ## 4. 人工检查清单
 

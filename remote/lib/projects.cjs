@@ -1815,6 +1815,11 @@ function createProjectRegistry(options = {}) {
     rollback,
     previewRoot,
     previewDir: previewDirOf,
+    previewManifest: (id) => {
+      const manifest = readJson(path.join(projectDirOf(id), '.publish-manifest.json'), null);
+      if (!manifest || !manifest.files || typeof manifest.files !== 'object') return null;
+      return manifest;
+    },
     buildPreview,
     verifyPreview,
     buildProject,

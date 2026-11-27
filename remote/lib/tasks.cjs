@@ -57,6 +57,19 @@ class DuplicateTaskError extends Error {
   }
 }
 
+/**
+ * B11 / C10-03：idempotencyKey 只在 (createdBy, projectId) 作用域内去重。
+ * 跨用户/跨项目复用同一个 key 属于冲突，必须拒绝且不泄漏已有任务。
+ */
+class IdempotencyConflictError extends Error {
+  constructor() {
+    super('idempotencyKey is already used in another user/project scope');
+    this.name = 'IdempotencyConflictError';
+    this.statusCode = 409;
+    this.code = 'IDEMPOTENCY_CONFLICT';
+  }
+}
+
 function normalizeText(raw) {
   if (typeof raw !== 'string') {
     throw new ValidationError('"text" must be a string');
@@ -198,12 +211,17 @@ function createTaskStore(options) {
       typeof (input && input.projectId) === 'string' && input.projectId
         ? input.projectId
         : 'default';
+    const createdBy = (input && input.createdBy) || 'admin';
 
     if (idempotencyKey) {
-      const byKey = tasks.find(
-        (task) => task.idempotencyKey === idempotencyKey,
-      );
-      if (byKey) return { task: { ...byKey }, duplicate: true };
+      const byKey = tasks.find((task) => task.idempotencyKey === idempotencyKey);
+      if (byKey) {
+        const sameScope =
+          (byKey.createdBy || 'admin') === createdBy &&
+          (byKey.projectId || 'default') === projectId;
+        if (sameScope) return { task: { ...byKey }, duplicate: true };
+        throw new IdempotencyConflictError();
+      }
     }
 
     const fingerprint = compactText(text);
@@ -234,7 +252,7 @@ function createTaskStore(options) {
               .filter((item) => typeof item === 'string' && /\.(html?|css)$/i.test(item))
               .slice(0, 5)
           : null,
-      createdBy: (input && input.createdBy) || 'admin',
+      createdBy,
       allowYolo: Boolean(input && input.allowYolo === true),
       status: 'queued',
       createdAt: now,
@@ -384,6 +402,7 @@ module.exports = {
   normalizeIdempotencyKey,
   ValidationError,
   DuplicateTaskError,
+  IdempotencyConflictError,
   TASK_STATUSES,
   MAX_TEXT_LENGTH,
 };

@@ -40,7 +40,12 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
-const { createTaskStore, ValidationError, DuplicateTaskError } = require('./lib/tasks.cjs');
+const {
+  createTaskStore,
+  ValidationError,
+  DuplicateTaskError,
+  IdempotencyConflictError,
+} = require('./lib/tasks.cjs');
 const { createWorker, resolveExecutorScript } = require('./lib/worker.cjs');
 const { createProjectRegistry, ProjectError } = require('./lib/projects.cjs');
 const { createPreviewServer } = require('./lib/preview.cjs');
@@ -305,6 +310,8 @@ function tokenMatches(candidate) {
 
 // ---- 短期 Session（P1-2）：服务端可吊销，Cookie 值不等于主 Token ----
 const sessions = new Map();
+const SSE_LIMIT = Number(process.env.REMOTE_SSE_LIMIT || 25);
+let sseActive = 0;
 
 function sessionKey(sessionId) {
   return crypto.createHash('sha256').update(sessionId).digest('hex');
@@ -563,18 +570,39 @@ function bucketLimited(buckets, ip, limit) {
   return bucket.count > limit;
 }
 
-function computeStatus() {
+/** B11 / C10-02：任务可见性（管理员全部；设备仅自己创建或已授权项目）。 */
+function taskVisibleTo(auth, task) {
+  if (!task || !auth) return false;
+  if (auth.kind === 'admin' || auth.admin === true) return true;
+  return (
+    (task.createdBy || 'admin') === auth.deviceId ||
+    projectAllowed(auth, task.projectId || 'default')
+  );
+}
+
+/** B11：任务证据（Vision 报告/截图）只对创建者或管理员开放。 */
+function privateTaskAllowed(auth, task) {
+  if (!task || !auth) return false;
+  if (auth.kind === 'admin' || auth.admin === true) return true;
+  return (task.createdBy || 'admin') === auth.deviceId;
+}
+
+function computeStatus(auth) {
+  const isAdmin = Boolean(auth && (auth.kind === 'admin' || auth.admin === true));
   const active = store.activeTask();
-  if (active) {
+  if (active && taskVisibleTo(auth, active)) {
     return {
       phase: active.status === 'verifying' ? 'verifying' : 'generating',
-      message: `[${active.id}] ${active.text.slice(0, 160)}`,
+      // 非管理员不回显 prompt 正文，只回显任务/项目/阶段
+      message: isAdmin
+        ? `[${active.id}] ${active.text.slice(0, 160)}`
+        : `[${active.id}] ${active.projectId || 'default'} ${active.status}`,
       activeTaskId: active.id,
       projectId: active.projectId || null,
       updatedAt: active.updatedAt,
     };
   }
-  const tasks = store.list();
+  const tasks = store.list().filter((task) => taskVisibleTo(auth, task));
   const last = tasks[tasks.length - 1];
   if (
     last &&
@@ -868,12 +896,18 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/status' && method === 'GET') {
       if (!requireAuth(req, res)) return;
-      sendJson(res, 200, computeStatus());
+      sendJson(res, 200, computeStatus(authState(req)));
       return;
     }
 
     if (pathname === '/events' && method === 'GET') {
       if (!requireAuth(req, res)) return;
+      // C10-01：SSE 连接上限，避免长连接耗尽进程资源
+      if (sseActive >= SSE_LIMIT) {
+        sendJson(res, 503, { ok: false, error: 'too many event streams' });
+        return;
+      }
+      sseActive += 1;
       res.writeHead(
         200,
         commonHeaders({
@@ -890,6 +924,7 @@ const server = http.createServer(async (req, res) => {
       const cleanup = () => {
         if (closed) return;
         closed = true;
+        sseActive = Math.max(0, sseActive - 1);
         if (ping) clearInterval(ping);
         unsubscribe();
       };
@@ -914,7 +949,13 @@ const server = http.createServer(async (req, res) => {
         res.write(`id: ${record.id}\ndata: ${JSON.stringify(record)}\n\n`);
       };
       res.write('retry: 3000\n\n');
-      for (const record of eventStore.listAfter(last, 2000)) send(record);
+      const replay = eventStore.listAfterInfo(last, 2000);
+      for (const record of replay.events) send(record);
+      if (replay.truncated && !closed) {
+        res.write(
+          `event: gap\ndata: ${JSON.stringify({ reason: 'window-truncated', windowStart: replay.windowStart })}\n\n`,
+        );
+      }
       unsubscribe = eventStore.subscribe((record) => {
         try {
           send(record);
@@ -1072,6 +1113,14 @@ const server = http.createServer(async (req, res) => {
           queued: store.list().filter((item) => item.status === 'queued').length,
         });
       } catch (error) {
+        if (error instanceof IdempotencyConflictError) {
+          sendJson(res, 409, {
+            ok: false,
+            error: error.message,
+            code: 'IDEMPOTENCY_CONFLICT',
+          });
+          return;
+        }
         if (error instanceof DuplicateTaskError) {
           sendJson(res, 409, {
             ok: false,
@@ -1168,6 +1217,10 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 404, { ok: false, error: 'vision task not found' });
         return;
       }
+      if (!privateTaskAllowed(authState(req), task)) {
+        sendJson(res, 403, { ok: false, error: 'vision evidence is private to its creator' });
+        return;
+      }
       const dir = path.join(RUNTIME_ROOT, 'evidence', projectId, taskId);
       let report = null;
       try {
@@ -1206,6 +1259,10 @@ const server = http.createServer(async (req, res) => {
       const task = store.get(taskId);
       if (!task || task.kind !== 'vision' || (task.projectId || 'default') !== projectId) {
         sendJson(res, 404, { ok: false, error: 'vision task not found' });
+        return;
+      }
+      if (!privateTaskAllowed(authState(req), task)) {
+        sendJson(res, 403, { ok: false, error: 'vision evidence is private to its creator' });
         return;
       }
       const file = path.join(RUNTIME_ROOT, 'evidence', projectId, taskId, 'screenshots', name);
@@ -1326,6 +1383,14 @@ const server = http.createServer(async (req, res) => {
           poll: `/projects/${projectId}/vision/${task.id}`,
         });
       } catch (error) {
+        if (error instanceof IdempotencyConflictError) {
+          sendJson(res, 409, {
+            ok: false,
+            error: error.message,
+            code: 'IDEMPOTENCY_CONFLICT',
+          });
+          return;
+        }
         if (error instanceof DuplicateTaskError) {
           sendJson(res, 409, {
             ok: false,

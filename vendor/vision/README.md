@@ -1,6 +1,6 @@
-# @vplay/vision 0.2.0 — E05 security candidate
+# @vplay/vision 0.2.1 — E07 integration candidate
 
-> 独立候选包：结构化补丁白名单、浏览器出站限制、截图/源码脱敏、宿主锁/原子 apply 契约。E03-H 的 0.1.0 保持不变。
+> 独立集成候选：0.2.0 的补丁白名单/出站限制/脱敏之上，新增内存级预览认证注入、delta+digest 宿主契约、修复前后验证对照、捕获证据脱敏。0.1.0/0.2.0 包保持不变。
 
 Vplay Studio 的可移植视觉验证模块包。它把 E02 已验证的真实双模型闭环整理为可集成组件：
 

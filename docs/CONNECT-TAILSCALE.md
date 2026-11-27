@@ -5,13 +5,14 @@
 
 ## 1. 当前状态（2026-11-27）
 
-| 项                         | 值                                                        |
-| -------------------------- | --------------------------------------------------------- |
-| Tailscale 版本             | `1.104.7`（Windows 服务 Running/Automatic）               |
-| 登录状态                   | **Logged out / NeedsLogin**（等待用户完成身份认证）       |
-| MagicDNS 名称              | 登录后由 `tailscale status --json` 的 `Self.DNSName` 获取 |
-| 8787/8788                  | 未监听（B06 实例已按 C07 要求停止）                       |
-| Serve/Funnel/SSH/Exit Node | 均未启用                                                  |
+| 项                         | 值                                                                  |
+| -------------------------- | ------------------------------------------------------------------- |
+| Tailscale 版本             | `1.104.7`（Windows 服务 Running/Automatic）                         |
+| 登录状态                   | 已登录；Windows `100.78.136.34`（Online）                           |
+| 其他设备                   | iPhone `100.118.137.100`（offline）；OPPO `100.75.200.83`（Online） |
+| MagicDNS 名称              | `timer009.tail199672.ts.net`                                        |
+| 8787/8788                  | 未监听（B06 实例已按 C07 要求停止）                                 |
+| Serve/Funnel/SSH/Exit Node | 均未启用（`No serve config`）                                       |
 
 ## 2. 拓扑（方案 A）
 
@@ -92,11 +93,12 @@ node remote/server.cjs
 
 > 未完成上述 7 项前，只能使用回环或隔离测试服务，不向 tailnet 发布。
 
-## 6. B10 状态（2026-11-27）
+## 6. B10/B11 状态（2026-11-27）
 
-- 用户已注册 Tailscale 账号，正在添加 Windows 与 iPhone 设备；**登录由用户本人完成**。
-- 两台设备在线后，允许先用「无凭据、无工程数据」的隔离测试服务验证 HTTPS 与跨网络通信。
+- 三端已接入：Windows `100.78.136.34`、iPhone `100.118.137.100`、OPPO `100.75.200.83`；
+  MagicDNS `timer009.tail199672.ts.net`；安卓 Wi-Fi/5G 通信已由用户验证。
+- `serve status` / `funnel status` 仍为空；8787/8788 未监听。
+- 精确启动/停止/恢复命令、隔离 HTTPS 测试与 ACL 建议见
+  `docs/CONNECT-L2-ACCEPTANCE.md`。
 - 正式 Runtime 继续只监听回环；**待 Qoder 独立安全门禁通过后**才启用私有 Serve。
-- 不启用 Funnel、Exit Node、子网路由，不开放公网端口。
-- 复核要点：`tailscale serve status` 仅 443/8443；`tailscale funnel status` 为空；
-  `Get-NetTCPConnection` 中 8787/8788 仅绑定 `127.0.0.1`。
+- 不启用 Funnel、Exit Node、子网路由，不开放公网端口；不修改 Tailnet ACL 或防火墙。

@@ -67,6 +67,22 @@
 - [ ] Qoder 独立安全门禁；通过后才考虑私有 Serve
 - [ ] 真实模型 Vision 闭环（预算授权后）
 
+## Sprint 03D / B11（当前）— Vision 最终集成与 Connect L2 验收准备
+
+- [x] 采用 Vision 0.2.1（vendored，无宿主补丁），保留短期票据/锁/hashTree/回退
+- [x] 宿主 delta：精确 operation 重放 + 前后 digest + 上下文窗口扫描
+- [x] 预览认证：`previewAuth` + 项目级 `/p/<id>/` 路径
+- [x] 严格 verified：必须有缺陷专属功能断言
+- [x] C10-01..C10-07、C10-09..C10-11 关闭；C10-08 部分（可移植工具 + 合成包）
+- [x] 非入口预览资源完整性校验
+- [x] 事件 seq 入哈希 + anchor 尾删检测 + 跨进程追加
+- [x] Tailscale 三端接入状态、HTTPS 拓扑、启动/停止/恢复、ACL 建议
+- [x] 隔离 HTTPS 测试服务（准备，未启用 Serve）
+- [x] 可信实验隔离评估（能力未实现，如实标注）
+- [ ] 真实模型 Vision 闭环（预算授权后）
+- [ ] 手机端 T-1..T-10 与 Qoder 门禁
+- [ ] 防火墙收敛（需用户批准）
+
 ## 非目标
 
 - 不做多租户 SaaS

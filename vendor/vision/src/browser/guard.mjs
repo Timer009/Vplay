@@ -28,6 +28,7 @@ export async function installNetworkGuard({
   previewUrl,
   allowedExtraOrigins = [],
   maxBlocked = 100,
+  stripCookiesFromExtraOrigins = true,
 }) {
   const previewOrigin = originOf(previewUrl);
   if (!previewOrigin) {
@@ -76,7 +77,20 @@ export async function installNetworkGuard({
       return;
     }
     const resourceType = request.resourceType();
+    // A subframe document request also reports isNavigationRequest()===true.
+    // Only main-frame document navigation should fail the critical navigation
+    // assertion; subframes are still blocked but recorded separately.
     const isNavigation = request.isNavigationRequest();
+    let mainFrameNavigation = false;
+    if (isNavigation) {
+      try {
+        const frame = request.frame();
+        mainFrameNavigation = Boolean(frame && frame.page() && frame === frame.page().mainFrame());
+      } catch {
+        // Unknown frame for a navigation request: fail closed.
+        mainFrameNavigation = true;
+      }
+    }
     const sameOrigin = allowedOrigins.has(parsed.origin);
     const allow = (parsed.protocol === 'http:' || parsed.protocol === 'https:')
       ? sameOrigin
@@ -85,11 +99,25 @@ export async function installNetworkGuard({
       record({
         url: request.url(),
         resourceType,
-        isNavigation,
+        isNavigation: mainFrameNavigation,
+        subframe: isNavigation && !mainFrameNavigation,
         reason: sameOrigin ? 'scheme/type' : 'origin',
       });
       await route.abort('blockedbyclient');
       return;
+    }
+    // Defense in depth: never forward preview credentials to an allowed
+    // non-preview origin (extra origins are rare; preview auth is host-scoped).
+    if (stripCookiesFromExtraOrigins && parsed.origin !== previewOrigin) {
+      try {
+        const headers = await request.allHeaders();
+        delete headers.cookie;
+        delete headers.authorization;
+        await route.continue({ headers });
+        return;
+      } catch {
+        // Fall through to a plain continue; the URL is not the preview origin.
+      }
     }
     await route.continue();
   });
