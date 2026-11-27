@@ -35,6 +35,19 @@
 4. **扩散式回退**：支持按文件回退，而不只是整快照回退。
 5. **跨互联网**：接入成熟组网方案（Tailscale / Cloudflare Tunnel），本仓库不自建 Relay。
 
+## Sprint 03B（当前）— Connect L2 + Vision 集成
+
+- [x] 持久化 SSE 事件流（seq / Last-Event-ID / 心跳 / 客户端去重）
+- [x] 统一 taskId / projectId / versionId / artifactId
+- [x] 设备身份、项目授权、任务 owner 过滤
+- [x] 项目外 evidence + 事件哈希链 + HMAC 锚定
+- [x] Vision 0.2.0 vendoring 与 host 契约（锁/原子写/全量 manifest/回退）
+- [x] 预览 CSP、浏览器同源守卫、截图/源码脱敏、同意门禁
+- [x] Console：SSE、版本/产物 ID、Vision 报告与截图
+- [ ] Tailscale 登录 → Serve HTTPS → C08 网络 7 项复验
+- [ ] 真实模型 Vision 闭环（预算授权后）
+- [ ] C08 40 项全量验收与独立复审
+
 ## 非目标
 
 - 不做多租户 SaaS

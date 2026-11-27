@@ -223,6 +223,18 @@ function createTaskStore(options) {
       text,
       idempotencyKey,
       source: (input && input.source) || 'remote',
+      kind: input && input.kind === 'vision' ? 'vision' : 'prompt',
+      visionMode:
+        input && ['analyze', 'verify', 'repair'].includes(input.visionMode)
+          ? input.visionMode
+          : 'analyze',
+      allowedFiles:
+        input && Array.isArray(input.allowedFiles)
+          ? input.allowedFiles
+              .filter((item) => typeof item === 'string' && /\.(html?|css)$/i.test(item))
+              .slice(0, 5)
+          : null,
+      createdBy: (input && input.createdBy) || 'admin',
       allowYolo: Boolean(input && input.allowYolo === true),
       status: 'queued',
       createdAt: now,

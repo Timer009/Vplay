@@ -148,6 +148,11 @@
     <select id="projectSelect"></select>
     <button class="btn ghost" id="projectRefreshBtn" type="button">刷新</button>
   </div>
+  <div class="project-row" style="margin-top:8px">
+    <button class="btn ghost" id="visionAnalyzeBtn" type="button" style="font-size:11px">视觉检测</button>
+    <button class="btn ghost" id="visionRepairBtn" type="button" style="font-size:11px">视觉修复（HTML/CSS）</button>
+  </div>
+  <div class="hint" id="visionHint">Vision 仅修复 HTML/CSS；需桌面端配置模型与 VISION_DATA_CONSENT=1</div>
 </section>
 
 <!-- 状态 -->
@@ -221,6 +226,7 @@
   var taskList = $('taskList');
   var projectCard = $('projectCard'), projectSelect = $('projectSelect');
   var projectRefreshBtn = $('projectRefreshBtn'), modeLabel = $('modeLabel');
+  var visionAnalyzeBtn = $('visionAnalyzeBtn'), visionRepairBtn = $('visionRepairBtn');
 
   $('hostLabel').textContent = location.host || 'localhost';
 
@@ -235,6 +241,7 @@
 
   var state = { authed: false, mode: 'workspace', previewPort: null, projects: [], selected: null };
   var polling = false, timer = null, sentTimer = null, openTaskId = null;
+  var eventSource = null, lastEventId = 0, taskRefreshTimer = null;
 
   function setConn(online) {
     connBadge.className = 'conn ' + (online ? 'online' : 'offline');
@@ -266,6 +273,7 @@
     state.authed = false;
     gate.classList.add('show');
     stopPolling();
+    stopEvents();
     setConn(false);
     if (message) { gateErr.textContent = message; gateErr.classList.add('show'); }
   }
@@ -315,6 +323,11 @@
   }
 
   function taskActions(task) {
+    if (task.kind === 'vision') {
+      return '<div class="task-actions">' +
+        '<button class="mini" data-act="vision" data-id="' + esc(task.id) + '" data-project="' + esc(task.projectId) + '">查看视觉报告</button>' +
+        '</div>';
+    }
     if (!task.snapshotSeq || !task.projectId) return '';
     return '<div class="task-actions">' +
       '<button class="mini" data-act="diff" data-id="' + esc(task.id) + '" data-project="' + esc(task.projectId) + '" data-seq="' + task.snapshotSeq + '">查看差异</button>' +
@@ -327,7 +340,7 @@
     if (!tasks.length) { taskList.innerHTML = '<div class="empty-note">暂无任务</div>'; return; }
     taskList.innerHTML = tasks.map(function (task) {
       var open = task.id === openTaskId ? ' open' : '';
-      var detail = '';
+      var detail = '项目: ' + (task.projectId || 'default');
       if (task.error) {
         detail += '错误 ' + (task.error.code || '') + ': ' + (task.error.message || '');
         if (task.error.detail) detail += '\n' + task.error.detail;
@@ -350,6 +363,20 @@
       if (task.result && task.result.outcome) {
         detail += (detail ? '\n' : '') + '结果: ' + task.result.outcome +
           (task.result.noChanges ? '（未检测到文件变更）' : '');
+      }
+      if (task.result && task.result.versionId) {
+        detail += (detail ? '\n' : '') + '版本: ' + task.result.versionId;
+      }
+      if (task.result && task.result.artifactId) {
+        detail += (detail ? '\n' : '') + '产物ID: ' + task.result.artifactId;
+      }
+      if (task.kind === 'vision') {
+        var vm = (task.result && task.result.vision && task.result.vision.mode) || '?';
+        var vs = (task.result && task.result.vision && task.result.vision.status) || task.status;
+        detail += (detail ? '\n' : '') + 'Vision: ' + vm + ' · ' + vs;
+        if (task.result && task.result.vision && task.result.vision.error) {
+          detail += '\n视觉错误: ' + task.result.vision.error.message;
+        }
       }
       if (!detail) detail = '创建于 ' + clock(task.createdAt);
       var badge = task.status;
@@ -428,6 +455,33 @@
   }
   function startPolling() { if (timer) return; poll(); timer = setInterval(poll, POLL_MS); }
   function stopPolling() { if (timer) { clearInterval(timer); timer = null; } }
+
+  function scheduleTaskRefresh() {
+    if (taskRefreshTimer) return;
+    taskRefreshTimer = setTimeout(function () { taskRefreshTimer = null; loadTasks(); }, 400);
+  }
+  function startEvents() {
+    if (eventSource || !state.authed) return;
+    var url = '/events' + (lastEventId ? ('?lastEventId=' + encodeURIComponent(lastEventId)) : '');
+    try {
+      eventSource = new EventSource(url, { withCredentials: true });
+    } catch (e) {
+      return;
+    }
+    eventSource.onopen = function () { setConn(true); };
+    eventSource.onmessage = function (ev) {
+      var data;
+      try { data = JSON.parse(ev.data); } catch (e) { return; }
+      var id = Number(ev.lastEventId || data.id || 0);
+      if (id && id <= lastEventId) return; // 客户端去重
+      if (id) lastEventId = id;
+      if (data && String(data.type || '').indexOf('task.') === 0) scheduleTaskRefresh();
+    };
+    eventSource.onerror = function () { if (state.authed) setConn(false); };
+  }
+  function stopEvents() {
+    if (eventSource) { try { eventSource.close(); } catch (e) {} eventSource = null; }
+  }
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) stopPolling(); else if (state.authed) startPolling();
   });
@@ -445,7 +499,7 @@
       if (r.ok && r.data.ok) {
         tokenInput.value = '';
         hideGate();
-        return loadProjects().then(function () { startPolling(); });
+        return loadProjects().then(function () { startPolling(); startEvents(); });
       }
       gateErr.textContent = r.status === 503 ? '桌面端未配置 REMOTE_TOKEN，远程控制已禁用'
         : r.status === 429 ? '尝试过于频繁，请稍后再试'
@@ -487,6 +541,7 @@
     updateSendState();
     var payload = { text: text };
     if (state.selected) payload.projectId = state.selected;
+    payload.idempotencyKey = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now());
     fetchJson('/prompt', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -546,6 +601,73 @@
       .catch(function (e) { detail.textContent += '\n(diff 获取失败: ' + e.message + ')'; });
   }
 
+  function loadVisionReport(taskId, projectId) {
+    var item = taskList.querySelector('.task-item[data-id="' + taskId + '"]');
+    if (!item) return;
+    var detail = item.querySelector('.task-detail');
+    detail.textContent += '\n--- vision ---\n加载中…';
+    fetchJson('/projects/' + encodeURIComponent(projectId) + '/vision/' + encodeURIComponent(taskId))
+      .then(function (r) {
+        detail.textContent = detail.textContent.replace('\n--- vision ---\n加载中…', '');
+        if (!r.ok) { detail.textContent += '\n(视觉报告获取失败: ' + ((r.data && r.data.error) || r.status) + ')'; return; }
+        var task = r.data.task || {};
+        var report = r.data.report || {};
+        var lines = ['--- vision ---'];
+        lines.push('状态: ' + (task.status || '?') + ' · 模式: ' +
+          ((task.result && task.result.vision && task.result.vision.mode) || '?'));
+        if (task.result && task.result.vision && task.result.vision.error) {
+          lines.push('错误: ' + (task.result.vision.error.message || ''));
+        }
+        if (report.result && report.result.report && report.result.report.summary) {
+          lines.push('摘要: ' + report.result.report.summary);
+        }
+        if (report.previewManifest !== undefined) lines.push('预览校验文件数: ' + report.previewManifest);
+        if (report.redaction && report.redaction.maskSelectors && report.redaction.maskSelectors.length) {
+          lines.push('截图遮罩: ' + report.redaction.maskSelectors.join(', '));
+        }
+        detail.textContent += '\n' + lines.join('\n');
+        var shots = r.data.screenshots || [];
+        if (shots.length) {
+          var wrap = document.createElement('div');
+          wrap.style.marginTop = '6px';
+          shots.forEach(function (path) {
+            var a = document.createElement('a');
+            a.href = path;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.className = 'mini';
+            a.style.marginRight = '6px';
+            a.textContent = '截图 ' + path.split('/').pop();
+            wrap.appendChild(a);
+          });
+          detail.appendChild(wrap);
+        }
+      })
+      .catch(function (e) { detail.textContent += '\n(视觉报告获取失败: ' + e.message + ')'; });
+  }
+
+  function submitVision(mode) {
+    if (!state.authed) return;
+    if (!state.selected) { showSendErr('请先选择项目'); return; }
+    fetchJson('/projects/' + encodeURIComponent(state.selected) + '/vision', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: mode,
+        idempotencyKey: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now())
+      })
+    }).then(function (r) {
+      if (r.ok) {
+        showSent(mode === 'repair' ? '已加入视觉修复任务（仅 HTML/CSS）' : '已加入视觉检测任务');
+        loadTasks();
+      } else if (r.status === 401) {
+        showGate('登录已失效，请重新输入令牌');
+      } else {
+        showSendErr('视觉任务提交失败：' + ((r.data && r.data.error) || ('HTTP ' + r.status)));
+      }
+    }).catch(function () { showSendErr('视觉任务提交失败：无法连接桌面端服务'); });
+  }
+
   function doRollback(taskId, projectId, seq) {
     var ok = window.confirm('回退到任务 ' + taskId + ' 执行前的快照 #' + seq + '？\n系统会先备份当前状态。');
     if (!ok) return;
@@ -570,6 +692,7 @@
       var act = actionBtn.getAttribute('data-act');
       if (act === 'diff') loadDiff(actionBtn.getAttribute('data-id'), actionBtn.getAttribute('data-project'), actionBtn.getAttribute('data-seq'));
       if (act === 'rollback') doRollback(actionBtn.getAttribute('data-id'), actionBtn.getAttribute('data-project'), actionBtn.getAttribute('data-seq'));
+      if (act === 'vision') loadVisionReport(actionBtn.getAttribute('data-id'), actionBtn.getAttribute('data-project'));
       return;
     }
     var item = e.target.closest('.task-item');
@@ -597,6 +720,8 @@
     loadTasks();
   });
   projectRefreshBtn.addEventListener('click', function () { loadProjects(); });
+  visionAnalyzeBtn.addEventListener('click', function () { submitVision('analyze'); });
+  visionRepairBtn.addEventListener('click', function () { submitVision('repair'); });
 
   function bootstrap() {
     fetchJson('/health').then(function (r) {
@@ -614,7 +739,7 @@
       return fetchJson('/status').then(function (s) {
         if (s.ok) {
           hideGate();
-          return loadProjects().then(function () { startPolling(); });
+          return loadProjects().then(function () { startPolling(); startEvents(); });
         }
         showGate();
         updateSendState();

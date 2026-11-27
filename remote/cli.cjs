@@ -15,11 +15,16 @@
  *   node remote/cli.cjs project rollback <id> --seq <n>
  */
 
+const path = require('path');
+
 const {
   createProjectRegistry,
   defaultHome,
   ProjectError,
 } = require('./lib/projects.cjs');
+const { createDeviceStore } = require('./lib/devices.cjs');
+const { createEventStore } = require('./lib/events.cjs');
+const { createVisionService } = require('./lib/vision-service.cjs');
 
 function flag(argv, name) {
   const index = argv.indexOf(`--${name}`);
@@ -60,9 +65,32 @@ async function main() {
   const registry = createProjectRegistry({ home });
 
   const [scope, action, target] = args;
+  if (scope === 'device') {
+    const devices = createDeviceStore({ file: path.join(home, 'devices.json') });
+    if (action === 'add') {
+      const created = devices.createDevice({
+        name: flag(argv, 'name') || target || 'device',
+        projects: flag(argv, 'projects') || '*',
+      });
+      print({ ok: true, device: created.device, token: created.token });
+      return;
+    }
+    if (action === 'list') {
+      print({ ok: true, devices: devices.list() });
+      return;
+    }
+    if (action === 'revoke') {
+      if (!target) throw new ProjectError('缺少设备 ID', 400, 'MISSING_DEVICE_ID');
+      print({ ok: devices.revoke(target) });
+      return;
+    }
+    throw new ProjectError('未知设备操作: ' + action, 400, 'UNKNOWN_ACTION');
+  }
+
   if (scope !== 'project' || !action) {
     process.stderr.write(
-      'usage: node remote/cli.cjs project <import|list|show|snapshot|diff|rollback> ...\n',
+      'usage: node remote/cli.cjs project <import|list|show|snapshot|diff|rollback|vision> ...\n' +
+        '       node remote/cli.cjs device <add|list|revoke> ...\n',
     );
     process.exitCode = 2;
     return;
@@ -111,6 +139,45 @@ async function main() {
     }
     const to = !toRaw || toRaw === 'current' ? 'current' : Number(toRaw);
     print({ ok: true, ...registry.diff(target, from, to) });
+    return;
+  }
+
+  if (action === 'vision') {
+    if (!target) throw new ProjectError('缺少 projectId', 400, 'MISSING_PROJECT_ID');
+    registry.get(target);
+    const mode = flag(argv, 'mode') || 'analyze';
+    if (!['analyze', 'verify', 'repair'].includes(mode)) {
+      throw new ProjectError('--mode 必须是 analyze|verify|repair', 400, 'INVALID_MODE');
+    }
+    const taskId = flag(argv, 'task-id') || `vision_${Date.now()}`;
+    const eventStore = createEventStore({
+      file: path.join(home, 'events', 'events.jsonl'),
+      hmacKey: process.env.EVIDENCE_HMAC_KEY || null,
+    });
+    const service = createVisionService({
+      registry,
+      home,
+      eventStore,
+      logger: (line) => process.stderr.write(`${line}\n`),
+    });
+    const allowed = flag(argv, 'allowed-file');
+    const output = await service.run({
+      taskId,
+      projectId: target,
+      mode,
+      skipLock: false,
+      previewUrl: flag(argv, 'preview-url') || null,
+      allowedFiles: allowed ? [allowed] : undefined,
+    });
+    print({
+      ok: true,
+      taskId,
+      projectId: target,
+      mode,
+      artifactId: output.artifactId,
+      reportFile: output.reportFile,
+      result: output.result,
+    });
     return;
   }
 

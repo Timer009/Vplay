@@ -1,7 +1,9 @@
 # Vplay Studio · 项目状态
 
-> 最后更新：Sprint 02（2026-11-26）｜分支 `sprint-02-project-adoption`
+> 最后更新：Sprint 03B（2026-11-27）｜分支 `sprint-03-connected-agent`
 > 已验收基线：`sprint-01-accepted` → `8058e67`（Sprint 01 真机 13/13 通过）
+> Sprint 02：`sprint-02-c05-fix` @ `fcfd880`（C06 通过，未合并 main）
+> Sprint 03A：`abc8e24`（C07 P0 安全基础）
 
 ## 1. 项目定位
 
@@ -21,7 +23,11 @@ Vplay Studio 以 OpenGame（Apache-2.0，源自 gemini-cli）为内核，目标�
 | **修改前快照 / 差异 / 回退（含备份）**                   | Sprint 02 新增       | `remote/lib/projects.cjs` + 测试 |
 | **孤儿 CLI 进程收敛**                                    | Sprint 02 新增       | `cli-runner.cjs` + `leases.cjs`  |
 | 项目记忆与连续多轮                                       | Sprint 02 新增（P1） | `memory.json` + `-c` 续接        |
-| 跨互联网协同                                             | **未验证**           | 仅保留传输层可替换性             |
+| **SSE 任务事件流（持久化 / 补发 / 心跳 / 去重）**        | Sprint 03B 新增      | `remote/lib/events.cjs` + 测试   |
+| **设备身份 / 项目授权 / 任务 owner 过滤**                | Sprint 03B 新增      | `remote/lib/devices.cjs` + CLI   |
+| **统一 versionId / artifactId / 项目外证据 + HMAC**      | Sprint 03B 新增      | `remote/lib/evidence.cjs`        |
+| **Vision 0.2.0 集成（analyze / verify / 受限 repair）**  | Sprint 03B 新增      | `remote/lib/vision-service.cjs`  |
+| 跨互联网协同（Tailscale）                                | 已安装，未登录       | 未发布 Runtime，等待认证         |
 
 ## 3. 安全加固状态（Qoder 审计 8058e67）
 
@@ -46,10 +52,12 @@ Vplay Studio 以 OpenGame（Apache-2.0，源自 gemini-cli）为内核，目标�
 1. **Sprint 02 未经真机验收**：只提供手机验收地址与步骤，真机结论待产品负责人执行。
 2. **独立安全审计仍在进行**（Qoder）：本仓库不宣称审计通过。
 3. 图像 / 视频 / 音频模态未启用（只有 DeepSeek Key），生成物走占位。
-4. Vite 项目需要**已构建的 dist**；系统不会自动执行 `npm run build`（避免在用户工程里跑脚本）。
-5. 快照不包含 `dist/`、`node_modules/`、`.git/`：回退只回退源码，不负责重建产物。
-6. 默认只监听 `127.0.0.1`；开放局域网需显式 `REMOTE_HOST`。
+4. Vite 项目回退后会**强制重建**（`npm run build`），构建失败即回退失败（fail closed）。
+5. 快照不包含 `dist/`、`node_modules/`、`.git/`；回退通过重建恢复产物。
+6. 默认只监听 `127.0.0.1`；网络模式必须显式指定本机接口地址，禁止 `0.0.0.0`。
 7. 公开模式（`VPLAY_PUBLIC_MODE=1`）会禁用 `--yolo` 并拒绝非受控工作区。
+8. Vision 需要 `VISION_DATA_CONSENT=1` 且只允许 HTML/CSS；真实模型调用需预算授权。
+9. 证据链 HMAC 只证明“由持钥宿主生成”，不是 OS 级不可篡改存储。
 
 ## 5. 风险登记
 

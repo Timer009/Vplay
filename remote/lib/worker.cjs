@@ -181,10 +181,14 @@ function createWorker(options) {
   const executorScript = options.executorScript || null;
   const timeoutMs = Number(options.timeoutMs || DEFAULT_TIMEOUT_MS);
   const publicMode = Boolean(options.publicMode);
-  const allowYolo = options.allowYolo !== false;
+  const allowYolo = options.allowYolo === true;
   const log = options.logger || ((line) => console.log(line));
   const secrets = (options.secrets || []).filter((secret) => typeof secret === 'string' && secret.length >= 6);
   const onFinished = typeof options.onFinished === 'function' ? options.onFinished : null;
+  const visionService = options.visionService || null;
+  const eventStore = options.eventStore || null;
+  const evidenceStore = options.evidenceStore || null;
+  const home = options.home || null;
 
   let current = null;
   let currentChild = null;
@@ -198,6 +202,47 @@ function createWorker(options) {
     out = out.split(path.resolve(dir)).join('<workspace>');
     out = out.split(path.resolve(legacyWorkspace)).join('<workspace>');
     return out;
+  }
+
+  function emitEvent(type, task, extra = {}) {
+    if (!eventStore) return;
+    const projectId = extra.projectId || (task && task.projectId) || 'default';
+    const data = extra.data && typeof extra.data === 'object' ? extra.data : null;
+    eventStore.append({
+      type,
+      taskId: extra.taskId || (task && task.id) || null,
+      projectId,
+      status: extra.status || null,
+      data,
+    });
+  }
+
+  function latestVersionId(projectId) {
+    if (!projects) return null;
+    try {
+      const list = projects.listSnapshots(projectId);
+      const last = list[list.length - 1];
+      return last ? `${last.seq}-${last.uid}` : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function persistEvidence(task, result, status, projectId) {
+    if (!evidenceStore) return null;
+    try {
+      return evidenceStore.writeTaskEvidence({
+        task: { ...task, status },
+        result,
+        versionId: latestVersionId(projectId),
+        events: eventStore ? eventStore.listForTask(task.id) : [],
+        logText: store.readLog(task.id) || '',
+        extra: { home: Boolean(home) },
+      });
+    } catch (error) {
+      log(`[remote] evidence write failed: ${error.message}`);
+      return null;
+    }
   }
 
   function resolveTarget(task) {
@@ -293,6 +338,105 @@ function createWorker(options) {
     };
   }
 
+  async function runVisionTaskFlow(task, target) {
+    const { projectId } = target;
+    let lockToken = null;
+    try {
+      lockToken = projects.acquireLock(projectId, { taskId: task.id }).token;
+    } catch (error) {
+      finish(task.id, 'failed', {
+        error: { code: error.code || 'PROJECT_LOCKED', message: error.message },
+      });
+      emitEvent('task.failed', task, { status: 'failed', data: { kind: 'vision' } });
+      current = null;
+      return;
+    }
+
+    try {
+      store.transition(task.id, 'running', {
+        startedAt: new Date().toISOString(),
+        pid: null,
+        projectId,
+      });
+      emitEvent('task.running', task, { status: 'running', data: { kind: 'vision' } });
+      store.appendLog(task.id, `[vision] start mode=${task.visionMode || 'analyze'}\n`);
+
+      const output = await visionService.run({
+        taskId: task.id,
+        projectId,
+        mode: task.visionMode || 'analyze',
+        allowedFiles: task.allowedFiles || undefined,
+        skipLock: true,
+      });
+
+      const verified = Boolean(
+        output.result && (output.result.validation ? output.result.validation.ok === true : output.result.ok),
+      );
+      const status = output.result && output.result.ok ? 'succeeded' : 'failed';
+      const result = {
+        ok: Boolean(output.result && output.result.ok),
+        verified,
+        outcome: (output.result && output.result.status) || null,
+        vision: {
+          status: output.result && output.result.status,
+          reportFile: output.reportFile,
+          artifactId: output.artifactId,
+          mode: task.visionMode || 'analyze',
+        },
+      };
+      const evidence = persistEvidence(task, result, status, projectId);
+      result.versionId = evidence ? evidence.versionId : latestVersionId(projectId);
+      result.artifactId = evidence ? evidence.artifactId : output.artifactId;
+      result.evidenceDir = evidence ? evidence.dir : null;
+      result.previewPath = `/p/${projectId}/`;
+
+      if (onFinished) {
+        try {
+          onFinished({ taskId: task.id, projectId, status, verified });
+        } catch (error) {
+          log(`[remote] onFinished failed: ${error.message}`);
+        }
+      }
+      finish(task.id, status, { result });
+      emitEvent(status === 'succeeded' ? 'task.succeeded' : 'task.failed', task, {
+        status,
+        data: { verified, kind: 'vision' },
+      });
+      store.appendLog(task.id, `[vision] finished ${status}\n`);
+      log(`[remote] vision task ${task.id} ${status}`);
+    } catch (error) {
+      const message = scrub(error.message, target.dir);
+      const result = {
+        ok: false,
+        verified: false,
+        outcome: 'failed',
+        vision: { error: { code: error.code || 'VISION_FAILED', message } },
+      };
+      const evidence = persistEvidence(task, result, 'failed', projectId);
+      result.versionId = evidence ? evidence.versionId : latestVersionId(projectId);
+      result.artifactId = evidence ? evidence.artifactId : null;
+      result.evidenceDir = evidence ? evidence.dir : null;
+      if (onFinished) {
+        try {
+          onFinished({ taskId: task.id, projectId, status: 'failed', verified: false });
+        } catch {
+          // 忽略
+        }
+      }
+      finish(task.id, 'failed', {
+        error: { code: error.code || 'VISION_FAILED', message },
+        result,
+      });
+      emitEvent('task.failed', task, { status: 'failed', data: { verified: false, kind: 'vision' } });
+      store.appendLog(task.id, `[vision] failed: ${message}\n`);
+      log(`[remote] vision task ${task.id} failed: ${message}`);
+    } finally {
+      if (lockToken) projects.releaseLock(projectId, lockToken);
+      current = null;
+      tick();
+    }
+  }
+
   function run(task) {
     current = task;
     let target;
@@ -307,6 +451,19 @@ function createWorker(options) {
     }
 
     const { project, dir, projectId } = target;
+
+    // Sprint03B：Vision 任务复用同一队列/状态机/锁，仅执行器不同
+    if (task.kind === 'vision') {
+      if (!visionService) {
+        finish(task.id, 'failed', {
+          error: { code: 'VISION_UNAVAILABLE', message: 'vision service is not configured' },
+        });
+        current = null;
+        return;
+      }
+      runVisionTaskFlow(task, target);
+      return;
+    }
 
     if (publicMode && project && !project.managed) {
       finish(task.id, 'failed', {
@@ -390,6 +547,7 @@ function createWorker(options) {
       projectId,
       snapshotSeq,
     });
+    emitEvent('task.running', task, { status: 'running' });
     currentChild = child;
 
     let stderrBuffer = '';
@@ -405,6 +563,7 @@ function createWorker(options) {
       if (phase === 'verifying' && store.get(task.id)?.status === 'running') {
         try {
           store.transition(task.id, 'verifying');
+          emitEvent('task.verifying', task, { status: 'verifying' });
         } catch {
           // 与退出竞争，忽略
         }
@@ -499,7 +658,19 @@ function createWorker(options) {
       }
       if (project) projects.releaseLock(projectId, lockToken);
 
+      const evidence = persistEvidence(task, enriched.result, status, projectId);
+      if (enriched.result) {
+        enriched.result.versionId = evidence ? evidence.versionId : latestVersionId(projectId);
+        enriched.result.artifactId = evidence ? evidence.artifactId : null;
+        enriched.result.evidenceDir = evidence ? evidence.dir : null;
+        enriched.result.previewPath = projectId ? `/p/${projectId}/` : '/legacy/';
+      }
+
       finish(task.id, status, enriched);
+      emitEvent(status === 'succeeded' ? 'task.succeeded' : 'task.failed', task, {
+        status,
+        data: { verified, outcome },
+      });
       store.appendLog(task.id, `[remote] ${new Date().toISOString()} finished: ${status}\n`);
       log(`[remote] task ${task.id} ${status}`);
       current = null;

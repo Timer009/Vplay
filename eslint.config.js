@@ -24,6 +24,7 @@ export default tseslint.config(
       '.integration-tests/**',
       'packages/**/.integration-test/**',
       'dist/**',
+      'vendor/**',
       'docs-site/.next/**',
       'docs-site/out/**',
       // agent-test/ is the agent's template corpus (game scaffolding,

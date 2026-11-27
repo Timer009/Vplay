@@ -46,6 +46,10 @@ const { createProjectRegistry, ProjectError } = require('./lib/projects.cjs');
 const { createPreviewServer } = require('./lib/preview.cjs');
 const { recoverStaleLeases } = require('./lib/leases.cjs');
 const { copyPreviewTree } = require('./lib/paths.cjs');
+const { createEventStore } = require('./lib/events.cjs');
+const { createEvidenceStore } = require('./lib/evidence.cjs');
+const { createDeviceStore } = require('./lib/devices.cjs');
+const { createVisionService } = require('./lib/vision-service.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
@@ -118,10 +122,35 @@ const RUNTIME_DIR = projects
   ? path.join(projects.home, '.opengame')
   : path.join(WORKSPACE, '.opengame');
 
+const EVIDENCE_HMAC_KEY = process.env.EVIDENCE_HMAC_KEY || null;
+const eventStore = createEventStore({
+  file: projects
+    ? path.join(RUNTIME_ROOT, 'events', 'events.jsonl')
+    : path.join(RUNTIME_DIR, 'events', 'events.jsonl'),
+  hmacKey: EVIDENCE_HMAC_KEY,
+  logger: (line) => console.log(line),
+});
+const evidenceStore = createEvidenceStore({
+  home: RUNTIME_ROOT,
+  // 单工作区模式：证据放到 .opengame 内（被 hashTree/快照排除），避免污染任务变更检测
+  root: projects ? path.join(RUNTIME_ROOT, 'evidence') : path.join(RUNTIME_DIR, 'evidence'),
+  hmacKey: EVIDENCE_HMAC_KEY,
+});
+const devices = createDeviceStore({
+  file: projects ? path.join(projects.home, 'devices.json') : path.join(RUNTIME_DIR, 'devices.json'),
+});
+
 const store = createTaskStore({
   runtimeDir: RUNTIME_DIR,
   workspaceDir: RUNTIME_ROOT,
   redactSecrets: TOKEN ? [TOKEN] : [],
+});
+
+const visionService = createVisionService({
+  registry: projects,
+  home: RUNTIME_ROOT,
+  eventStore,
+  logger: (line) => console.log(line),
 });
 
 const worker = createWorker({
@@ -135,6 +164,10 @@ const worker = createWorker({
   publicMode: PUBLIC_MODE,
   allowYolo: process.env.VPLAY_ALLOW_YOLO === '1',
   secrets: TOKEN ? [TOKEN] : [],
+  visionService,
+  eventStore,
+  evidenceStore,
+  home: RUNTIME_ROOT,
   onFinished: ({ projectId, verified }) => {
     try {
       // C07-P1-03：只有功能验证通过的任务才切换预览；失败保留 last-known-good。
@@ -220,7 +253,7 @@ function pruneSessions() {
   }
 }
 
-function createSession() {
+function createSession(deviceId = null, admin = false) {
   pruneSessions();
   const sessionId = crypto.randomBytes(24).toString('base64url');
   const now = Date.now();
@@ -228,6 +261,8 @@ function createSession() {
     createdAt: now,
     lastSeen: now,
     tokenFingerprint: REMOTE_ENABLED ? digest(TOKEN).toString('hex') : null,
+    deviceId,
+    admin: admin === true,
   });
   return sessionId;
 }
@@ -309,15 +344,44 @@ function sessionFrom(req) {
   return parseCookies(req)[COOKIE_NAME] || '';
 }
 
-/** 鉴权来源：主 Token（Bearer）或短期 Session（Cookie）。 */
-function authVia(req) {
-  if (tokenMatches(bearerFrom(req))) return 'token';
-  if (validSession(sessionFrom(req))) return 'session';
+/** 鉴权来源：管理员主 Token / 设备 Token / 短期 Session（Cookie）。 */
+function authState(req) {
+  const bearer = bearerFrom(req);
+  if (tokenMatches(bearer)) return { kind: 'admin', deviceId: null };
+  const device = devices.authenticate(bearer);
+  if (device) return { kind: 'device', deviceId: device.id, device };
+  const sessionId = sessionFrom(req);
+  if (validSession(sessionId)) {
+    const session = sessions.get(sessionKey(sessionId));
+    const deviceId = session ? session.deviceId || null : null;
+    return {
+      kind: 'session',
+      deviceId,
+      admin: Boolean(session && session.admin === true),
+      device: deviceId ? devices.list().find((item) => item.id === deviceId) || null : null,
+    };
+  }
   return null;
 }
 
+function authVia(req) {
+  const state = authState(req);
+  if (!state) return null;
+  if (state.kind === 'admin') return 'token';
+  return state.kind;
+}
+
 function isAuthed(req) {
-  return Boolean(authVia(req));
+  return Boolean(authState(req));
+}
+
+/** 设备项目授权：管理员始终允许。 */
+function projectAllowed(auth, projectId) {
+  if (!auth) return false;
+  if (auth.kind === 'admin' || auth.admin === true) return true;
+  const device = auth.device || (auth.deviceId ? devices.list().find((item) => item.id === auth.deviceId) : null);
+  if (!device) return false;
+  return devices.isProjectAllowed(device, projectId);
 }
 
 function commonHeaders(extra) {
@@ -449,6 +513,8 @@ function publicTask(task) {
   return {
     id: task.id,
     projectId: task.projectId || 'default',
+    kind: task.kind || 'prompt',
+    createdBy: task.createdBy || 'admin',
     status: task.status,
     text: task.text,
     createdAt: task.createdAt,
@@ -468,6 +534,18 @@ function publicTask(task) {
           verification: task.result.verification,
           changedFiles: task.result.changedFiles,
           diffSummary: task.result.diffSummary,
+          versionId: task.result.versionId || null,
+          artifactId: task.result.artifactId || null,
+          previewPath: task.result.previewPath || null,
+          vision: task.result.vision
+            ? {
+                status: task.result.vision.status || null,
+                mode: task.result.vision.mode || null,
+                reportFile: task.result.vision.reportFile || null,
+                artifactId: task.result.vision.artifactId || null,
+                error: task.result.vision.error || null,
+              }
+            : null,
         }
       : null,
   };
@@ -553,6 +631,7 @@ const server = http.createServer(async (req, res) => {
       secFetchSite === 'cross-site' &&
       method === 'GET' &&
       (pathname === '/status' ||
+        pathname === '/events' ||
         pathname === '/tasks' ||
         pathname.startsWith('/tasks/') ||
         pathname === '/projects' ||
@@ -607,13 +686,15 @@ const server = http.createServer(async (req, res) => {
       } catch {
         candidate = '';
       }
-      if (!tokenMatches(candidate)) {
+      const isAdmin = tokenMatches(candidate);
+      const device = isAdmin ? null : devices.authenticate(candidate);
+      if (!isAdmin && !device) {
         console.warn(`[remote] failed console login from ${ip}`);
         sendJson(res, 401, { ok: false, error: 'invalid token' });
         return;
       }
       // P1-2：下发短期 Session，而不是把主 Token 写进 Cookie
-      const sessionId = createSession();
+      const sessionId = createSession(device ? device.id : null, isAdmin);
       const secure = req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https';
       const cookie = [
         `${COOKIE_NAME}=${encodeURIComponent(sessionId)}`,
@@ -644,7 +725,12 @@ const server = http.createServer(async (req, res) => {
           'Cache-Control': 'no-store',
         }),
       );
-      res.end(JSON.stringify({ ok: true, expiresIn: SESSION_TTL_MS / 1000 }));
+      res.end(JSON.stringify({
+        ok: true,
+        role: isAdmin ? 'admin' : 'device',
+        device: device ? { id: device.id, name: device.name, projects: device.projects } : null,
+        expiresIn: SESSION_TTL_MS / 1000,
+      }));
       return;
     }
 
@@ -694,24 +780,75 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === '/events' && method === 'GET') {
+      if (!requireAuth(req, res)) return;
+      res.writeHead(
+        200,
+        commonHeaders({
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-store',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        }),
+      );
+      const last = req.headers['last-event-id'] || params.get('lastEventId') || '0';
+      const send = (record) => {
+        res.write(`id: ${record.id}\ndata: ${JSON.stringify(record)}\n\n`);
+      };
+      res.write('retry: 3000\n\n');
+      for (const record of eventStore.listAfter(last, 2000)) send(record);
+      const unsubscribe = eventStore.subscribe((record) => {
+        try {
+          send(record);
+        } catch {
+          // 连接已断开
+        }
+      });
+      const ping = setInterval(() => {
+        try {
+          res.write(': ping\n\n');
+        } catch {
+          // 忽略
+        }
+      }, 15000);
+      const cleanup = () => {
+        clearInterval(ping);
+        unsubscribe();
+      };
+      req.on('close', cleanup);
+      req.on('error', cleanup);
+      res.on('close', cleanup);
+      return;
+    }
+
     if (pathname === '/tasks' && method === 'GET') {
       if (!requireAuth(req, res)) return;
+      const auth = authState(req);
       const limit = Math.min(Number(params.get('limit') || 20), 50);
       const projectFilter = params.get('projectId');
       let tasks = store.list();
+      // C07-P1-04：设备只看到自己创建的任务；管理员看全部
+      if (auth && auth.kind !== 'admin' && auth.admin !== true) {
+        tasks = tasks.filter((t) => (t.createdBy || 'admin') === auth.deviceId);
+      }
       if (projectFilter) tasks = tasks.filter((t) => (t.projectId || 'default') === projectFilter);
       tasks = tasks.slice(-limit).reverse().map(publicTask);
-      sendJson(res, 200, { ok: true, tasks });
+      sendJson(res, 200, { ok: true, tasks, role: auth && auth.kind });
       return;
     }
 
     if (pathname.startsWith('/tasks/') && method === 'GET') {
       if (!requireAuth(req, res)) return;
+      const auth = authState(req);
       const rest = pathname.slice('/tasks/'.length);
       const [id, action] = rest.split('/');
       const task = store.get(id);
       if (!task) {
         sendJson(res, 404, { ok: false, error: 'task not found' });
+        return;
+      }
+      if (auth && auth.kind !== 'admin' && auth.admin !== true && (task.createdBy || 'admin') !== auth.deviceId) {
+        sendJson(res, 403, { ok: false, error: 'task is not visible to this device' });
         return;
       }
       if (action === 'log') {
@@ -764,9 +901,14 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 404, { ok: false, error: `unknown projectId: ${projectId}` });
         return;
       }
+      const auth = authState(req);
+      if (!projectAllowed(auth, projectId)) {
+        sendJson(res, 403, { ok: false, error: 'device is not authorized for this project' });
+        return;
+      }
 
       const via = authVia(req);
-      // C07-P0-01：yolo 必须由主 token 显式按任务申请；Session 不能开启 yolo
+      // C07-P0-01：yolo 必须由主 token 显式按任务申请；Session/设备不能开启 yolo
       const requestedYolo = payload.allowYolo === true;
       if (requestedYolo && via !== 'token') {
         sendJson(res, 403, { ok: false, error: 'yolo requires bearer token authorization' });
@@ -779,11 +921,21 @@ const server = http.createServer(async (req, res) => {
           idempotencyKey: payload.idempotencyKey,
           source: 'remote',
           projectId,
+          createdBy: (auth && auth.deviceId) || 'admin',
           allowYolo: requestedYolo && via === 'token',
         });
         console.log(
           `[remote] task ${task.id} ${duplicate ? 'already exists (idempotent)' : 'queued'} project=${projectId}`,
         );
+        if (!duplicate) {
+          eventStore.append({
+            type: 'task.created',
+            taskId: task.id,
+            projectId,
+            status: 'queued',
+            data: { kind: task.kind || 'prompt', createdBy: task.createdBy || 'admin' },
+          });
+        }
         sendJson(res, duplicate ? 200 : 202, {
           ok: true,
           duplicate,
@@ -849,7 +1001,11 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 200, { ok: true, mode: 'workspace', projects: [] });
         return;
       }
-      const items = projects.list().map((item) => ({
+      const auth = authState(req);
+      const visible = projects
+        .list()
+        .filter((item) => projectAllowed(auth, item.id));
+      const items = visible.map((item) => ({
         id: item.id,
         name: item.name,
         kind: item.kind,
@@ -864,6 +1020,77 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (/^\/projects\/[a-z0-9-]+\/vision\/[a-zA-Z0-9_-]+$/.test(pathname) && method === 'GET') {
+      if (!requireAuth(req, res)) return;
+      const parts = pathname.split('/');
+      const projectId = parts[2];
+      const taskId = parts[4];
+      if (!projectAllowed(authState(req), projectId)) {
+        sendJson(res, 403, { ok: false, error: 'device is not authorized for this project' });
+        return;
+      }
+      const task = store.get(taskId);
+      if (!task || task.kind !== 'vision' || (task.projectId || 'default') !== projectId) {
+        sendJson(res, 404, { ok: false, error: 'vision task not found' });
+        return;
+      }
+      const dir = path.join(RUNTIME_ROOT, 'evidence', projectId, taskId);
+      let report = null;
+      try {
+        const file = path.join(dir, 'vision-report.json');
+        if (fs.existsSync(file) && fs.statSync(file).size <= 2 * 1024 * 1024) {
+          report = JSON.parse(fs.readFileSync(file, 'utf-8'));
+        }
+      } catch {
+        report = null;
+      }
+      let screenshots = [];
+      try {
+        const shotDir = path.join(dir, 'screenshots');
+        screenshots = fs
+          .readdirSync(shotDir)
+          .filter((name) => name.endsWith('.png'))
+          .slice(0, 20)
+          .map((name) => `/projects/${projectId}/vision/${taskId}/screenshot/${name}`);
+      } catch {
+        screenshots = [];
+      }
+      sendJson(res, 200, { ok: true, task: publicTask(task), report, screenshots });
+      return;
+    }
+
+    if (/^\/projects\/[a-z0-9-]+\/vision\/[a-zA-Z0-9_-]+\/screenshot\/[A-Za-z0-9._-]+\.png$/.test(pathname) && method === 'GET') {
+      if (!requireAuth(req, res)) return;
+      const parts = pathname.split('/');
+      const projectId = parts[2];
+      const taskId = parts[4];
+      const name = parts[6];
+      if (!projectAllowed(authState(req), projectId)) {
+        sendJson(res, 403, { ok: false, error: 'device is not authorized for this project' });
+        return;
+      }
+      const task = store.get(taskId);
+      if (!task || task.kind !== 'vision' || (task.projectId || 'default') !== projectId) {
+        sendJson(res, 404, { ok: false, error: 'vision task not found' });
+        return;
+      }
+      const file = path.join(RUNTIME_ROOT, 'evidence', projectId, taskId, 'screenshots', name);
+      const base = path.join(RUNTIME_ROOT, 'evidence', projectId, taskId, 'screenshots');
+      if (!file.startsWith(base + path.sep) || !fs.existsSync(file)) {
+        sendJson(res, 404, { ok: false, error: 'screenshot not found' });
+        return;
+      }
+      const data = fs.readFileSync(file);
+      res.writeHead(200, {
+        'Content-Type': 'image/png',
+        'Content-Length': data.length,
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      res.end(data);
+      return;
+    }
+
     if (pathname.startsWith('/projects/') && method === 'GET') {
       if (!requireAuth(req, res)) return;
       if (!projects) {
@@ -872,6 +1099,10 @@ const server = http.createServer(async (req, res) => {
       }
       const rest = pathname.slice('/projects/'.length).split('/');
       const projectId = rest[0];
+      if (!projectAllowed(authState(req), projectId)) {
+        sendJson(res, 403, { ok: false, error: 'device is not authorized for this project' });
+        return;
+      }
       try {
         const detail = projects.get(projectId);
         if (rest[1] === 'diff') {
@@ -906,6 +1137,79 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname.startsWith('/projects/') && pathname.endsWith('/vision') && method === 'POST') {
+      if (!requireAuth(req, res)) return;
+      if (!projects) {
+        sendJson(res, 404, { ok: false, error: 'projects mode is not enabled' });
+        return;
+      }
+      const projectId = pathname.split('/')[2];
+      const auth = authState(req);
+      if (!projectAllowed(auth, projectId)) {
+        sendJson(res, 403, { ok: false, error: 'device is not authorized for this project' });
+        return;
+      }
+      const raw = await readBody(req);
+      if (raw === null) return;
+      let payload = {};
+      try {
+        payload = JSON.parse(raw || '{}');
+      } catch {
+        sendJson(res, 400, { ok: false, error: 'body must be valid JSON' });
+        return;
+      }
+      const mode = ['analyze', 'verify', 'repair'].includes(payload.mode)
+        ? payload.mode
+        : 'analyze';
+      const allowedFiles = (Array.isArray(payload.allowedFiles) ? payload.allowedFiles : [])
+        .filter((item) => typeof item === 'string' && /\.(html?|css)$/i.test(item))
+        .slice(0, 5);
+      try {
+        const { task, duplicate } = store.create({
+          text: `Vision ${mode} · ${projectId}`,
+          idempotencyKey: payload.idempotencyKey,
+          source: 'remote',
+          projectId,
+          kind: 'vision',
+          visionMode: mode,
+          allowedFiles,
+          createdBy: (auth && auth.deviceId) || 'admin',
+          allowYolo: false,
+        });
+        if (!duplicate) {
+          eventStore.append({
+            type: 'task.created',
+            taskId: task.id,
+            projectId,
+            status: 'queued',
+            data: { kind: 'vision', mode },
+          });
+        }
+        sendJson(res, duplicate ? 200 : 202, {
+          ok: true,
+          duplicate,
+          task: publicTask(task),
+          poll: `/projects/${projectId}/vision/${task.id}`,
+        });
+      } catch (error) {
+        if (error instanceof DuplicateTaskError) {
+          sendJson(res, 409, {
+            ok: false,
+            error: error.message,
+            existingTask: publicTask(error.existing),
+          });
+          return;
+        }
+        if (error instanceof ValidationError) {
+          sendJson(res, 400, { ok: false, error: error.message });
+          return;
+        }
+        console.error(`[remote] vision task create failed: ${error.message}`);
+        sendJson(res, 500, { ok: false, error: 'failed to create vision task' });
+      }
+      return;
+    }
+
     if (pathname.startsWith('/projects/') && pathname.endsWith('/rollback') && method === 'POST') {
       if (!requireAuth(req, res)) return;
       if (!projects) {
@@ -913,6 +1217,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const projectId = pathname.split('/')[2];
+      if (!projectAllowed(authState(req), projectId)) {
+        sendJson(res, 403, { ok: false, error: 'device is not authorized for this project' });
+        return;
+      }
       const active = store.activeTask();
       if (active && (active.projectId || 'default') === projectId) {
         sendJson(res, 409, {
@@ -1049,6 +1357,16 @@ if (recovered.length > 0) {
   console.log(
     `[remote] marked ${recovered.length} interrupted task(s) from a previous run: ${recovered.join(', ')}`,
   );
+  for (const taskId of recovered) {
+    const task = store.get(taskId);
+    eventStore.append({
+      type: 'task.interrupted',
+      taskId,
+      projectId: (task && task.projectId) || 'default',
+      status: 'interrupted',
+      data: { reason: 'service restarted while running' },
+    });
+  }
 }
 const leaseActions = recoverStaleLeases({
   leasesDir: path.join(RUNTIME_DIR, 'leases'),
