@@ -62,3 +62,43 @@
 5. 用负对照证明：模型进程无法读取 `EVIDENCE_HMAC_KEY`、无法写 `evidence/`、无法访问其它项目。
 
 在满足上述 5 条前，本仓库一律标记 **OS_ISOLATION=NOT_IMPLEMENTED**。
+
+---
+
+## 6. B12 实际环境只读检查（2026-11-28）
+
+```text
+用户：54167（非提权；BUILTIN\Administrators 为 deny-only）
+OS：Windows 11 家庭版 10.0.26300
+本地账号：54167（启用）、CodexSandboxOffline/Online（启用，其他 Agent 的沙箱账号）、
+          Administrator/Guest/DefaultAccount/WDAGUtilityAccount（禁用）
+~/.vplay ACL：SYSTEM / Administrators / 54167 均 Full（继承）
+WindowsSandbox.exe：不存在
+WSL：未安装
+Docker：不可用
+可选功能（Windows Sandbox/Hyper-V/Containers/WSL）：查询需要提权 → NOT_AVAILABLE_WITHOUT_ADMIN
+8787/8788：无监听
+node.exe 入站规则：4 条 Public Allow（未修改）
+```
+
+结论：
+
+- 本机**当前不可用** Windows Sandbox / Hyper-V / 容器 / WSL 作为隔离载体（未安装或需提权）。
+- 已有 `CodexSandbox*` 账号属于其他 Agent，**不得擅自使用/改密/改 ACL**。
+- 可落地的最小方案仍是：用户批准后创建独立低权限账号 + 对实验目录/证据目录做 ACL，
+  并以该账号运行模型执行器；B12 只提供脚本与门禁，**未执行**。
+- 证据目录仍与宿主同权限域；不得宣称不可篡改。
+
+## 7. B12 准备脚本
+
+目录：`remote/tools/trusted-lab/`
+
+- `isolation-check.ps1`：只读检查（账号/OS/可选功能/ACL/端口/防火墙计数/Tailscale）
+- `lab-config.example.json`：实验配置样例（无密钥）
+- `start-lab.ps1`：默认 DryRun；`-Approve` 仅创建 lab 目录并启动无任务 Runtime
+- `stop-lab.ps1`：只停止 pid 文件中的进程
+- `cleanup-lab.ps1`：默认 DryRun；限定 labRoot
+- `recover-lab.ps1`：打印 journal / anchor / quota 检查
+- `prepare-spacer-lab.ps1`：默认 DryRun；复制 Spacer 到独立实验目录并校验哈希
+
+这些脚本**未在 B12 执行**（除只读检查命令），状态保持 `NOT_IMPLEMENTED`。

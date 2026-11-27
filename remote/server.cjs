@@ -113,12 +113,42 @@ for (const entry of String(process.env.REMOTE_ALLOWED_HOSTS || '').split(',')) {
   if (value) ALLOWED_HOSTS.add(value);
 }
 
+const EVIDENCE_HMAC_KEY = process.env.EVIDENCE_HMAC_KEY || null;
 const { token: TOKEN, source: TOKEN_SOURCE } = resolveToken();
 const REMOTE_ENABLED = Boolean(TOKEN);
 // B10 / C09 B-09：预览鉴权改为「短期、会话绑定、可吊销」的票据。
 // PREVIEW_ACCESS_KEY 仅作为启用开关（不再把静态哈希写进 Cookie）。
-const PREVIEW_AUTH_ENABLED = Boolean((process.env.PREVIEW_ACCESS_KEY || '').trim());
+const PREVIEW_ACCESS_KEY = (process.env.PREVIEW_ACCESS_KEY || '').trim();
+const PREVIEW_AUTH_ENABLED = Boolean(PREVIEW_ACCESS_KEY);
 const PREVIEW_TICKET_TTL_MS = 4 * 60 * 60 * 1000;
+
+// B12 / C11：对外部署（Serve/代理/公共模式）必须 fail-closed，不能静默开放预览。
+if (SERVE_MODE) {
+  const problems = [];
+  if (!PREVIEW_AUTH_ENABLED) {
+    problems.push('PREVIEW_ACCESS_KEY is required in Serve/proxy mode');
+  } else if (PREVIEW_ACCESS_KEY.length < 16) {
+    problems.push('PREVIEW_ACCESS_KEY must be at least 16 characters');
+  }
+  if (!EVIDENCE_HMAC_KEY || EVIDENCE_HMAC_KEY.length < 16) {
+    problems.push('EVIDENCE_HMAC_KEY (>=16 chars) is required in Serve/proxy mode');
+  }
+  const externalHosts = String(process.env.REMOTE_ALLOWED_HOSTS || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .filter((item) => !['localhost', '127.0.0.1', '::1'].includes(item));
+  if (externalHosts.length === 0) {
+    problems.push('REMOTE_ALLOWED_HOSTS must include the MagicDNS/Host name in Serve/proxy mode');
+  }
+  if (!['127.0.0.1', 'localhost', '::1'].includes(HOST)) {
+    problems.push(`REMOTE_HOST must stay loopback in Serve/proxy mode (got ${HOST})`);
+  }
+  if (problems.length) {
+    console.error(`[remote] refuse to start (Serve/proxy fail-closed):\n- ${problems.join('\n- ')}`);
+    process.exit(1);
+  }
+}
 
 const projects = process.env.VPLAY_HOME
   ? createProjectRegistry({ home: process.env.VPLAY_HOME })
@@ -128,7 +158,6 @@ const RUNTIME_DIR = projects
   ? path.join(projects.home, '.opengame')
   : path.join(WORKSPACE, '.opengame');
 
-const EVIDENCE_HMAC_KEY = process.env.EVIDENCE_HMAC_KEY || null;
 const eventStore = createEventStore({
   file: projects
     ? path.join(RUNTIME_ROOT, 'events', 'events.jsonl')
@@ -806,10 +835,8 @@ const server = http.createServer(async (req, res) => {
       }
       // P1-2：下发短期 Session，而不是把主 Token 写进 Cookie
       const sessionId = createSession(device ? device.id : null, isAdmin);
-      // B10：只有明确信任回环代理（Tailscale Serve）时才接受 X-Forwarded-Proto
-      const secure =
-        Boolean(req.socket.encrypted) ||
-        (TRUST_PROXY && req.headers['x-forwarded-proto'] === 'https');
+      // B12：Serve/代理模式下强制 Secure（即使 XFP 缺失也 fail-closed）
+      const secure = Boolean(req.socket.encrypted) || TRUST_PROXY;
       const cookie = [
         `${COOKIE_NAME}=${encodeURIComponent(sessionId)}`,
         'HttpOnly',
@@ -1650,6 +1677,25 @@ server.listen(PORT, HOST, () => {
     console.log('[remote] serial worker disabled (REMOTE_AUTORUN=0)');
   }
   if (AUTHORUN) worker.start();
+
+  // B12 / C11-02：运行时安全回收（宽限期 + 租约 + 写入标记保护）
+  if (projects) {
+    const gcTimer = setInterval(() => {
+      try {
+        const results = projects.reapSnapshots();
+        for (const item of results) {
+          if (item.removed || item.quarantined) {
+            console.log(
+              `[remote] snapshot gc ${item.id}: removed=${item.removed} quarantined=${item.quarantined} registered=${item.registered} onDisk=${item.onDisk}`,
+            );
+          }
+        }
+      } catch (error) {
+        console.error(`[remote] snapshot gc failed: ${error.message}`);
+      }
+    }, 60000);
+    if (typeof gcTimer.unref === 'function') gcTimer.unref();
+  }
 
   previewServer.listen(PREVIEW_PORT, HOST, () => {
     console.log(`[preview] game preview on http://${HOST}:${PREVIEW_PORT} (read-only, no control API)`);

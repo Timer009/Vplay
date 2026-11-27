@@ -51,6 +51,19 @@
 - `rollback` 获取项目锁（worker/Vision 已持锁时传 `lockToken`），构建使用异步
   `spawn`，回退期间 SSE 心跳不受阻塞；journal 只有全部校验通过才删除。
 
+## 2.3 快照 GC / 租约（B12 / C11-01 + C11-02）
+
+- 快照提交：先写注册表（裁剪只影响引用），再把「已提交且未引用」的目录写入
+  `.snapshot-gc.json`（含宽限期 `deleteAfter`）；**不在提交路径删除目录**。
+- 运行时 reaper（启动 + 每 60s + 显式调用）：
+  - tombstone 到期且未被引用/未租用 → 删除目录与 manifest；
+  - 未登记目录：有 `.writing.json` 且 pid 存活或很新 → 跳过；
+  - 其余未登记目录只移动到 `.snapshot-orphans/`，**绝不直接删除**；
+  - 幂等；输出 `.snapshot-quota.json`。
+- 读者租约：`runtime/snapshot-leases/<id>.<uid>.<pid>.<rand>.lease`；
+  `diff` 与 `rollback` 在读取期间持租约，裁剪会跳过被租用的快照。
+- 崩溃 writer：`.writing.json` 的 pid 死亡且时间过旧后可被隔离；不误伤活跃写入。
+
 ## 3. Vision 任务崩溃
 
 - apply 前写 `evidence/<project>/<task>/apply-journal.json`（含 root 与 before/after 摘要）；

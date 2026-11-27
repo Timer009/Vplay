@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "labRoot": "C:\\Users\\<user>\\vplay-lab",
+  "workspace": "<labRoot>\\workspace",
+  "vplayHome": "<labRoot>\\home",
+  "evidence": "<labRoot>\\home\\evidence",
+  "logs": "<labRoot>\\logs",
+  "controlPort": 18787,
+  "previewPort": 18788,
+  "bindHost": "127.0.0.1",
+  "publicMode": true,
+  "trustProxy": false,
+  "previewAuthRequired": true,
+  "hmacRequired": true,
+  "model": {
+    "provider": "qwen-compatible",
+    "requestsPerTask": 4,
+    "maxTokensPerTask": 20000,
+    "budgetNote": "由外层 provider 限额；本仓库不保存 key，不实现计费"
+  },
+  "isolation": {
+    "status": "NOT_IMPLEMENTED",
+    "agentUser": "<low-priv-user>",
+    "separateFromUserProjects": true,
+    "evidenceReadOnlyForAgent": false,
+    "networkEgressRestricted": false
+  }
+}

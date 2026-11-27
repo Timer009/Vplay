@@ -224,6 +224,9 @@ test('B10-C5/B-07: Serve/proxy mode refuses the test seam even on loopback', asy
     const publicMode = await rejectsSeam({
       VPLAY_PUBLIC_MODE: '1',
       REMOTE_ALLOW_TEST_SEAM: '1',
+      PREVIEW_ACCESS_KEY: '0123456789abcdef',
+      EVIDENCE_HMAC_KEY: 'fedcba9876543210',
+      REMOTE_ALLOWED_HOSTS: 'timer009.tail199672.ts.net',
       VPLAY_HOME: publicHome,
     });
     assert.equal(publicMode.code, 1);
@@ -232,6 +235,9 @@ test('B10-C5/B-07: Serve/proxy mode refuses the test seam even on loopback', asy
     const proxyMode = await rejectsSeam({
       REMOTE_TRUST_PROXY: '1',
       REMOTE_ALLOW_TEST_SEAM: '1',
+      PREVIEW_ACCESS_KEY: '0123456789abcdef',
+      EVIDENCE_HMAC_KEY: 'fedcba9876543210',
+      REMOTE_ALLOWED_HOSTS: 'timer009.tail199672.ts.net',
       VPLAY_HOME: proxyHome,
     });
     assert.equal(proxyMode.code, 1);

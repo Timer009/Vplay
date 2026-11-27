@@ -275,13 +275,27 @@ function withHomeLock(home, fn, options = {}) {
     // 只释放自己持有的锁；被他人回收/替换时绝不删除
     const info = readLockInfo(file);
     if (info && info.token === token) {
-      for (let attempt = 0; attempt < 5; attempt += 1) {
+      let released = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
         try {
           fs.rmSync(file, { force: true });
+          released = true;
           break;
         } catch (error) {
-          if (!['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) break;
+          if (!['EPERM', 'EACCES', 'EBUSY', 'ENOENT'].includes(error.code)) break;
           sleepSync(10 + Math.floor(Math.random() * 15));
+        }
+      }
+      if (!released) {
+        // Windows 上读句柄可能短暂阻止删除：写入 released 标记，5s 后可被安全回收
+        try {
+          fs.writeFileSync(
+            file,
+            JSON.stringify({ pid: 0, token: 'released', at: Date.now() }),
+            'utf-8',
+          );
+        } catch {
+          // 交给人工/下次回收
         }
       }
     }
@@ -452,6 +466,9 @@ function createProjectRegistry(options = {}) {
   const registryFile = path.join(home, 'projects.json');
   const runtimeDir = path.join(home, 'runtime');
   const locksDir = path.join(runtimeDir, 'locks');
+  // B12：快照配额与 GC 参数（测试可覆盖）
+  const maxSnapshots = Math.max(2, Number(options.maxSnapshots || MAX_SNAPSHOTS));
+  const snapshotGraceMs = Math.max(0, Number(options.snapshotGraceMs ?? 30000));
 
   fs.mkdirSync(projectsRoot, { recursive: true });
   fs.mkdirSync(locksDir, { recursive: true });
@@ -506,6 +523,103 @@ function createProjectRegistry(options = {}) {
 
   function snapshotsDir(id) {
     return path.join(projectDirOf(id), '.snapshots');
+  }
+
+  // ---- B12 / C11-01/C11-02：快照租约、GC 队列与安全回收 ----
+  function leasesDir() {
+    return path.join(runtimeDir, 'snapshot-leases');
+  }
+
+  function gcFileOf(id) {
+    return path.join(projectDirOf(id), '.snapshot-gc.json');
+  }
+
+  function quotaFileOf(id) {
+    return path.join(projectDirOf(id), '.snapshot-quota.json');
+  }
+
+  function writingMarkerOf(dir) {
+    return path.join(dir, '.writing.json');
+  }
+
+  function readGc(id) {
+    const state = readJson(gcFileOf(id), null);
+    if (!state || !Array.isArray(state.tombstones)) return { version: 1, tombstones: [] };
+    return state;
+  }
+
+  function writeGc(id, state) {
+    writeJson(gcFileOf(id), { version: 1, tombstones: state.tombstones || [] });
+  }
+
+  /** 读者租约：diff / rollback / 外部校验持有期间，裁剪不得删除对应目录。 */
+  function acquireSnapshotLease(id, uid, label = 'reader') {
+    if (!uid) return () => {};
+    const dir = leasesDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(
+      dir,
+      `${id}.${uid}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.lease`,
+    );
+    try {
+      writeJson(file, { pid: process.pid, uid, label, at: Date.now() });
+    } catch {
+      return () => {};
+    }
+    return () => {
+      try {
+        fs.rmSync(file, { force: true });
+      } catch {
+        // 忽略
+      }
+    };
+  }
+
+  function activeLeases(id) {
+    const dir = leasesDir();
+    const set = new Set();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      return set;
+    }
+    for (const name of entries) {
+      if (!name.startsWith(`${id}.`) || !name.endsWith('.lease')) continue;
+      const file = path.join(dir, name);
+      const info = readJson(file, null);
+      const stale =
+        !info ||
+        !pidAlive(Number(info.pid)) ||
+        Date.now() - Number(info.at || 0) > 10 * 60 * 1000;
+      if (stale) {
+        try {
+          fs.rmSync(file, { force: true });
+        } catch {
+          // 忽略
+        }
+        continue;
+      }
+      set.add(String(info.uid));
+    }
+    return set;
+  }
+
+  /** 正在写入的目录（marker pid 仍存活或文件很新）不得被回收。 */
+  function isActiveWriter(dir) {
+    const marker = writingMarkerOf(dir);
+    let stat;
+    try {
+      stat = fs.statSync(marker);
+    } catch {
+      return false;
+    }
+    const info = readJson(marker, null);
+    if (info && Number.isFinite(Number(info.pid))) {
+      // pid 明确死亡：即使 marker 很新，也是崩溃残留，可安全隔离
+      return pidAlive(Number(info.pid));
+    }
+    return Date.now() - stat.mtimeMs < 10000;
   }
 
   function list() {
@@ -1147,6 +1261,7 @@ function createProjectRegistry(options = {}) {
     let lastError = null;
     for (let attempt = 0; attempt < 6; attempt += 1) {
       try {
+        // B12：提交只写注册表与 GC 队列，不在快照路径里做目录删除/回收
         return withRegistryLock(() => snapshotInternal(id, label));
       } catch (error) {
         lastError = error;
@@ -1195,6 +1310,8 @@ function createProjectRegistry(options = {}) {
 
     let entry = null;
     try {
+      // B12：写入标记，供运行时 GC 识别“正在写入”的目录，绝不误隔离
+      writeJson(writingMarkerOf(dir), { pid: process.pid, at: new Date().toISOString() });
       const links = findLinks(record.srcDir);
       copyTree(record.srcDir, dir);
       // 兜底：某些平台 cpSync 会把链接本身复制过去，这里只删链接、不跟随目标
@@ -1218,14 +1335,16 @@ function createProjectRegistry(options = {}) {
       entry = entryData;
       writeJson(manifestFile(id, entry), manifest);
 
-      // OCC 合并写：写入前重读注册表并合并，写后核对 uid。
-      // 即使跨进程临界区短暂重叠，也不会静默丢条目或产生「虚假成功」。
+      // OCC 合并写：先提交注册表，再异步 GC；提交与删除严格分序。
       let persisted = false;
+      let committed = null;
+      let victims = [];
       for (let round = 0; round < 8 && !persisted; round += 1) {
         const current = readJson(snapshotsFile(id), { seq: 0, snapshots: [] });
         const existing = current.snapshots || [];
         if (existing.some((item) => item.uid === entry.uid)) {
           persisted = true;
+          committed = current;
           break;
         }
         const used = new Set(existing.map((item) => Number(item.seq)));
@@ -1247,30 +1366,61 @@ function createProjectRegistry(options = {}) {
             continue;
           }
         }
-        const merged = existing.concat(entry);
-        if (merged.length > MAX_SNAPSHOTS) {
-          const dropped = merged.splice(0, merged.length - MAX_SNAPSHOTS);
-          for (const item of dropped) {
-            fs.rmSync(path.join(snapshotsDir(id), item.dir), { recursive: true, force: true });
-            fs.rmSync(manifestFile(id, item), { force: true });
+        const leased = activeLeases(id);
+        const all = existing
+          .concat(entry)
+          .slice()
+          .sort((a, b) => Number(a.seq) - Number(b.seq));
+        let excess = Math.max(0, all.length - maxSnapshots);
+        const kept = [];
+        const dropped = [];
+        for (const item of all) {
+          const isNew = item.uid === entry.uid;
+          if (excess > 0 && !isNew && !leased.has(String(item.uid))) {
+            dropped.push(item);
+            excess -= 1;
+          } else {
+            kept.push(item);
           }
         }
+        victims = dropped;
         writeJson(snapshotsFile(id), {
           seq: Math.max(Number(current.seq) || 0, entry.seq),
-          snapshots: merged,
+          snapshots: kept,
         });
         const check = readJson(snapshotsFile(id), { snapshots: [] });
         persisted = (check.snapshots || []).some((item) => item.uid === entry.uid);
-        if (persisted) {
-          // 二次确认：给并发写入者一个落盘窗口，防止「我先验证、随后被覆盖」
-          sleepSync(20 + Math.floor(Math.random() * 20));
-          const confirm = readJson(snapshotsFile(id), { snapshots: [] });
-          persisted = (confirm.snapshots || []).some((item) => item.uid === entry.uid);
-        }
+        if (persisted) committed = check;
         if (!persisted) sleepSync(10 + Math.floor(Math.random() * 20));
       }
       if (!persisted) {
         throw new ProjectError('registry update lost, retrying', 409, 'LOCK_LOST');
+      }
+
+      // 只有“已提交且未被引用”的目录才入 GC 队列；不在此处删除，保护在途读者
+      const referenced = new Set((committed.snapshots || []).map((item) => item.dir));
+      const pending = victims.filter((item) => !referenced.has(item.dir));
+      if (pending.length) {
+        const gc = readGc(id);
+        const known = new Set(gc.tombstones.map((item) => item.uid));
+        const now = Date.now();
+        for (const item of pending) {
+          if (known.has(item.uid)) continue;
+          gc.tombstones.push({
+            uid: item.uid,
+            seq: item.seq,
+            dir: item.dir,
+            deleteAfter: now + snapshotGraceMs,
+            enqueuedAtMs: now,
+            enqueuedAt: new Date(now).toISOString(),
+          });
+        }
+        writeGc(id, gc);
+      }
+      try {
+        fs.rmSync(writingMarkerOf(dir), { force: true });
+      } catch {
+        // 忽略
       }
 
       validateSnapshot(id, entry.uid);
@@ -1287,45 +1437,58 @@ function createProjectRegistry(options = {}) {
     const record = requireProject(id);
     const from = listSnapshots(id).find((item) => Number(item.seq) === Number(fromSeq));
     if (!from) throw new ProjectError(`快照不存在: ${fromSeq}`, 404, 'SNAPSHOT_NOT_FOUND');
-    const fromDir = snapshotPath(id, from);
-    const before = manifestOf(id, from);
-
-    let after;
-    let afterDir;
-    let toLabel;
-    if (to === 'current' || to === null || to === undefined) {
-      afterDir = record.srcDir;
-      after = hashTree(record.srcDir);
-      toLabel = 'current';
-    } else {
-      const target = listSnapshots(id).find((item) => Number(item.seq) === Number(to));
-      if (!target) throw new ProjectError(`快照不存在: ${to}`, 404, 'SNAPSHOT_NOT_FOUND');
-      afterDir = snapshotPath(id, target);
-      after = manifestOf(id, target);
-      toLabel = Number(to);
+    const target =
+      to === 'current' || to === null || to === undefined
+        ? null
+        : listSnapshots(id).find((item) => Number(item.seq) === Number(to));
+    if (to !== 'current' && to !== null && to !== undefined && !target) {
+      throw new ProjectError(`快照不存在: ${to}`, 404, 'SNAPSHOT_NOT_FOUND');
     }
+    // B12：diff 期间持有租约，防止 200 上限裁剪并发删除正在读取的目录
+    const releaseFrom = acquireSnapshotLease(id, from.uid, 'diff-from');
+    const releaseTo = target ? acquireSnapshotLease(id, target.uid, 'diff-to') : () => {};
+    try {
+      const fromDir = snapshotPath(id, from);
+      const before = manifestOf(id, from);
 
-    const compared = compareManifests(before, after);
-    const files = [
-      ...compared.added.map((p) => ({ path: p, status: 'added' })),
-      ...compared.removed.map((p) => ({ path: p, status: 'removed' })),
-      ...compared.modified.map((p) => ({ path: p, status: 'modified' })),
-    ];
-    const diffResult = unifiedDiff(fromDir, afterDir, files);
-    return {
-      projectId: id,
-      from: Number(fromSeq),
-      to: toLabel,
-      counts: {
-        added: compared.added.length,
-        removed: compared.removed.length,
-        modified: compared.modified.length,
-      },
-      files,
-      patch: diffResult.patch,
-      truncated: diffResult.truncated,
-      omitted: diffResult.omitted,
-    };
+      let after;
+      let afterDir;
+      let toLabel;
+      if (!target) {
+        afterDir = record.srcDir;
+        after = hashTree(record.srcDir);
+        toLabel = 'current';
+      } else {
+        afterDir = snapshotPath(id, target);
+        after = manifestOf(id, target);
+        toLabel = Number(to);
+      }
+
+      const compared = compareManifests(before, after);
+      const files = [
+        ...compared.added.map((p) => ({ path: p, status: 'added' })),
+        ...compared.removed.map((p) => ({ path: p, status: 'removed' })),
+        ...compared.modified.map((p) => ({ path: p, status: 'modified' })),
+      ];
+      const diffResult = unifiedDiff(fromDir, afterDir, files);
+      return {
+        projectId: id,
+        from: Number(fromSeq),
+        to: toLabel,
+        counts: {
+          added: compared.added.length,
+          removed: compared.removed.length,
+          modified: compared.modified.length,
+        },
+        files,
+        patch: diffResult.patch,
+        truncated: diffResult.truncated,
+        omitted: diffResult.omitted,
+      };
+    } finally {
+      releaseTo();
+      releaseFrom();
+    }
   }
 
   /**
@@ -1395,18 +1558,26 @@ function createProjectRegistry(options = {}) {
    *  - 构建使用异步 spawn，回退期间事件循环不被阻塞（SSE 心跳可用）。
    */
   async function rollback(id, seq, options = {}) {
+    const entry = listSnapshots(id).find((item) => Number(item.seq) === Number(seq));
+    const releaseLease = entry ? acquireSnapshotLease(id, entry.uid, 'rollback') : () => {};
     const providedToken = options.lockToken || null;
     if (providedToken) {
       const current = readLock(id);
       if (!current || current.token !== providedToken) {
+        releaseLease();
         throw new ProjectError('回退需要持有当前项目锁', 409, 'PROJECT_LOCKED');
       }
-      return rollbackLocked(id, seq);
+      try {
+        return await rollbackLocked(id, seq);
+      } finally {
+        releaseLease();
+      }
     }
     const lock = acquireLock(id, { taskId: options.taskId || `rollback-${seq}` });
     try {
       return await rollbackLocked(id, seq);
     } finally {
+      releaseLease();
       releaseLock(id, lock.token);
     }
   }
@@ -1590,44 +1761,148 @@ function createProjectRegistry(options = {}) {
    * 启动时隔离未登记的孤儿快照目录（NEW-C04-02 验收项：无孤儿目录）。
    * 不删除数据，只移动到 <project>/.snapshot-orphans/ 便于人工处理。
    */
-  function recoverOrphanSnapshots() {
+  /**
+   * B12 / C11-01 + C11-02：安全回收。
+   *
+   * 事务顺序：
+   *  1) 快照提交时只把「已提交且不再被引用」的目录写入 `.snapshot-gc.json`（宽限期）；
+   *  2) 本函数在宽限期后删除 tombstone（已知被裁剪的目录）；
+   *  3) 未登记且有活动写入标记/较新的目录一律跳过；
+   *  4) 其余未知目录只隔离到 `.snapshot-orphans/`，**绝不直接删除**；
+   *  5) 幂等、可重复调用；输出配额统计。
+   */
+  function reapSnapshots(options = {}) {
+    const onlyId = options.id || null;
+    const graceMs = Math.max(0, Number(options.graceMs ?? snapshotGraceMs));
+    const graceOverride = options.graceMs !== undefined;
+    const quarantine = options.quarantine !== false;
     return withRegistryLock(() => {
       const results = [];
-      for (const record of registry.projects) {
-        const base = snapshotsDir(record.id);
+      const records = onlyId
+        ? registry.projects.filter((item) => item.id === onlyId)
+        : registry.projects;
+      for (const record of records) {
+        const id = record.id;
+        const base = snapshotsDir(id);
         if (!fs.existsSync(base)) continue;
-        const state = readJson(snapshotsFile(record.id), { snapshots: [] });
-        const known = new Set((state.snapshots || []).map((item) => item.dir));
+        const state = readJson(snapshotsFile(id), { snapshots: [] });
+        const referenced = new Set((state.snapshots || []).map((item) => item.dir));
+        const leased = activeLeases(id);
+        const gc = readGc(id);
+        const now = Date.now();
+        let removed = 0;
+        const keptTombstones = [];
+        for (const tombstone of gc.tombstones) {
+          if (referenced.has(tombstone.dir)) continue; // 又被引用：撤销删除
+          if (leased.has(String(tombstone.uid))) {
+            keptTombstones.push(tombstone);
+            continue;
+          }
+          const dueAt = graceOverride
+            ? Number(tombstone.enqueuedAtMs || 0) + graceMs
+            : Number(tombstone.deleteAfter || 0);
+          if (now < dueAt) {
+            keptTombstones.push(tombstone);
+            continue;
+          }
+          try {
+            fs.rmSync(path.join(base, tombstone.dir), { recursive: true, force: true });
+            fs.rmSync(manifestFile(id, tombstone), { force: true });
+            removed += 1;
+          } catch {
+            keptTombstones.push(tombstone);
+          }
+        }
+        writeGc(id, { tombstones: keptTombstones });
+
+        const known = new Set(referenced);
+        for (const item of keptTombstones) known.add(item.dir);
         let entries = [];
         try {
           entries = fs.readdirSync(base, { withFileTypes: true });
         } catch {
-          continue;
+          entries = [];
         }
-        const orphans = entries
-          .filter((item) => item.isDirectory() && !known.has(item.name))
-          .map((item) => item.name);
-        if (orphans.length === 0) continue;
-        const trashDir = path.join(projectDirOf(record.id), '.snapshot-orphans');
-        fs.mkdirSync(trashDir, { recursive: true });
-        for (const name of orphans) {
-          try {
-            fs.renameSync(
-              path.join(base, name),
-              path.join(trashDir, `${name}-${Date.now()}`),
-            );
-          } catch {
-            // 单个目录移动失败不影响其他
+        const orphans = [];
+        const activeWriters = [];
+        if (quarantine) {
+          for (const item of entries) {
+            if (!item.isDirectory()) continue;
+            if (!/^\d{3,}-/.test(item.name)) continue;
+            if (known.has(item.name)) continue;
+            const full = path.join(base, item.name);
+            if (isActiveWriter(full)) {
+              activeWriters.push(item.name);
+              continue;
+            }
+            let mtime = 0;
+            try {
+              mtime = fs.statSync(full).mtimeMs;
+            } catch {
+              continue;
+            }
+            if (now - mtime < graceMs) continue;
+            orphans.push(item.name);
           }
         }
-        appendRecoveryEvidence(record.id, {
-          event: 'orphan-snapshots-quarantined',
-          dirs: orphans,
-        });
-        results.push({ id: record.id, quarantined: orphans });
+        if (orphans.length) {
+          const trashDir = path.join(projectDirOf(id), '.snapshot-orphans');
+          fs.mkdirSync(trashDir, { recursive: true });
+          const moved = [];
+          for (const name of orphans) {
+            try {
+              fs.renameSync(
+                path.join(base, name),
+                path.join(trashDir, `${name}-${now}`),
+              );
+              moved.push(name);
+            } catch {
+              // 单个目录移动失败不影响其他
+            }
+          }
+          if (moved.length) {
+            appendRecoveryEvidence(id, {
+              event: 'orphan-snapshots-quarantined',
+              dirs: moved,
+            });
+          }
+          orphans.length = 0;
+          orphans.push(...moved);
+        }
+
+        const onDisk = entries.filter(
+          (item) => item.isDirectory() && /^\d{3,}-/.test(item.name),
+        ).length;
+        const quota = {
+          projectId: id,
+          max: maxSnapshots,
+          registered: (state.snapshots || []).length,
+          onDisk,
+          tombstones: keptTombstones.length,
+          removed,
+          quarantined: orphans.length,
+          quarantinedDirs: orphans,
+          activeWriters,
+          leases: leased.size,
+          at: new Date().toISOString(),
+        };
+        try {
+          writeJson(quotaFileOf(id), quota);
+        } catch {
+          // 统计失败不影响回收
+        }
+        results.push({ id, ...quota });
       }
       return results;
     });
+  }
+
+  /** 兼容旧调用：启动时隔离孤儿目录（现在统一走安全 reaper）。 */
+  function recoverOrphanSnapshots() {
+    return reapSnapshots({ graceMs: 0 }).map((item) => ({
+      id: item.id,
+      quarantined: item.quarantinedDirs || [],
+    }));
   }
 
   function appendRound(id, round) {
@@ -1810,6 +2085,10 @@ function createProjectRegistry(options = {}) {
     validateSnapshot,
     recoverInterruptedRollbacks,
     recoverOrphanSnapshots,
+    reapSnapshots,
+    snapshotQuota: (id) => readJson(quotaFileOf(id), null),
+    acquireSnapshotLease,
+    maxSnapshots,
     listSnapshots,
     diff,
     rollback,

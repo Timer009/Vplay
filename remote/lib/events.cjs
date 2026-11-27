@@ -111,6 +111,13 @@ function createEventStore(options = {}) {
       lastSize = 0;
     }
     anchor = readAnchor();
+    if (!anchor && totalCount > 0) {
+      // B12：旧版本（无 anchor）升级时自动建立锚点，保证独立验证器兼容；
+      // 若升级前已发生尾删，无法追溯，只能从当前状态开始检测。
+      writeAnchor();
+      logger('[events] anchor adopted from existing chain (legacy compatibility)');
+      anchor = readAnchor();
+    }
     if (anchor && Number.isFinite(Number(anchor.count)) && Number(anchor.count) > totalCount) {
       logger(
         `[events] WARNING: anchor count ${anchor.count} > file records ${totalCount}; possible tail truncation`,

@@ -191,6 +191,7 @@ module.exports = {
   EXECUTOR,
   makeWorkspace,
   removeWorkspace,
+  freePort,
   startServer,
   request,
   jsonHeaders,

@@ -1,6 +1,6 @@
 # Vplay Studio · 项目状态
 
-> 最后更新：Sprint 03C（B11，2026-11-27）｜分支 `sprint-03-b11-candidate`
+> 最后更新：Sprint 03C（B12，2026-11-28）｜分支 `sprint-03-b12-candidate`
 > 已验收基线：`sprint-01-accepted` → `8058e67`（Sprint 01 真机 13/13 通过）
 > Sprint 02：`sprint-02-c05-fix` @ `fcfd880`（C06 通过，未合并 main）
 > Sprint 03A：`abc8e24`（C07 P0 安全基础）
@@ -78,6 +78,19 @@ Vplay Studio 以 OpenGame（Apache-2.0，源自 gemini-cli）为内核，目标�
 | E07 严格 verified          | 已关闭     | `confirmed` + 宿主硬门禁：必须有缺陷专属断言                        |
 | B-11 防火墙                | **未关闭** | 4 条 node Any/Any 仍在；按用户要求未修改                            |
 | B-15 OS 隔离               | **未实现** | 见 `docs/TRUST-BOUNDARY-B11.md`                                     |
+
+### 3.3 Sprint 03C（B12：C11 收口 + 可信实验准备）
+
+| C11 编号                                                | 状态                 | 实现要点                                                                                             |
+| ------------------------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------- |
+| C11-01 快照 200 上限裁剪竞态                            | 已关闭               | 先提交注册表、再入 GC 队列；宽限期后回收；租约保护 diff/rollback；提交后不再直接 `rmSync` 被引用目录 |
+| C11-02 运行时孤儿回收                                   | 已关闭               | 启动 + 60s 周期 reaper；`.writing` 标记/活 pid 保护；未知目录只隔离不删除；幂等；配额统计            |
+| C11 压测（跨 200 / 10 进程 / diff+rollback / 崩溃残留） | 已覆盖               | `b12-snapshot-gc.test.cjs`：4/4；每条保留记录校验目录/manifest/uid/文件哈希/可回退                   |
+| Serve/代理 fail-closed                                  | 已关闭               | 缺 `PREVIEW_ACCESS_KEY`/`EVIDENCE_HMAC_KEY`/外部 Host/非回环 → 拒绝启动（`b12-deploy`）              |
+| Secure Cookie                                           | 已关闭               | `REMOTE_TRUST_PROXY=1` 时强制 `Secure`，不依赖客户端 XFP                                             |
+| 事件 anchor 兼容 / HMAC 降级                            | 已关闭               | 旧 v1 链自动建立 anchor 并继续校验；`verifyEvidence(requireHmac)` 拒降级                             |
+| 可信实验环境                                            | 准备完成，能力未实现 | `remote/tools/trusted-lab/*`；本机不具 Sandbox/Hyper-V/WSL/容器（需提权/未安装）                     |
+| 真实 Spacer 实验                                        | 准备完成             | 基线哈希 `4babef02…`；副本/配置/F1–F10/证据流程文档；未执行真实模型                                  |
 
 ### 3.1 Sprint 03C 收口（C09 → B10）
 
