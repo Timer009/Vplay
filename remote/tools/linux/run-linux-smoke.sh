@@ -40,6 +40,7 @@ node --test remote/test/b22-safety.test.cjs
 node --test remote/test/b22-code-change.test.cjs
 node --test remote/test/b23-ipc.test.cjs
 node --test remote/test/b23-code-change.test.cjs
+node --test remote/test/b23-vision.test.cjs
 node --test remote/test/b10-correctness.test.cjs
 node --test remote/test/b12-snapshot-gc.test.cjs
 
