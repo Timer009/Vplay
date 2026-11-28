@@ -294,6 +294,10 @@ test('P1-6: a second server on the same workspace refuses to start', async () =>
           OPENGAME_WORKSPACE: workspace,
           REMOTE_TOKEN: TOKEN,
           REMOTE_ALLOW_TEST_SEAM: '1',
+          // B22：完整开发模式需显式开启；否则默认受限会在锁检查前退出。
+          VPLAY_RESTRICTED_DEPLOYMENT: '0',
+          VPLAY_APPROVAL_HMAC_KEY: 'vplay-test-approval-key-0123456789abcdef',
+          VPLAY_MODEL_PROXY_URL: 'http://127.0.0.1:18900/v1',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,

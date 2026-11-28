@@ -128,6 +128,8 @@ test('B12-deploy: Serve mode forces Secure cookies without trusting client XFP',
       REMOTE_TOKEN: 'b12-token',
       REMOTE_AUTORUN: '0',
       REMOTE_TRUST_PROXY: '1',
+      // B22：此用例验证 Serve Cookie 语义，显式使用完整开发模式。
+      VPLAY_RESTRICTED_DEPLOYMENT: '0',
       PREVIEW_ACCESS_KEY: '0123456789abcdef',
       EVIDENCE_HMAC_KEY: 'fedcba9876543210',
       REMOTE_ALLOWED_HOSTS: 'timer009.tail199672.ts.net,127.0.0.1',

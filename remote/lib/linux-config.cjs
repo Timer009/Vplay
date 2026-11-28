@@ -67,20 +67,18 @@ function restrictedCliArgs() {
   ];
 }
 
-// ---- B21：部署级强制受限策略 ----------------------------------------------
-// 语义（fail-closed）：
-//  - 未设置 / 空值：完整开发模式（向后兼容，非受限部署）。
-//  - 显式 0/false/off/no/full/dev：完整开发模式。
-//  - 其它任何非空值（含拼写错误、'yes'、'true'、'2'）：一律视为受限部署。
-// 受限部署内，任务缺省即 restricted=true，且只有 approval.state==='approved'
-// 的任务才允许 spawn；非 restricted 的旧/恢复任务一律失败关闭。
+// ---- B21/B22：部署级强制受限策略 ------------------------------------------
+// 语义（B22 起默认 fail-closed）：
+//  - 未设置 / 空值 / 未知值（含拼写错误）：受限部署（默认拒绝）。
+//  - 只有可信操作员显式设置 0/false/off/no/full/dev：完整开发模式。
+// 受限部署内，任务缺省即 restricted=true，且只有带可信 HMAC 签名的审批
+// （approval.proof）才允许 spawn；非 restricted 的旧/恢复任务一律失败关闭。
 const RESTRICTED_DEPLOYMENT_ENV = 'VPLAY_RESTRICTED_DEPLOYMENT';
 const RESTRICTED_DEPLOYMENT_OFF = new Set(['0', 'false', 'off', 'no', 'full', 'dev', 'development']);
 
 function parseRestrictedDeployment(value) {
-  if (value === undefined || value === null) return false;
-  const raw = String(value).trim().toLowerCase();
-  if (!raw) return false;
+  const raw = value === undefined || value === null ? '' : String(value).trim().toLowerCase();
+  if (!raw) return true;
   return !RESTRICTED_DEPLOYMENT_OFF.has(raw);
 }
 
@@ -208,13 +206,14 @@ function spawnDetachedOptions(extra = {}, platform = process.platform) {
 function killProcessGroup(pid, options = {}) {
   const platform = options.platform || process.platform;
   const kill = options.kill || process.kill;
+  const signal = options.signal || 'SIGKILL';
   if (platform === 'win32' || !pid) return false;
   try {
-    kill(-Number(pid), 'SIGKILL');
+    kill(-Number(pid), signal);
     return true;
   } catch {
     try {
-      kill(Number(pid), 'SIGKILL');
+      kill(Number(pid), signal);
       return true;
     } catch {
       return false;

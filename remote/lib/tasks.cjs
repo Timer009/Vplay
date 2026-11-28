@@ -43,6 +43,9 @@ const TRANSITIONS = {
 const MAX_TEXT_LENGTH = 4000;
 const MAX_TASKS = 200;
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+// B22：任务 id / 项目 id 是文件路径的一部分，必须严格限制字符集。
+const TASK_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
+const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,39}$/;
 
 class ValidationError extends Error {
   constructor(message) {
@@ -158,12 +161,47 @@ function createTaskStore(options) {
 
   let tasks = load();
 
+  /** 服务端派生的唯一合法日志路径；不信任 tasks.json 中保存的值。 */
+  function expectedLogPath(id) {
+    return `.opengame/${logsPrefix}/${id}.log`;
+  }
+
+  /**
+   * B22：tasks.json 可能被同机进程改写。加载时只接受结构合法、字符集受限、
+   * 状态合法的记录；logPath 一律重算，杜绝 `../` 越界写。
+   */
+  function sanitizeLoaded(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const id = typeof raw.id === 'string' ? raw.id : '';
+    if (!TASK_ID_PATTERN.test(id)) return null;
+    if (!TASK_STATUSES.includes(raw.status)) return null;
+    if (typeof raw.text !== 'string') return null;
+    const task = { ...raw };
+    task.id = id;
+    task.text = raw.text;
+    task.projectId =
+      typeof raw.projectId === 'string' && PROJECT_ID_PATTERN.test(raw.projectId)
+        ? raw.projectId
+        : 'default';
+    task.kind = ['vision', 'code_change'].includes(raw.kind) ? raw.kind : 'prompt';
+    task.restricted = raw.restricted === true || task.kind === 'code_change';
+    task.allowYolo = task.restricted ? false : raw.allowYolo === true;
+    task.logPath = expectedLogPath(id);
+    if (!raw.approval || typeof raw.approval !== 'object') {
+      task.approval = task.restricted
+        ? { state: 'pending', approvedAt: null, approvedBy: null, rejectedAt: null }
+        : null;
+    }
+    if (!task.codeChange || typeof task.codeChange !== 'object') task.codeChange = null;
+    return task;
+  }
+
   function load() {
     try {
       const raw = fs.readFileSync(tasksFile, 'utf-8').replace(/^\uFEFF/, '');
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed.tasks)) return [];
-      return parsed.tasks.filter((task) => task && typeof task.id === 'string');
+      return parsed.tasks.map(sanitizeLoaded).filter(Boolean);
     } catch {
       return [];
     }
@@ -241,13 +279,16 @@ function createTaskStore(options) {
 
     const now = new Date().toISOString();
     const id = newTaskId();
+    const kind =
+      input && ['vision', 'code_change'].includes(input.kind) ? input.kind : 'prompt';
+    const restricted = Boolean(input && input.restricted === true) || kind === 'code_change';
     const task = {
       id,
       projectId,
       text,
       idempotencyKey,
       source: (input && input.source) || 'remote',
-      kind: input && input.kind === 'vision' ? 'vision' : 'prompt',
+      kind,
       visionMode:
         input && ['analyze', 'verify', 'repair'].includes(input.visionMode)
           ? input.visionMode
@@ -268,20 +309,23 @@ function createTaskStore(options) {
               .filter((item) => typeof item === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(item))
               .slice(0, 10)
           : null,
-      createdBy,
-      allowYolo: Boolean(input && input.allowYolo === true),
-      restricted: Boolean(input && input.restricted === true),
-      approval:
-        input && input.restricted === true
-          ? { state: 'pending', approvedAt: null, approvedBy: null, rejectedAt: null }
+      codeChange:
+        kind === 'code_change' && input && input.codeChange && typeof input.codeChange === 'object'
+          ? input.codeChange
           : null,
-      status: input && input.restricted === true ? 'awaiting_approval' : 'queued',
+      createdBy,
+      allowYolo: restricted ? false : Boolean(input && input.allowYolo === true),
+      restricted,
+      approval: restricted
+        ? { state: 'pending', approvedAt: null, approvedBy: null, rejectedAt: null }
+        : null,
+      status: restricted ? 'awaiting_approval' : 'queued',
       createdAt: now,
       updatedAt: now,
       startedAt: null,
       finishedAt: null,
       pid: null,
-      logPath: `.opengame/${logsPrefix}/${id}.log`,
+      logPath: expectedLogPath(id),
       error: null,
       result: null,
     };
@@ -315,6 +359,19 @@ function createTaskStore(options) {
   }
 
   /**
+   * B22：受控更新（审批消费 runs、code_change 结果等）。仅供服务端内部使用；
+   * 不经过状态机，但保留 updatedAt 并原子持久化。
+   */
+  function patch(id, fields) {
+    const task = tasks.find((item) => item.id === id);
+    if (!task) throw new Error(`unknown task: ${id}`);
+    if (fields && typeof fields === 'object') Object.assign(task, fields);
+    task.updatedAt = new Date().toISOString();
+    persist();
+    return { ...task };
+  }
+
+  /**
    * Startup recovery: tasks caught mid-flight are marked interrupted and are
    * NEVER resumed automatically. Queued tasks were never executed, so they stay
    * queued and will run in order.
@@ -343,7 +400,8 @@ function createTaskStore(options) {
   function appendLog(id, chunk) {
     const task = tasks.find((item) => item.id === id);
     if (!task) return;
-    const file = path.resolve(options.workspaceDir, task.logPath);
+    // B22：永远使用派生路径，忽略可能被篡改的 task.logPath。
+    const file = path.resolve(options.workspaceDir, expectedLogPath(task.id));
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       let size = logSizes.get(id);
@@ -377,7 +435,7 @@ function createTaskStore(options) {
   function readLog(id, maxBytes = 8000) {
     const task = tasks.find((item) => item.id === id);
     if (!task) return null;
-    const file = path.resolve(options.workspaceDir, task.logPath);
+    const file = path.resolve(options.workspaceDir, expectedLogPath(task.id));
     try {
       const stat = fs.statSync(file);
       if (stat.size <= maxBytes) {
@@ -410,6 +468,7 @@ function createTaskStore(options) {
     activeTask,
     create,
     transition,
+    patch,
     recoverOnStartup,
     appendLog,
     readLog,

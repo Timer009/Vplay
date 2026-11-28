@@ -57,6 +57,11 @@ const { createDeviceStore } = require('./lib/devices.cjs');
 const { createVisionService, recoverVisionApplies } = require('./lib/vision-service.cjs');
 const { createPreviewTicketStore } = require('./lib/preview-tickets.cjs');
 const { parseMaxSnapshots, parseUmask, parseRestrictedDeployment } = require('./lib/linux-config.cjs');
+const {
+  resolveApprovalKey,
+  resolveApprovalModel,
+  createApprovalProof,
+} = require('./lib/approval.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
@@ -107,6 +112,11 @@ const PUBLIC_MODE =
 const RESTRICTED_DEPLOYMENT = parseRestrictedDeployment(
   process.env.VPLAY_RESTRICTED_DEPLOYMENT,
 );
+// B22：审批签名密钥只存在于控制面进程；缺失即拒绝启动（受限部署）。
+const APPROVAL_KEY = resolveApprovalKey(process.env);
+const APPROVAL_MODEL = resolveApprovalModel(process.env);
+const APPROVAL_TTL_MS = Number(process.env.VPLAY_APPROVAL_TTL_MS || 30 * 60 * 1000);
+
 const AUTHORUN = process.env.REMOTE_AUTORUN !== '0';
 const TASK_TIMEOUT_MS = Number(process.env.REMOTE_TASK_TIMEOUT_MS || 15 * 60 * 1000);
 const PROMPT_RATE_LIMIT = Number(process.env.REMOTE_RATE_LIMIT || 10);
@@ -163,6 +173,35 @@ if (SERVE_MODE) {
   }
   if (problems.length) {
     console.error(`[remote] refuse to start (Serve/proxy fail-closed):\n- ${problems.join('\n- ')}`);
+    process.exit(1);
+  }
+}
+
+// B22：受限部署的强制依赖（审批签名密钥、loopback 模型代理）。
+if (RESTRICTED_DEPLOYMENT) {
+  const problems = [];
+  if (!APPROVAL_KEY) {
+    problems.push('VPLAY_APPROVAL_HMAC_KEY (>=32 chars) is required in restricted deployment');
+  }
+  const proxy = String(process.env.VPLAY_MODEL_PROXY_URL || '').trim();
+  if (!proxy) {
+    problems.push('VPLAY_MODEL_PROXY_URL (loopback) is required in restricted deployment');
+  } else {
+    try {
+      const parsed = new URL(proxy);
+      const host = parsed.hostname.toLowerCase();
+      if (
+        !['http:', 'https:'].includes(parsed.protocol) ||
+        !['127.0.0.1', 'localhost', '::1'].includes(host)
+      ) {
+        problems.push('VPLAY_MODEL_PROXY_URL must be loopback (127.0.0.1/localhost/::1)');
+      }
+    } catch {
+      problems.push('VPLAY_MODEL_PROXY_URL is not a valid URL');
+    }
+  }
+  if (problems.length) {
+    console.error(`[remote] refuse to start (restricted deployment fail-closed):\n- ${problems.join('\n- ')}`);
     process.exit(1);
   }
 }
@@ -245,8 +284,11 @@ const worker = createWorker({
   timeoutMs: TASK_TIMEOUT_MS,
   publicMode: PUBLIC_MODE,
   allowYolo: process.env.VPLAY_ALLOW_YOLO === '1',
-  // B21：部署级强制受限（fail-closed），worker 在 spawn 前再次校验。
+  // B21/B22：部署级强制受限（fail-closed），worker 在 spawn 前再次校验。
   restrictedDeployment: RESTRICTED_DEPLOYMENT,
+  approvalKey: APPROVAL_KEY || null,
+  approvalModel: APPROVAL_MODEL,
+  approvalTtlMs: APPROVAL_TTL_MS,
   secrets: TOKEN ? [TOKEN] : [],
   visionService,
   eventStore,
@@ -674,8 +716,19 @@ function publicTask(task) {
   };
 }
 
-function previewLink(req, projectId) {
-  const hostname = String(req.headers.host || 'localhost').split(':')[0];
+/** B22：审批绑定的基线版本（最新快照）；无项目/无快照时为 null。 */
+function currentBaseVersionId(projectId) {
+  if (!projects) return null;
+  try {
+    const list = projects.listSnapshots(projectId);
+    const last = list[list.length - 1];
+    return last ? `${last.seq}-${last.uid}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function previewLink(req, projectId) {  const hostname = String(req.headers.host || 'localhost').split(':')[0];
   const previewPath = projectId ? `/p/${projectId}/` : '/legacy/';
   return {
     previewPath,
@@ -1016,6 +1069,38 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // B22：运行时证据校验（admin）。HMAC 缺失时 fail-closed。
+    const evidenceVerifyMatch = /^\/tasks\/([^/]+)\/evidence\/verify$/.exec(pathname);
+    if (evidenceVerifyMatch && method === 'GET') {
+      if (!requireAuth(req, res)) return;
+      const auth = authState(req);
+      if (!auth || auth.kind !== 'admin') {
+        sendJson(res, 403, { ok: false, error: 'evidence verification requires administrator token' });
+        return;
+      }
+      const task = store.get(evidenceVerifyMatch[1]);
+      if (!task) {
+        sendJson(res, 404, { ok: false, error: 'task not found' });
+        return;
+      }
+      const safe = (value) => String(value || 'default').replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 80);
+      const dir = path.join(
+        evidenceStore.root,
+        safe(task.projectId || 'default'),
+        safe(task.id),
+      );
+      const result = evidenceStore.verifyEvidence(dir, {
+        hmacKey: EVIDENCE_HMAC_KEY || '',
+        requireHmac: Boolean(EVIDENCE_HMAC_KEY),
+      });
+      sendJson(res, result.ok ? 200 : 409, {
+        ok: result.ok,
+        reasons: result.reasons,
+        artifactId: result.artifactId || null,
+      });
+      return;
+    }
+
     if (pathname.startsWith('/tasks/') && method === 'GET') {
       if (!requireAuth(req, res)) return;
       const auth = authState(req);
@@ -1073,8 +1158,8 @@ const server = http.createServer(async (req, res) => {
       }
       const action = approvalMatch[2];
       const at = new Date().toISOString();
-      // B21：审批时固化范围（项目/类型/模式/Vision 文件集），worker 会逐项比对，
-      // 审批后任务字段无法被 API 改写，因此范围不可绕过。
+      // B21/B22：审批时固化范围（项目/类型/模式/Vision 文件集），并用控制面
+      // HMAC 密钥签名绑定内容哈希、模型、基线、有效期与执行次数。
       const scope = {
         projectId: task.projectId || 'default',
         kind: task.kind || 'prompt',
@@ -1082,13 +1167,43 @@ const server = http.createServer(async (req, res) => {
         allowedFiles:
           task.kind === 'vision' && Array.isArray(task.allowedFiles) ? [...task.allowedFiles] : null,
       };
+      let proof = null;
+      if (action === 'approve') {
+        if (!APPROVAL_KEY) {
+          sendJson(res, 500, {
+            ok: false,
+            error: 'approval signing key is not configured',
+            code: 'APPROVAL_KEY_MISSING',
+          });
+          return;
+        }
+        proof = createApprovalProof({
+          task,
+          key: APPROVAL_KEY,
+          ttlMs: APPROVAL_TTL_MS,
+          maxRuns: 1,
+          model: APPROVAL_MODEL,
+          baseVersionId: currentBaseVersionId(task.projectId || 'default'),
+        }).proof;
+      }
       const updated = store.transition(
         task.id,
         action === 'approve' ? 'queued' : 'rejected',
         {
           approval:
             action === 'approve'
-              ? { state: 'approved', approvedAt: at, approvedBy: 'admin', rejectedAt: null, scope }
+              ? {
+                  state: 'approved',
+                  approvedAt: at,
+                  approvedBy: 'admin',
+                  rejectedAt: null,
+                  scope,
+                  model: APPROVAL_MODEL,
+                  baseVersionId: currentBaseVersionId(task.projectId || 'default'),
+                  expiresAt: proof ? proof.payload.expiresAt : null,
+                  maxRuns: 1,
+                  proof,
+                }
               : { state: 'rejected', approvedAt: null, approvedBy: null, rejectedAt: at, scope: null },
         },
       );
@@ -1749,10 +1864,18 @@ server.listen(PORT, HOST, () => {
   console.log(
     `[remote] restricted deployment: ${
       RESTRICTED_DEPLOYMENT
-        ? 'yes (all tasks require administrator approval)'
+        ? 'yes (all tasks require signed administrator approval)'
         : 'no (full development mode)'
     }`,
   );
+  if (!RESTRICTED_DEPLOYMENT) {
+    console.warn(
+      '[remote] WARNING: full development mode is explicitly enabled (VPLAY_RESTRICTED_DEPLOYMENT=0). ' +
+        'Only a trusted operator may run this mode; never expose it to devices.',
+    );
+  } else {
+    console.log(`[remote] approval model: ${APPROVAL_MODEL}`);
+  }
   if (!REMOTE_ENABLED) {
     console.warn(
       '[remote] REMOTE_TOKEN is not set — remote control is DISABLED (all control endpoints return 503).',

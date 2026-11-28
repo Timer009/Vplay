@@ -54,6 +54,11 @@ async function startServer(options) {
     REMOTE_LOGIN_RATE_LIMIT: '1000',
     REMOTE_ALLOW_TEST_SEAM: '1',
     REMOTE_AUTORUN: options.autorun === false ? '0' : '1',
+    // B22：默认 fail-closed；测试显式声明完整开发模式，并提供审批密钥与代理占位。
+    VPLAY_RESTRICTED_DEPLOYMENT: '0',
+    VPLAY_APPROVAL_HMAC_KEY: 'vplay-test-approval-key-0123456789abcdef',
+    VPLAY_MODEL_PROXY_URL: 'http://127.0.0.1:18900/v1',
+    VPLAY_MODEL_PROXY_TOKEN: 'vplay-test-proxy-token',
     ...(options.env || {}),
   };
   delete env.REMOTE_TOKEN;

@@ -69,23 +69,33 @@ function clearLease() {
   }
 }
 
-function killTree(pid) {
+function killTree(pid, signal = 'SIGKILL') {
   if (!pid) return;
   try {
     if (process.platform === 'win32') {
       spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-    } else if (!killProcessGroup(pid)) {
-      process.kill(pid, 'SIGKILL');
+    } else if (!killProcessGroup(pid, { signal })) {
+      process.kill(pid, signal);
     }
   } catch {
     // 进程可能已退出
   }
 }
 
+/** 先 SIGTERM 再 SIGKILL，确保孙进程也被进程组信号覆盖。 */
+function terminateTree(pid) {
+  if (!pid) return;
+  killTree(pid, 'SIGTERM');
+  const timer = setTimeout(() => killTree(pid, 'SIGKILL'), 2500);
+  timer.unref?.();
+}
+
 const child = spawn(command[0], command.slice(1), {
   stdio: ['ignore', 'inherit', 'inherit'],
   windowsHide: true,
   env: process.env,
+  // POSIX：CLI 成为独立进程组组长，runner 与 worker 都能按组清理整棵树。
+  detached: process.platform !== 'win32',
 });
 
 writeLease(child.pid);
@@ -103,17 +113,25 @@ const watchdog = setInterval(() => {
   if (!alive && !parentGone) {
     parentGone = true;
     console.error(`[runner] parent ${parentPid} is gone, terminating child ${child.pid}`);
-    killTree(child.pid);
-    clearLease();
-    process.exit(1);
+    terminateTree(child.pid);
+    clearInterval(heartbeat);
+    clearInterval(watchdog);
+    setTimeout(() => {
+      clearLease();
+      process.exit(1);
+    }, 2700).unref?.();
   }
 }, 2000);
 
 function shutdown(code) {
   clearInterval(heartbeat);
   clearInterval(watchdog);
+  if (child.pid && child.exitCode === null) terminateTree(child.pid);
   clearLease();
-  process.exit(code);
+  const timer = setTimeout(() => process.exit(code), 2800);
+  timer.unref?.();
+  // 子进程很快退出时立即结束，避免多余等待。
+  if (child.exitCode !== null) process.exit(code);
 }
 
 child.on('error', (error) => {
@@ -127,10 +145,20 @@ child.on('exit', (code, signal) => {
 });
 
 process.on('SIGTERM', () => {
-  killTree(child.pid);
+  terminateTree(child.pid);
   shutdown(143);
 });
 process.on('SIGINT', () => {
-  killTree(child.pid);
+  terminateTree(child.pid);
   shutdown(130);
+});
+process.on('uncaughtException', (error) => {
+  console.error(`[runner] uncaught exception: ${error && error.message ? error.message : error}`);
+  terminateTree(child.pid);
+  shutdown(1);
+});
+process.on('unhandledRejection', (error) => {
+  console.error(`[runner] unhandled rejection: ${error && error.message ? error.message : error}`);
+  terminateTree(child.pid);
+  shutdown(1);
 });

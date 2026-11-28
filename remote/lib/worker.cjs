@@ -22,6 +22,12 @@ const path = require('path');
 
 const { hashTree, compareManifests } = require('./paths.cjs');
 const { spawnDetachedOptions, killProcessGroup, restrictedCliArgs, evaluateSpawnPolicy } = require('./linux-config.cjs');
+const {
+  resolveApprovalKey,
+  resolveApprovalModel,
+  verifyApprovalProof,
+  consumeApprovalProof,
+} = require('./approval.cjs');
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const STATUS_POLL_MS = 1000;
@@ -54,14 +60,34 @@ const MODEL_ENV_KEYS = new Set([
 ]);
 
 /** 只传「模型调用必需 + 系统运行必需」的变量；REMOTE_* / VPLAY_* 一律不传。 */
-function buildChildEnv(taskId, source = process.env) {
+function buildChildEnv(taskId, source = process.env, options = {}) {
   const env = {};
+  const restricted = options.restricted === true;
   for (const [key, value] of Object.entries(source)) {
     if (key.startsWith('REMOTE_') || key.startsWith('VPLAY_') || key.startsWith('EVIDENCE_')) continue;
+    if (key.startsWith('APPROVAL_')) continue;
+    // B22：受限任务不得继承任何真实模型端点/凭据，只允许任务级代理配置。
+    if (restricted && MODEL_ENV_KEYS.has(key)) continue;
     const allowed = ENV_PASSTHROUGH.has(key) || MODEL_ENV_KEYS.has(key);
     if (allowed) env[key] = value;
   }
   env.OPENGAME_REMOTE_TASK_ID = taskId;
+  if (restricted) {
+    env.OPENAI_BASE_URL = options.proxyUrl;
+    env.OPENAI_API_KEY = options.proxyToken || 'vplay-proxy-placeholder';
+    if (options.model) env.OPENAI_MODEL = options.model;
+    if (options.sandboxHome) {
+      env.HOME = options.sandboxHome;
+      env.USERPROFILE = options.sandboxHome;
+      env.XDG_CONFIG_HOME = path.join(options.sandboxHome, '.config');
+      env.XDG_CACHE_HOME = path.join(options.sandboxHome, '.cache');
+      env.XDG_DATA_HOME = path.join(options.sandboxHome, '.local', 'share');
+      if (process.platform === 'win32') {
+        env.APPDATA = path.join(options.sandboxHome, 'AppData', 'Roaming');
+        env.LOCALAPPDATA = path.join(options.sandboxHome, 'AppData', 'Local');
+      }
+    }
+  }
   return env;
 }
 
@@ -77,12 +103,20 @@ function resolveExecutorScript(env = process.env) {
 /**
  * C07-P0-01：审批模式解析（纯函数，便于测试）。
  * yolo 需要三者同时成立：非 public、环境显式开启、任务显式 allowYolo。
+ * B22：受限任务永远不能 auto-edit/yolo，只能 default（只读工具本身不会写）。
  */
 function resolveApprovalMode({ publicMode, allowYolo, task }) {
+  if (task && task.restricted === true) return 'default';
   if (publicMode) return 'auto-edit';
   if (!allowYolo) return 'auto-edit';
   if (!task || task.allowYolo !== true) return 'auto-edit';
   return 'yolo';
+}
+
+/** B22：受限任务禁用 --continue / --chat-recording，避免继承历史会话状态。 */
+function resolveContinue({ restricted, project, rounds, env = process.env }) {
+  if (restricted) return false;
+  return Boolean(project) && (rounds || []).length > 0 && env.VPLAY_CONTINUE_SESSION !== '0';
 }
 
 function readRuntimePhase(dir) {
@@ -130,16 +164,23 @@ function summarize(text, max = 120) {
   return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
 }
 
-function killTree(child) {
+function killTree(child, extraPids = []) {
   if (!child || child.exitCode !== null) return;
+  const pids = [child.pid, ...extraPids]
+    .filter((pid) => Number.isFinite(Number(pid)) && Number(pid) > 0)
+    .map(Number);
   try {
     if (process.platform === 'win32') {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
-        windowsHide: true,
-        stdio: 'ignore',
-      });
-    } else if (!killProcessGroup(child.pid)) {
-      child.kill('SIGKILL');
+      for (const pid of pids) {
+        spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+      }
+    } else {
+      // 先杀 runner 记录的 CLI 进程组（runner 以 detached 启动 CLI），再杀 runner 组。
+      for (const pid of extraPids) killProcessGroup(pid);
+      if (!killProcessGroup(child.pid)) child.kill('SIGKILL');
     }
   } catch {
     try {
@@ -195,7 +236,9 @@ function createWorker(options) {
   const legacyWorkspace = path.resolve(options.workspaceDir);
   const cliPath = options.cliPath;
   const runnerPath = path.resolve(__dirname, 'cli-runner.cjs');
-  const leasesDir = path.join(path.resolve(options.runtimeDir), 'leases');
+  const runtimeDir = path.resolve(options.runtimeDir);
+  const leasesDir = path.join(runtimeDir, 'leases');
+  const restrictedHomeRoot = path.join(runtimeDir, 'restricted-home');
   const executorScript = options.executorScript || null;
   const timeoutMs = Number(options.timeoutMs || DEFAULT_TIMEOUT_MS);
   const publicMode = Boolean(options.publicMode);
@@ -209,6 +252,13 @@ function createWorker(options) {
   const eventStore = options.eventStore || null;
   const evidenceStore = options.evidenceStore || null;
   const home = options.home || null;
+  // B22：审批密钥只存在于服务端进程；Agent 子进程环境会被剥离 APPROVAL_*。
+  const approvalKey =
+    options.approvalKey === undefined ? resolveApprovalKey(process.env) : options.approvalKey;
+  const approvalModel =
+    options.approvalModel || resolveApprovalModel(process.env);
+  const approvalTtlMs = Number(options.approvalTtlMs || 30 * 60 * 1000);
+  const restrictedProxy = options.restrictedProxy || null;
 
   let current = null;
   let currentChild = null;
@@ -289,16 +339,134 @@ function createWorker(options) {
     }
   }
 
-  function spawnExecutor(task, dir) {
+  /** B22：spawn 前的失败关闭收尾（不进入 running）。 */
+  function blockTask(task, code, message) {
+    try {
+      store.appendLog(task.id, `[remote] blocked before spawn: ${code} ${message}\n`);
+    } catch {
+      // 忽略
+    }
+    finish(task.id, 'failed', {
+      pid: null,
+      error: { code, message },
+    });
+    emitEvent('task.blocked', task, { status: 'failed', data: { code } });
+    log(`[remote] task ${task.id} blocked before spawn: ${code}`);
+  }
+
+  function readLeaseChildPid(taskId) {
+    if (!taskId) return null;
+    try {
+      const parsed = JSON.parse(
+        fs.readFileSync(path.join(leasesDir, `${taskId}.json`), 'utf-8'),
+      );
+      const pid = Number(parsed.childPid);
+      return Number.isFinite(pid) && pid > 0 ? pid : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function killTaskTree(child, taskId) {
+    killTree(child, [readLeaseChildPid(taskId)]);
+  }
+
+  /**
+   * B22：受限运行环境预检。
+   * - 工作区存在 .qwen（settings/extensions/commands 注入面）→ 拒绝；
+   * - 必须配置 loopback 模型代理；受限 CLI 不持有真实模型 Key；
+   * - 为任务创建独立 HOME，隔离用户级 .qwen / 凭据。
+   */
+  function resolveRestrictedRuntime(task, dir) {
+    const qwenDir = path.join(dir, '.qwen');
+    if (fs.existsSync(qwenDir)) {
+      return {
+        ok: false,
+        code: 'WORKSPACE_CONFIG_PRESENT',
+        message: 'restricted tasks refuse a workspace with .qwen configuration',
+      };
+    }
+    const url = String(
+      (restrictedProxy && restrictedProxy.url) || process.env.VPLAY_MODEL_PROXY_URL || '',
+    ).trim();
+    if (!url) {
+      return {
+        ok: false,
+        code: 'MODEL_PROXY_REQUIRED',
+        message: 'restricted tasks require VPLAY_MODEL_PROXY_URL (loopback proxy)',
+      };
+    }
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return { ok: false, code: 'MODEL_PROXY_INVALID', message: 'model proxy URL is invalid' };
+    }
+    const host = parsed.hostname.toLowerCase();
+    if (
+      !['http:', 'https:'].includes(parsed.protocol) ||
+      !['127.0.0.1', 'localhost', '::1'].includes(host)
+    ) {
+      return {
+        ok: false,
+        code: 'MODEL_PROXY_INVALID',
+        message: 'model proxy must be loopback (127.0.0.1/localhost/::1)',
+      };
+    }
+    const token = String(
+      (restrictedProxy && restrictedProxy.token) ||
+        process.env.VPLAY_MODEL_PROXY_TOKEN ||
+        '',
+    ).trim();
+    return {
+      ok: true,
+      proxyUrl: url,
+      proxyToken: token || 'vplay-proxy-placeholder',
+      sandboxHome: path.join(restrictedHomeRoot, task.id),
+    };
+  }
+
+  function childEnvFor(task, restrictedRuntime) {
+    return buildChildEnv(task.id, process.env, {
+      restricted: task.restricted === true,
+      proxyUrl: restrictedRuntime ? restrictedRuntime.proxyUrl : undefined,
+      proxyToken: restrictedRuntime ? restrictedRuntime.proxyToken : undefined,
+      sandboxHome: restrictedRuntime ? restrictedRuntime.sandboxHome : undefined,
+      model: task.restricted === true ? approvalModel : undefined,
+    });
+  }
+
+  /** B22：审批验签 + 绑定校验 + 消费一次执行额度。返回失败原因或 null。 */
+  function consumeApproval(task) {
+    const result = verifyApprovalProof(task.approval, {
+      task,
+      key: approvalKey,
+      now: Date.now(),
+      model: approvalModel,
+      baseVersionId: latestVersionId(task.projectId || 'default'),
+    });
+    if (!result.ok) return result.reason;
+    let consumed;
+    try {
+      consumed = consumeApprovalProof(task.approval, approvalKey);
+    } catch {
+      return 'APPROVAL_KEY_MISSING';
+    }
+    store.patch(task.id, { approval: consumed });
+    task.approval = consumed;
+    return null;
+  }
+
+  function spawnExecutor(task, dir, env) {
     return spawn(process.execPath, [executorScript, task.text], spawnDetachedOptions({
       cwd: dir,
-      env: buildChildEnv(task.id),
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     }));
   }
 
-  function spawnCli(task, dir, prompt, useContinue) {
+  function spawnCli(task, dir, prompt, useContinue, env) {
     fs.mkdirSync(leasesDir, { recursive: true });
     const leaseFile = path.join(leasesDir, `${task.id}.json`);
     const args = [
@@ -326,7 +494,7 @@ function createWorker(options) {
     }
     return spawn(process.execPath, args, spawnDetachedOptions({
       cwd: dir,
-      env: buildChildEnv(task.id),
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     }));
@@ -483,6 +651,18 @@ function createWorker(options) {
 
     const { project, dir, projectId } = target;
 
+    // C：code_change 通道由独立功能 commit 提供；安全候选内一律失败关闭。
+    if (task.kind === 'code_change') {
+      finish(task.id, 'failed', {
+        error: {
+          code: 'CODE_CHANGE_UNAVAILABLE',
+          message: 'code_change channel is not enabled in the safety candidate',
+        },
+      });
+      current = null;
+      return;
+    }
+
     // Sprint03B：Vision 任务复用同一队列/状态机/锁，仅执行器不同
     if (task.kind === 'vision') {
       if (!visionService) {
@@ -506,6 +686,24 @@ function createWorker(options) {
       });
       current = null;
       return;
+    }
+
+    // B22：受限任务在任何 spawn 之前完成环境预检（.qwen / 代理 / 隔离 HOME）。
+    let restrictedRuntime = null;
+    if (task.restricted === true) {
+      restrictedRuntime = resolveRestrictedRuntime(task, dir);
+      if (!restrictedRuntime.ok) {
+        blockTask(task, restrictedRuntime.code, restrictedRuntime.message);
+        current = null;
+        return;
+      }
+      try {
+        fs.mkdirSync(restrictedRuntime.sandboxHome, { recursive: true, mode: 0o700 });
+      } catch (error) {
+        blockTask(task, 'RESTRICTED_HOME_FAILED', error.message);
+        current = null;
+        return;
+      }
     }
 
     if (!executorScript && !fs.existsSync(cliPath)) {
@@ -545,10 +743,12 @@ function createWorker(options) {
     }
 
     const prompt = buildPrompt(task, project);
-    const useContinue =
-      Boolean(project) &&
-      (projects.memory(projectId).rounds || []).length > 0 &&
-      process.env.VPLAY_CONTINUE_SESSION !== '0';
+    const useContinue = resolveContinue({
+      restricted: task.restricted === true,
+      project,
+      rounds: project ? projects.memory(projectId).rounds : null,
+      env: process.env,
+    });
     const startedAtMs = Date.now();
     // 单工作区模式没有快照，用前后哈希判断是否真的改了文件（P1-4）
     const beforeManifest = project ? null : hashTree(dir);
@@ -562,7 +762,10 @@ function createWorker(options) {
 
     let child;
     try {
-      child = executorScript ? spawnExecutor(task, dir) : spawnCli(task, dir, prompt, useContinue);
+      const childEnv = childEnvFor(task, restrictedRuntime);
+      child = executorScript
+        ? spawnExecutor(task, dir, childEnv)
+        : spawnCli(task, dir, prompt, useContinue, childEnv);
     } catch (error) {
       if (project) projects.releaseLock(projectId, lockToken);
       finish(task.id, 'failed', {
@@ -609,7 +812,7 @@ function createWorker(options) {
     const timeout = setTimeout(() => {
       timedOut = true;
       store.appendLog(task.id, `[remote] timeout after ${timeoutMs}ms, killing process tree\n`);
-      killTree(child);
+      killTaskTree(child, task.id);
     }, timeoutMs);
 
     let settled = false;
@@ -794,27 +997,25 @@ function createWorker(options) {
     if (stopped || current) return;
     const task = store.nextQueued();
     if (!task) return;
-    // B21：spawn 前最后一道门。旧任务/恢复任务/被篡改的 tasks.json 都过不去。
+    // B21/B22：spawn 前最后一道门。旧任务/恢复任务/被篡改的 tasks.json 都过不去。
     const policy = evaluateSpawnPolicy(task, { restrictedDeployment });
     if (!policy.ok) {
       current = task;
-      try {
-        store.appendLog(task.id, `[remote] blocked before spawn: ${policy.code} ${policy.message}\n`);
-      } catch {
-        // 日志失败不影响拦截
-      }
-      finish(task.id, 'failed', {
-        pid: null,
-        error: { code: policy.code, message: policy.message },
-      });
-      emitEvent('task.blocked', task, {
-        status: 'failed',
-        data: { code: policy.code, restrictedDeployment },
-      });
-      log(`[remote] task ${task.id} blocked before spawn: ${policy.code}`);
+      blockTask(task, policy.code, policy.message);
       current = null;
       tick();
       return;
+    }
+    // B22：受限任务必须持有可信控制面签名的审批，且绑定内容/模型/基线/次数。
+    if (task.restricted === true) {
+      const reason = consumeApproval(task);
+      if (reason) {
+        current = task;
+        blockTask(task, reason, `approval rejected: ${reason}`);
+        current = null;
+        tick();
+        return;
+      }
     }
     run(task);
   }
@@ -833,7 +1034,7 @@ function createWorker(options) {
     }
     // P1-5：停止时杀掉正在运行的 CLI 进程树，避免留下孤儿
     if (currentChild) {
-      killTree(currentChild);
+      killTaskTree(currentChild, current ? current.id : null);
       currentChild = null;
     }
   }
@@ -853,5 +1054,6 @@ module.exports = {
   buildChildEnv,
   resolveExecutorScript,
   resolveApprovalMode,
+  resolveContinue,
   DEFAULT_TIMEOUT_MS,
 };

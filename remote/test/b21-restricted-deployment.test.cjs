@@ -20,6 +20,7 @@ const { spawnSync } = require('child_process');
 
 const { createTaskStore } = require('../lib/tasks.cjs');
 const { createWorker } = require('../lib/worker.cjs');
+const { createApprovalProof } = require('../lib/approval.cjs');
 const {
   parseRestrictedDeployment,
   evaluateSpawnPolicy,
@@ -56,8 +57,9 @@ function restrictedTask(store, text, extra = {}) {
 }
 
 test('B21-policy: restricted deployment parsing is fail-closed on unknown values', () => {
-  assert.equal(parseRestrictedDeployment(undefined), false);
-  assert.equal(parseRestrictedDeployment(''), false);
+  // B22：未设置/空值默认进入受限部署；只有显式 off 值才开启完整开发模式。
+  assert.equal(parseRestrictedDeployment(undefined), true);
+  assert.equal(parseRestrictedDeployment(''), true);
   for (const off of ['0', 'false', 'FALSE', 'off', 'no', 'full', 'dev']) {
     assert.equal(parseRestrictedDeployment(off), false, off);
   }
@@ -257,6 +259,15 @@ test('B21 worker: approved restricted task spawns exactly once', async () => {
   write(path.join(root, 'index.html'), '<!doctype html><html><body>legacy</body></html>\n');
   const store = makeStore(root);
   const task = restrictedTask(store, 'approved restricted task');
+  const approvalKey = 'vplay-test-approval-key-0123456789abcdef';
+  const proof = createApprovalProof({
+    task,
+    key: approvalKey,
+    ttlMs: 10 * 60 * 1000,
+    maxRuns: 1,
+    model: 'qwen3-coder-plus',
+    baseVersionId: null,
+  }).proof;
   store.transition(task.id, 'queued', {
     approval: {
       state: 'approved',
@@ -264,6 +275,7 @@ test('B21 worker: approved restricted task spawns exactly once', async () => {
       approvedBy: 'admin',
       rejectedAt: null,
       scope: { projectId: 'default', kind: 'prompt', visionMode: null, allowedFiles: null },
+      proof,
     },
   });
 
@@ -274,6 +286,9 @@ test('B21 worker: approved restricted task spawns exactly once', async () => {
     cliPath: path.join(root, 'dist', 'cli.js'),
     executorScript: EXECUTOR,
     restrictedDeployment: true,
+    approvalKey,
+    approvalModel: 'qwen3-coder-plus',
+    restrictedProxy: { url: 'http://127.0.0.1:18900/v1', token: 'b21-proxy' },
     logger: () => {},
   });
   try {

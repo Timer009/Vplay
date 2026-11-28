@@ -36,6 +36,7 @@ node --test remote/test/b14-vision-022.test.cjs
 node --test remote/test/b19-linux-config.test.cjs
 node --test remote/test/b20-restricted.test.cjs
 node --test remote/test/b21-restricted-deployment.test.cjs
+node --test remote/test/b22-safety.test.cjs
 node --test remote/test/b10-correctness.test.cjs
 node --test remote/test/b12-snapshot-gc.test.cjs
 
@@ -55,6 +56,9 @@ export REMOTE_AUTORUN=0
 export VPLAY_MAX_SNAPSHOTS=20
 export VPLAY_UMASK=027
 export VPLAY_RESTRICTED_DEPLOYMENT=1
+export VPLAY_APPROVAL_HMAC_KEY="${VPLAY_APPROVAL_HMAC_KEY:-smoke-approval-key-0123456789abcdef}"
+export VPLAY_MODEL_PROXY_URL="${VPLAY_MODEL_PROXY_URL:-http://127.0.0.1:18900/v1}"
+export VPLAY_MODEL_PROXY_TOKEN="${VPLAY_MODEL_PROXY_TOKEN:-smoke-proxy-token}"
 export PREVIEW_ACCESS_KEY="${PREVIEW_ACCESS_KEY:-smoke-preview-key-0123456789}"
 export EVIDENCE_HMAC_KEY="${EVIDENCE_HMAC_KEY:-smoke-hmac-key-0123456789}"
 export VPLAY_BROWSER_HEADLESS=true

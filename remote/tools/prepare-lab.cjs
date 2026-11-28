@@ -48,6 +48,36 @@ function safeRelPath(value) {
   return rel;
 }
 
+/**
+ * B22 / C19 B21-8：逐段检查源文件父目录，禁止 symlink/junction 穿越。
+ * 仅检查父目录；末端文件由调用方校验必须为普通文件。
+ */
+function assertNoSymlinkParents(root, rel) {
+  const segments = rel.split('/');
+  let current = root;
+  for (const segment of segments.slice(0, -1)) {
+    current = path.join(current, segment);
+    let stat;
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      throw new Error(`parent directory missing: ${current}`);
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(`parent path contains symlink/junction: ${current}`);
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`parent path is not a directory: ${current}`);
+    }
+  }
+  const realRoot = realpathOrResolve(root);
+  const realParent = realpathOrResolve(path.dirname(path.join(root, ...segments)));
+  if (realParent !== realRoot && !realParent.startsWith(realRoot + path.sep)) {
+    throw new Error(`parent path escapes sourceDir: ${rel}`);
+  }
+  return true;
+}
+
 /** 读取 HEAD 的全部 tracked 文件（mode/type/object/path）。 */
 function listTrackedEntries(source) {
   const result = spawnSync(
@@ -143,6 +173,7 @@ function prepareLab({
     throw new Error(`invalid projectId: ${projectId}`);
   }
   const rel = safeRelPath(entry);
+  assertNoSymlinkParents(source, rel);
   const sourceEntry = path.join(source, ...rel.split('/'));
   if (!fs.existsSync(sourceEntry)) throw new Error(`entry not found: ${sourceEntry}`);
   const sourceStat = fs.lstatSync(sourceEntry);
@@ -194,6 +225,7 @@ function prepareLab({
 
   const files = [];
   for (const item of entries) {
+    assertNoSymlinkParents(source, item.rel);
     const bytes = blobs.get(item.rel);
     if (!bytes) throw new Error(`no content for tracked file: ${item.rel}`);
     const blobSha256 = sha256(bytes);
@@ -320,4 +352,4 @@ if (require.main === module) {
   }, null, 2));
 }
 
-module.exports = { prepareLab, sha256, listTrackedEntries };
+module.exports = { prepareLab, sha256, listTrackedEntries, assertNoSymlinkParents };
