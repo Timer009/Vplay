@@ -626,6 +626,8 @@ function publicTask(task) {
     projectId: task.projectId || 'default',
     kind: task.kind || 'prompt',
     createdBy: task.createdBy || 'admin',
+    restricted: task.restricted === true,
+    approval: task.approval || null,
     status: task.status,
     text: task.text,
     createdAt: task.createdAt,
@@ -1037,6 +1039,47 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // C18 P-2：受限任务必须由管理员批准后才入队；设备 token 不得自批。
+    const approvalMatch = /^\/tasks\/([^/]+)\/(approve|reject)$/.exec(pathname);
+    if (approvalMatch && method === 'POST') {
+      if (!requireAuth(req, res)) return;
+      const auth = authState(req);
+      if (!auth || auth.kind !== 'admin') {
+        sendJson(res, 403, { ok: false, error: 'approval requires administrator token' });
+        return;
+      }
+      const task = store.get(approvalMatch[1]);
+      if (!task) {
+        sendJson(res, 404, { ok: false, error: 'task not found' });
+        return;
+      }
+      if (task.status !== 'awaiting_approval' || task.restricted !== true) {
+        sendJson(res, 409, { ok: false, error: `task is not awaiting approval: ${task.status}` });
+        return;
+      }
+      const action = approvalMatch[2];
+      const at = new Date().toISOString();
+      const updated = store.transition(
+        task.id,
+        action === 'approve' ? 'queued' : 'rejected',
+        {
+          approval:
+            action === 'approve'
+              ? { state: 'approved', approvedAt: at, approvedBy: 'admin', rejectedAt: null }
+              : { state: 'rejected', approvedAt: null, approvedBy: null, rejectedAt: at },
+        },
+      );
+      eventStore.append({
+        type: action === 'approve' ? 'task.approved' : 'task.rejected',
+        taskId: updated.id,
+        projectId: updated.projectId || 'default',
+        status: updated.status,
+        data: { restricted: true, by: 'admin' },
+      });
+      sendJson(res, 200, { ok: true, task: publicTask(updated) });
+      return;
+    }
+
     if (pathname === '/prompt' && method === 'POST') {
       if (!requireAuth(req, res)) return;
       if (bucketLimited(promptBuckets, req.socket.remoteAddress || 'unknown', PROMPT_RATE_LIMIT)) {
@@ -1092,6 +1135,7 @@ const server = http.createServer(async (req, res) => {
           projectId,
           createdBy: (auth && auth.deviceId) || 'admin',
           allowYolo: requestedYolo && via === 'token',
+          restricted: payload.restricted === true,
         });
         console.log(
           `[remote] task ${task.id} ${duplicate ? 'already exists (idempotent)' : 'queued'} project=${projectId}`,
@@ -1101,8 +1145,8 @@ const server = http.createServer(async (req, res) => {
             type: 'task.created',
             taskId: task.id,
             projectId,
-            status: 'queued',
-            data: { kind: task.kind || 'prompt', createdBy: task.createdBy || 'admin' },
+            status: task.status,
+            data: { kind: task.kind || 'prompt', createdBy: task.createdBy || 'admin', restricted: task.restricted === true },
           });
         }
         sendJson(res, duplicate ? 200 : 202, {

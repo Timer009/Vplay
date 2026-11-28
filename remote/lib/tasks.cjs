@@ -16,24 +16,28 @@ const path = require('path');
 const crypto = require('crypto');
 
 const TASK_STATUSES = [
+  'awaiting_approval',
   'queued',
   'running',
   'verifying',
   'succeeded',
   'failed',
   'interrupted',
+  'rejected',
 ];
 
 const ACTIVE_STATUSES = new Set(['running', 'verifying']);
 
 /** Allowed state transitions. Anything else is a bug and throws. */
 const TRANSITIONS = {
+  awaiting_approval: ['queued', 'rejected'],
   queued: ['running', 'failed', 'interrupted'],
   running: ['verifying', 'succeeded', 'failed', 'interrupted'],
   verifying: ['succeeded', 'failed', 'interrupted'],
   succeeded: [],
   failed: [],
   interrupted: [],
+  rejected: [],
 };
 
 const MAX_TEXT_LENGTH = 4000;
@@ -227,7 +231,9 @@ function createTaskStore(options) {
     const fingerprint = compactText(text);
     const sameText = tasks.find(
       (task) =>
-        (task.status === 'queued' || task.status === 'running') &&
+        (task.status === 'queued' ||
+          task.status === 'running' ||
+          task.status === 'awaiting_approval') &&
         (task.projectId || 'default') === projectId &&
         compactText(task.text || '') === fingerprint,
     );
@@ -264,7 +270,12 @@ function createTaskStore(options) {
           : null,
       createdBy,
       allowYolo: Boolean(input && input.allowYolo === true),
-      status: 'queued',
+      restricted: Boolean(input && input.restricted === true),
+      approval:
+        input && input.restricted === true
+          ? { state: 'pending', approvedAt: null, approvedBy: null, rejectedAt: null }
+          : null,
+      status: input && input.restricted === true ? 'awaiting_approval' : 'queued',
       createdAt: now,
       updatedAt: now,
       startedAt: null,
@@ -296,7 +307,7 @@ function createTaskStore(options) {
     task.status = next;
     task.updatedAt = new Date().toISOString();
     if (patch && typeof patch === 'object') Object.assign(task, patch);
-    if (next === 'failed' || next === 'interrupted' || next === 'succeeded') {
+    if (next === 'failed' || next === 'interrupted' || next === 'succeeded' || next === 'rejected') {
       task.finishedAt = task.updatedAt;
     }
     persist();

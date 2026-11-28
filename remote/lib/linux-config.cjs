@@ -26,6 +26,38 @@ const BROWSER_ARG_PATTERNS = [
   /^--js-flags=--max-old-space-size=(256|384|512|768|1024|1536|2048)$/,
 ];
 
+// C18 P-1：受限模式只读工具白名单（执行层由 CLI --core-tools 过滤）。
+const RESTRICTED_CORE_TOOLS = Object.freeze([
+  'read_file',
+  'read_many_files',
+  'grep_search',
+  'glob',
+  'list_directory',
+]);
+const RESTRICTED_EXCLUDED_TOOLS = Object.freeze([
+  'run_shell_command',
+  'edit',
+  'write_file',
+  'web_fetch',
+  'web_search',
+  'task',
+  'skill',
+  'generate_game_assets',
+  'generate_tilemap',
+  'generate_gdd',
+  'exit_plan_mode',
+  'save_memory',
+]);
+
+function restrictedCliArgs() {
+  return [
+    '--core-tools',
+    RESTRICTED_CORE_TOOLS.join(','),
+    '--exclude-tools',
+    RESTRICTED_EXCLUDED_TOOLS.join(','),
+  ];
+}
+
 const FORBIDDEN_BROWSER_ARG = /--no-sandbox|--disable-setuid-sandbox|--single-process|--disable-web-security|--allow-running-insecure-content|--remote-debugging|--disable-features=.*(site-per-process|IsolateOrigins)|--no-zygote/i;
 
 class BrowserArgsError extends Error {
@@ -114,4 +146,7 @@ module.exports = {
   parseUmask,
   spawnDetachedOptions,
   killProcessGroup,
+  RESTRICTED_CORE_TOOLS,
+  RESTRICTED_EXCLUDED_TOOLS,
+  restrictedCliArgs,
 };
