@@ -32,7 +32,7 @@
   - 根目录构建/工作区元数据（`package.json`、`package-lock.json`、`eslint.config.js`、
     `.gitignore`）。
 - 逐文件变更清单：`docs/UPSTREAM-MODIFICATIONS.md`（由 `git diff --name-status`
-  生成，共 129 个文件；相对初始脚手架，不声称是上游逐文件差异全集）。
+  生成，共 133 个文件；相对初始脚手架，不声称是上游逐文件差异全集）。
 
 > 说明：本轮发布准备**未重新克隆上游 OpenGame 做逐文件对比**；上游身份依据
 > D18 报告中的 GitHub API 核实结果（`license=Apache-2.0`、`package.json`

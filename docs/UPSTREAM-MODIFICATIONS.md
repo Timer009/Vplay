@@ -1,11 +1,13 @@
 ﻿# 上游基线以来的文件变更清单
 
-> 基线：本仓库初始脚手架 `a016895`（承载 OpenGame 0.6.0）；目标：B14 候选 `792d11c`。
-> 由 `git diff --name-status a016895 792d11c` 生成；A=新增，M=修改，D=删除，R=重命名。
+> 基线：本仓库初始脚手架 `a016895`（承载 OpenGame 0.6.0）；目标：B16 候选 `5faaaee`。
+> 由 `git diff --name-status a016895 5faaaee` 生成；A=新增，M=修改，D=删除，R=重命名。
 
 | 状态 | 文件                                                 |
 | ---- | ---------------------------------------------------- |
 | M    | `.gitignore`                                         |
+| A    | `ATTRIBUTION.md`                                     |
+| M    | `README.md`                                          |
 | A    | `docs/ARCHITECTURE.md`                               |
 | A    | `docs/CONNECT-L2-ACCEPTANCE.md`                      |
 | A    | `docs/CONNECT-TAILSCALE.md`                          |
@@ -17,6 +19,7 @@
 | A    | `docs/ROADMAP.md`                                    |
 | A    | `docs/STARTUP-RECOVERY.md`                           |
 | A    | `docs/TRUST-BOUNDARY-B11.md`                         |
+| A    | `docs/UPSTREAM-MODIFICATIONS.md`                     |
 | A    | `docs/reports/SPRINT-01-REPORT.md`                   |
 | A    | `docs/reports/SPRINT-02-B04-REPORT.md`               |
 | A    | `docs/reports/SPRINT-02-FINAL-HARDENING.md`          |
@@ -59,6 +62,7 @@
 | A    | `remote/test/b12-snapshot-gc.test.cjs`               |
 | A    | `remote/test/b13-vision-connect.test.cjs`            |
 | A    | `remote/test/b14-vision-022.test.cjs`                |
+| A    | `remote/test/b16-lock-writer.test.cjs`               |
 | A    | `remote/test/c07-hardening.test.cjs`                 |
 | A    | `remote/test/concurrency.test.cjs`                   |
 | A    | `remote/test/e2e-agent.test.cjs`                     |

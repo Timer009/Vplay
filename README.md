@@ -29,7 +29,8 @@ _\*Corresponding author_
 > 本仓库是 **Timer009/Vplay**，OpenGame 0.6.0 的衍生修改版（Apache-2.0）。
 > 上游：<https://github.com/leigest519/OpenGame>；修改声明见 [`ATTRIBUTION.md`](ATTRIBUTION.md)。
 >
-> - 当前参赛候选：**`sprint-03-b14-candidate`** @ `792d11c`（冻结运行代码；C15/E12 独立验收中）
+> - 当前参赛候选：**`sprint-03-b16-candidate`**（运行代码 `5faaaee`；C16/E13 独立验收中）
+> - 上一冻结基线：`sprint-03-b14-candidate` @ `792d11c`（Vision 0.2.2；C15 仅 G1 阻断，B16 定点修复）
 > - 发布准备文档分支：`sprint-03-b15-release-prep`（仅文档，不含运行代码改动）
 > - 默认分支 `main` 仍停留在初始脚手架 `a016895`，**落后于候选分支**；评委/集成请以候选分支为准，等待验收通过后再合并。
 
