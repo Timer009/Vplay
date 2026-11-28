@@ -274,6 +274,11 @@ function createWorker(options) {
   const agentSocket = options.agentSocket || null;
   const ipcKey = options.ipcKey || null;
   const agentConnectTimeoutMs = Number(options.agentConnectTimeoutMs || 5000);
+  // B23 P1：code_change 的真实浏览器验证（生产必须开启；完整开发模式仅静态检查）。
+  const browserVerifier = typeof options.browserVerifier === 'function' ? options.browserVerifier : null;
+  const requireBrowserVerification = options.requireBrowserVerification === true;
+  const previewTicketProvider =
+    typeof options.previewTicketProvider === 'function' ? options.previewTicketProvider : null;
 
   let current = null;
   let currentChild = null;
@@ -873,21 +878,66 @@ function createWorker(options) {
         throw error;
       }
 
-      let published = false;
-      let publishError = null;
-      try {
-        const root = projects.buildPreview(projectId);
-        const check = projects.verifyPreview(projectId);
-        published = Boolean(root && check.ok);
-        if (!published) publishError = check.reason;
-      } catch (error) {
-        publishError = error.message;
+      let browserResult = null;
+      let previewCookie = null;
+      if (requireBrowserVerification) {
+        if (!browserVerifier) {
+          const error = new Error('browser verifier is not configured');
+          error.code = 'BROWSER_VERIFICATION_UNAVAILABLE';
+          throw error;
+        }
+        if (previewTicketProvider) {
+          try {
+            previewCookie = previewTicketProvider({ projectId, taskId: task.id });
+          } catch {
+            previewCookie = null;
+          }
+        }
+        try {
+          projects.buildPreview(projectId);
+        } catch {
+          // 预览构建失败会在验证阶段以 HTTP 非 200 体现
+        }
+        browserResult = await browserVerifier({
+          projectId,
+          taskId: task.id,
+          previewCookie,
+        });
+        if (!browserResult || browserResult.ok !== true) {
+          const error = new Error(
+            `browser verification failed: ${(browserResult && browserResult.reason) || 'unknown'}`,
+          );
+          error.code = 'CODE_CHANGE_BROWSER_FAILED';
+          error.browser = browserResult;
+          throw error;
+        }
       }
 
+      // 未验证版本不得作为成功版本发布：只有浏览器验证通过才 build/publish。
+      let published = false;
+      let publishError = null;
+      if (requireBrowserVerification) {
+        try {
+          const root = projects.buildPreview(projectId);
+          const check = projects.verifyPreview(projectId);
+          published = Boolean(root && check.ok);
+          if (!published) publishError = check.reason;
+        } catch (error) {
+          publishError = error.message;
+        }
+        if (!published) {
+          const error = new Error(`preview publish failed: ${publishError || 'unknown'}`);
+          error.code = 'CODE_CHANGE_PUBLISH_FAILED';
+          error.browser = browserResult;
+          throw error;
+        }
+      }
+
+      const verified = requireBrowserVerification && published;
       const result = {
         ok: true,
-        verified: false,
-        outcome: 'code_change_unverified',
+        verified,
+        outcome: verified ? 'code_change_verified' : 'code_change_unverified',
         codeChange: {
           files: files.map((file) => file.path),
           baseHash: change.baseHash,
@@ -895,7 +945,20 @@ function createWorker(options) {
           checks: checks.checks,
           published,
           publishError,
-          browserVerification: 'BLOCKED_E16_SANDBOX',
+          browserVerification: requireBrowserVerification
+            ? browserResult && browserResult.ok
+              ? 'PASS'
+              : 'FAIL'
+            : 'SKIPPED_FULL_DEV',
+          browser: browserResult
+            ? {
+                url: browserResult.url || null,
+                status: browserResult.status || null,
+                pageErrors: browserResult.pageErrors || [],
+                consoleErrors: browserResult.consoleErrors || [],
+                sandbox: browserResult.sandbox || null,
+              }
+            : null,
         },
       };
       try {
@@ -903,7 +966,7 @@ function createWorker(options) {
           taskId: task.id,
           prompt: task.text.slice(0, 200),
           changedFiles: files.length,
-          verified: false,
+          verified,
           status: 'succeeded',
         });
       } catch (error) {
@@ -933,6 +996,12 @@ function createWorker(options) {
         try {
           rollbackChangeSet({ journalFile, root: dir });
           rolledBack = true;
+          // 回滚后重建预览，避免留下未验证/半写产物
+          try {
+            projects.buildPreview(projectId);
+          } catch {
+            // 预览恢复失败不影响回滚结论
+          }
         } catch (rollbackError) {
           log(`[remote] code_change rollback failed: ${rollbackError.message}`);
         }
@@ -944,6 +1013,7 @@ function createWorker(options) {
         codeChange: {
           error: { code: error.code || 'CODE_CHANGE_FAILED', message },
           checks: error.checks || null,
+          browser: error.browser || null,
           rolledBack,
         },
       };

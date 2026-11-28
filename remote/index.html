@@ -86,6 +86,10 @@
   .mini{font-family:var(--mono);font-size:10px;letter-spacing:.6px;padding:6px 9px;border-radius:7px;border:1px solid var(--line-bright);background:transparent;color:var(--dim);cursor:pointer}
   .mini:active{color:var(--green);border-color:var(--green-deep)}
   .mini[data-act="rollback"]{color:var(--amber);border-color:var(--amber-deep)}
+  .mini[data-act="approve"]{color:var(--green);border-color:var(--green-deep)}
+  .mini[data-act="reject"]{color:var(--amber);border-color:var(--amber-deep)}
+  .code-diff{display:none;margin-top:8px;max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:10.5px;line-height:1.5;color:var(--dim);background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:7px;padding:8px}
+  .code-diff.show{display:block}
   .empty-note{color:var(--faint);font-size:12px}
 
   .artifact-none{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--faint)}
@@ -323,16 +327,21 @@
   }
 
   function taskActions(task) {
-    if (task.kind === 'vision') {
-      return '<div class="task-actions">' +
-        '<button class="mini" data-act="vision" data-id="' + esc(task.id) + '" data-project="' + esc(task.projectId) + '">查看视觉报告</button>' +
-        '</div>';
+    var actions = [];
+    if (task.status === 'awaiting_approval') {
+      actions.push('<button class="mini" data-act="approve" data-id="' + esc(task.id) + '">批准</button>');
+      actions.push('<button class="mini" data-act="reject" data-id="' + esc(task.id) + '">拒绝</button>');
     }
-    if (!task.snapshotSeq || !task.projectId) return '';
-    return '<div class="task-actions">' +
-      '<button class="mini" data-act="diff" data-id="' + esc(task.id) + '" data-project="' + esc(task.projectId) + '" data-seq="' + task.snapshotSeq + '">查看差异</button>' +
-      '<button class="mini" data-act="rollback" data-id="' + esc(task.id) + '" data-project="' + esc(task.projectId) + '" data-seq="' + task.snapshotSeq + '">回退到本次之前</button>' +
-    '</div>';
+    if (task.kind === 'code_change' && task.codeChange && task.codeChange.diff) {
+      actions.push('<button class="mini" data-act="codechange" data-id="' + esc(task.id) + '">查看变更</button>');
+    }
+    if (task.kind === 'vision') {
+      actions.push('<button class="mini" data-act="vision" data-id="' + esc(task.id) + '" data-project="' + esc(task.projectId) + '">查看视觉报告</button>');
+    } else if (task.snapshotSeq && task.projectId) {
+      actions.push('<button class="mini" data-act="diff" data-id="' + esc(task.id) + '" data-project="' + esc(task.projectId) + '" data-seq="' + task.snapshotSeq + '">查看差异</button>');
+      actions.push('<button class="mini" data-act="rollback" data-id="' + esc(task.id) + '" data-project="' + esc(task.projectId) + '" data-seq="' + task.snapshotSeq + '">回退到本次之前</button>');
+    }
+    return actions.length ? '<div class="task-actions">' + actions.join('') + '</div>' : '';
   }
 
   function renderTasks(payload) {
@@ -378,9 +387,18 @@
           detail += '\n视觉错误: ' + task.result.vision.error.message;
         }
       }
+      if (task.kind === 'code_change' && task.codeChange) {
+        var ccf = task.codeChange.files || [];
+        detail += (detail ? '\n' : '') + '代码变更: ' + ccf.length + ' 个文件 · ' +
+          (task.codeChange.diffSha256 || '').slice(0, 12) +
+          (task.codeChange.summary ? ' · ' + task.codeChange.summary : '');
+      }
       if (!detail) detail = '创建于 ' + clock(task.createdAt);
       var badge = task.status;
       if (task.status === 'succeeded' && task.result && task.result.verified === false) badge = 'unverified';
+      var codeDiff = (task.kind === 'code_change' && task.codeChange && task.codeChange.diff)
+        ? '<pre class="code-diff" data-diff-for="' + esc(task.id) + '">' + esc(task.codeChange.diff) + '</pre>'
+        : '';
       return '<div class="task-item' + open + '" data-id="' + esc(task.id) + '">' +
         '<div class="row"><span class="task-id">' + esc(task.id) + '</span>' +
         '<span class="task-badge" data-s="' + esc(badge) + '">' + esc(badge) + '</span></div>' +
@@ -388,6 +406,7 @@
         '<div class="task-sub">' + esc(task.projectId || 'default') + ' · ' + clock(task.createdAt) + '</div>' +
         '<div class="task-detail">' + esc(detail) + '</div>' +
         taskActions(task) +
+        codeDiff +
         '</div>';
     }).join('');
   }
@@ -685,6 +704,21 @@
     }).catch(function () { showSendErr('回退失败：无法连接桌面端服务'); });
   }
 
+  function doApproval(taskId, action) {
+    var verb = action === 'approve' ? '批准' : '拒绝';
+    if (!window.confirm(verb + '任务 ' + taskId + '？')) return;
+    fetchJson('/tasks/' + encodeURIComponent(taskId) + '/' + action, { method: 'POST' })
+      .then(function (r) {
+        if (r.ok) {
+          showSent('已' + verb + '：' + r.data.task.status);
+          loadTasks();
+        } else {
+          showSendErr(verb + '失败：' + ((r.data && r.data.error) || ('HTTP ' + r.status)));
+        }
+      })
+      .catch(function () { showSendErr(verb + '失败：无法连接桌面端服务'); });
+  }
+
   taskList.addEventListener('click', function (e) {
     var actionBtn = e.target.closest('[data-act]');
     if (actionBtn) {
@@ -693,6 +727,12 @@
       if (act === 'diff') loadDiff(actionBtn.getAttribute('data-id'), actionBtn.getAttribute('data-project'), actionBtn.getAttribute('data-seq'));
       if (act === 'rollback') doRollback(actionBtn.getAttribute('data-id'), actionBtn.getAttribute('data-project'), actionBtn.getAttribute('data-seq'));
       if (act === 'vision') loadVisionReport(actionBtn.getAttribute('data-id'), actionBtn.getAttribute('data-project'));
+      if (act === 'approve' || act === 'reject') doApproval(actionBtn.getAttribute('data-id'), act);
+      if (act === 'codechange') {
+        var id = actionBtn.getAttribute('data-id');
+        var diffEl = taskList.querySelector('.code-diff[data-diff-for="' + id + '"]');
+        if (diffEl) diffEl.classList.toggle('show');
+      }
       return;
     }
     var item = e.target.closest('.task-item');

@@ -73,3 +73,65 @@ Content-Type: application/json
 - 依赖安装、构建系统改造、vendor 变更；
 - 真实模型调用；change-set 由外部 Harness/模型产生，本轮只用通用 dummy 测试；
 - 浏览器自动化验证（E16 0.2.3 集成前，禁止用 no-sandbox 0.2.2 替代）。
+
+## 6. B23：真实模型接入契约（Harness/代理侧）
+
+产品不直接调用模型；Harness 代理把模型输出转为结构化 change-set，再调用：
+
+```http
+POST /projects/<isolated-lab>/code-change
+Authorization: Bearer <REMOTE_TOKEN>
+```
+
+建议模型工具定义（OpenAI tools，`strict: true`）：
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "propose_code_change",
+    "description": "Propose complete-file edits for the isolated Vplay lab project",
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "files"],
+      "properties": {
+        "summary": { "type": "string", "maxLength": 200 },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "content"],
+            "properties": {
+              "path": { "type": "string" },
+              "content": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+约束：
+
+- 模型只能给出完整文件内容；不允许 diff/patch 指令、shell、依赖、URL；
+- 宿主负责路径/扩展名/大小/隐藏路径校验与 diff 生成；
+- 审批由管理员在手机端完成（批准/拒绝 + diff 展开），审批绑定基线/文件/diff 哈希；
+- 真实模型调用、token 预算、取消、SSE 由 Harness 代理负责（见 B21 §6）。
+
+## 7. B23：浏览器验证与发布语义
+
+- 受限部署（生产）：`requireBrowserVerification=true`。
+  - 静态检查通过后启动 `chromiumSandbox:true` 的浏览器，访问
+    `http://127.0.0.1:<previewPort>/p/<projectId>/`；
+  - 有 pageerror / console.error / HTTP 非 200 → 视为失败：回滚文件、重建预览、任务 failed；
+  - 只有浏览器验证通过 → `verified=true`、`published=true`，才能作为成功版本。
+- 完整开发模式：不做浏览器验证，`browserVerification=SKIPPED_FULL_DEV`，
+  `verified=false`、`published=false`；不得作为发布版本。
+- Vision 0.2.3 未集成前，code_change 的浏览器验证使用宿主 playwright-core +
+  强制 sandbox，**不使用** 0.2.2 no-sandbox 路径。

@@ -71,6 +71,7 @@ const {
   renderDiff,
 } = require('./lib/code-change.cjs');
 const { probeAgent } = require('./lib/agent-client.cjs');
+const { createBrowserVerifier } = require('./lib/browser-verify.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
@@ -316,6 +317,22 @@ const worker = createWorker({
   agentSocket: AGENT_SOCKET,
   ipcKey: IPC_KEY || null,
   agentConnectTimeoutMs: AGENT_CONNECT_TIMEOUT_MS,
+  // B23 P1：生产（受限部署）必须做真实浏览器验证；完整开发模式只做静态检查。
+  requireBrowserVerification:
+    RESTRICTED_DEPLOYMENT || process.env.VPLAY_BROWSER_VERIFY === '1',
+  browserVerifier:
+    RESTRICTED_DEPLOYMENT || process.env.VPLAY_BROWSER_VERIFY === '1'
+      ? createBrowserVerifier({ previewPort: PREVIEW_PORT })
+      : null,
+  previewTicketProvider: ({ projectId: ticketProjectId, taskId }) =>
+    PREVIEW_AUTH_ENABLED
+      ? issuePreviewTicket({
+          projectId: ticketProjectId,
+          admin: false,
+          ttlMs: 5 * 60 * 1000,
+          sessionKey: `codechange:${taskId}`,
+        })
+      : null,
   secrets: TOKEN ? [TOKEN] : [],
   visionService,
   eventStore,
@@ -761,6 +778,7 @@ function publicTask(task) {
                 published: task.result.codeChange.published === true,
                 publishError: task.result.codeChange.publishError || null,
                 browserVerification: task.result.codeChange.browserVerification || null,
+                browser: task.result.codeChange.browser || null,
                 rolledBack: task.result.codeChange.rolledBack === true,
                 error: task.result.codeChange.error || null,
               }

@@ -155,7 +155,7 @@ test('B22-C API: admin creates, approves and executes an isolated-lab change-set
     }, { timeout: 20000 });
 
     assert.equal(done.status, 'succeeded', JSON.stringify(done.error || done.result));
-    assert.equal(done.result.codeChange.browserVerification, 'BLOCKED_E16_SANDBOX');
+    assert.equal(done.result.codeChange.browserVerification, 'SKIPPED_FULL_DEV');
     assert.equal(done.result.verified, false);
     assert.equal(
       fs.readFileSync(path.join(project.srcDir, 'game.js'), 'utf-8'),

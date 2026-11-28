@@ -14,6 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const { hashTree } = require('./paths.cjs');
@@ -287,6 +288,52 @@ function rollbackChangeSet({ journalFile, root }) {
   return { ok: true, files: (journal.files || []).map((file) => file.path) };
 }
 
+/** 提取 HTML 内嵌 <script>（无 src）内容；用于语法检查，不执行。 */
+function extractInlineScripts(html) {
+  const scripts = [];
+  const pattern = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = pattern.exec(html))) {
+    const attrs = match[1] || '';
+    if (/\bsrc\s*=/i.test(attrs)) continue;
+    const body = match[2] || '';
+    if (!body.trim()) continue;
+    scripts.push({
+      module: /\btype\s*=\s*["']module["']/i.test(attrs),
+      content: body,
+    });
+  }
+  return scripts;
+}
+
+function checkInlineScripts(file, html, checks, timeoutMs) {
+  const scripts = extractInlineScripts(html);
+  scripts.forEach((script, index) => {
+    const tmp = path.join(
+      os.tmpdir(),
+      `vplay-inline-${crypto.randomBytes(6).toString('hex')}${script.module ? '.mjs' : '.js'}`,
+    );
+    try {
+      fs.writeFileSync(tmp, script.content, 'utf-8');
+      const result = spawnSync(process.execPath, ['--check', tmp], {
+        encoding: 'utf-8',
+        timeout: timeoutMs,
+        windowsHide: true,
+      });
+      checks.push({
+        path: `${file.path}#inline-script-${index + 1}`,
+        ok: result.status === 0,
+        error:
+          result.status === 0
+            ? null
+            : String(result.stderr || result.error || '').slice(0, 400),
+      });
+    } finally {
+      fs.rmSync(tmp, { force: true });
+    }
+  });
+}
+
 /** 固定检查：只允许 node --check 与存在性；不执行项目代码、不装依赖。 */
 function runFixedChecks({ root, files, timeoutMs = 15000 }) {
   const checks = [];
@@ -310,6 +357,9 @@ function runFixedChecks({ root, files, timeoutMs = 15000 }) {
       });
     } else {
       checks.push({ path: file.path, ok: true, error: null });
+      if (ext === '.html' || ext === '.htm') {
+        checkInlineScripts(file, fs.readFileSync(target, 'utf-8'), checks, timeoutMs);
+      }
     }
   }
   return { ok: checks.every((check) => check.ok), checks };
