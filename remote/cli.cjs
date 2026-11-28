@@ -22,6 +22,7 @@ const {
   defaultHome,
   ProjectError,
 } = require('./lib/projects.cjs');
+const { parseMaxSnapshots } = require('./lib/linux-config.cjs');
 const { createDeviceStore } = require('./lib/devices.cjs');
 const { createEventStore } = require('./lib/events.cjs');
 const { createVisionService } = require('./lib/vision-service.cjs');
@@ -62,7 +63,10 @@ async function main() {
   const argv = process.argv.slice(2);
   const args = positional(argv);
   const home = process.env.VPLAY_HOME || defaultHome();
-  const registry = createProjectRegistry({ home });
+  const registry = createProjectRegistry({
+    home,
+    maxSnapshots: parseMaxSnapshots(process.env.VPLAY_MAX_SNAPSHOTS),
+  });
 
   const [scope, action, target] = args;
   if (scope === 'device') {

@@ -16,6 +16,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { killProcessGroup } = require('./linux-config.cjs');
 
 function readFlag(argv, name) {
   const index = argv.indexOf(`--${name}`);
@@ -73,7 +74,7 @@ function killTree(pid) {
   try {
     if (process.platform === 'win32') {
       spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-    } else {
+    } else if (!killProcessGroup(pid)) {
       process.kill(pid, 'SIGKILL');
     }
   } catch {

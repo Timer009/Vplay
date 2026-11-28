@@ -21,6 +21,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { hashTree, compareManifests } = require('./paths.cjs');
+const { spawnDetachedOptions, killProcessGroup } = require('./linux-config.cjs');
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const STATUS_POLL_MS = 1000;
@@ -137,8 +138,8 @@ function killTree(child) {
         windowsHide: true,
         stdio: 'ignore',
       });
-    } else {
-      process.kill(-child.pid, 'SIGKILL');
+    } else if (!killProcessGroup(child.pid)) {
+      child.kill('SIGKILL');
     }
   } catch {
     try {
@@ -287,12 +288,12 @@ function createWorker(options) {
   }
 
   function spawnExecutor(task, dir) {
-    return spawn(process.execPath, [executorScript, task.text], {
+    return spawn(process.execPath, [executorScript, task.text], spawnDetachedOptions({
       cwd: dir,
       env: buildChildEnv(task.id),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
-    });
+    }));
   }
 
   function spawnCli(task, dir, prompt, useContinue) {
@@ -317,12 +318,12 @@ function createWorker(options) {
     if (useContinue) {
       args.push('--continue', '--chat-recording');
     }
-    return spawn(process.execPath, args, {
+    return spawn(process.execPath, args, spawnDetachedOptions({
       cwd: dir,
       env: buildChildEnv(task.id),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
-    });
+    }));
   }
 
   function verify(project, dir, task, startedAtMs) {

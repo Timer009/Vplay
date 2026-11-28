@@ -36,6 +36,7 @@ const {
   unifiedDiff,
   walkFiles,
 } = require('./paths.cjs');
+const { spawnDetachedOptions, killProcessGroup } = require('./linux-config.cjs');
 
 const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const SNAPSHOT_DIR_PATTERN = /^\d{3,}-[a-z0-9-]+$/;
@@ -105,7 +106,7 @@ function killProcessTree(child) {
         windowsHide: true,
         stdio: 'ignore',
       });
-    } else {
+    } else if (!killProcessGroup(child.pid)) {
       child.kill('SIGKILL');
     }
   } catch {
@@ -997,12 +998,12 @@ function createProjectRegistry(options = {}) {
     return new Promise((resolve) => {
       let child;
       try {
-        child = spawn(spec.shell, spec.args, {
+        child = spawn(spec.shell, spec.args, spawnDetachedOptions({
           cwd: record.srcDir,
           env: spec.env,
           windowsHide: true,
           stdio: ['ignore', 'ignore', 'pipe'],
-        });
+        }));
       } catch (error) {
         resolve({ ok: false, status: null, command: spec.command, stderr: String(error.message) });
         return;

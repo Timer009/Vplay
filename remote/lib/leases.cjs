@@ -12,6 +12,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
+const { killProcessGroup } = require('./linux-config.cjs');
 
 function processCommandLine(pid) {
   try {
@@ -41,7 +42,7 @@ function killTree(pid) {
         windowsHide: true,
         stdio: 'ignore',
       }).unref();
-    } else {
+    } else if (!killProcessGroup(pid)) {
       process.kill(pid, 'SIGKILL');
     }
     return true;

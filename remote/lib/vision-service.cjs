@@ -30,6 +30,7 @@ const {
 } = require('./vision-policy.cjs');
 const visionPolicy = require('./vision-policy.cjs');
 const { createDeltaPolicy } = require('./vision-policy-delta.cjs');
+const { parseBrowserArgs } = require('./linux-config.cjs');
 const { hashTree, compareManifests, sha256File } = require('./paths.cjs');
 
 const VENDOR_ENTRY = path.join(__dirname, '..', '..', 'vendor', 'vision', 'src', 'index.mjs');
@@ -268,11 +269,15 @@ function createVisionService(options = {}) {
         : null;
       const previewAuth = previewAuthOf(projectId, ticket);
 
+      // B19：低内存浏览器参数只允许白名单；禁止 --no-sandbox 等危险参数。
+      // 非法配置直接失败关闭，不把任意环境变量透传给 Chromium。
+      const launchArgs = parseBrowserArgs(process.env.VPLAY_BROWSER_ARGS);
       const browserRunner =
         deps.browserRunner ||
         vision.createBrowserRunner({
           executablePath: process.env.VPLAY_BROWSER_EXECUTABLE || null,
           headless: process.env.VPLAY_BROWSER_HEADLESS !== 'false',
+          launchArgs,
           ...(previewAuth ? { previewAuth } : {}),
         });
       const adapter = deps.adapter || vision.createSpacerAdapter();

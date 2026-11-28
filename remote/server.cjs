@@ -56,6 +56,7 @@ const { createEvidenceStore } = require('./lib/evidence.cjs');
 const { createDeviceStore } = require('./lib/devices.cjs');
 const { createVisionService, recoverVisionApplies } = require('./lib/vision-service.cjs');
 const { createPreviewTicketStore } = require('./lib/preview-tickets.cjs');
+const { parseMaxSnapshots, parseUmask } = require('./lib/linux-config.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
@@ -115,6 +116,15 @@ for (const entry of String(process.env.REMOTE_ALLOWED_HOSTS || '').split(',')) {
 }
 
 const EVIDENCE_HMAC_KEY = process.env.EVIDENCE_HMAC_KEY || null;
+// B19 / Linux：POSIX 默认收紧 umask（日志/证据不默认 world-readable）。
+if (process.platform !== 'win32') {
+  try {
+    process.umask(parseUmask(process.env.VPLAY_UMASK));
+  } catch {
+    // 非法值已被 parseUmask 回退；umask 失败不影响启动
+  }
+}
+const MAX_SNAPSHOTS = parseMaxSnapshots(process.env.VPLAY_MAX_SNAPSHOTS);
 const { token: TOKEN, source: TOKEN_SOURCE } = resolveToken();
 const REMOTE_ENABLED = Boolean(TOKEN);
 // B10 / C09 B-09：预览鉴权改为「短期、会话绑定、可吊销」的票据。
@@ -152,7 +162,7 @@ if (SERVE_MODE) {
 }
 
 const projects = process.env.VPLAY_HOME
-  ? createProjectRegistry({ home: process.env.VPLAY_HOME })
+  ? createProjectRegistry({ home: process.env.VPLAY_HOME, maxSnapshots: MAX_SNAPSHOTS })
   : null;
 const RUNTIME_ROOT = projects ? projects.home : WORKSPACE;
 const RUNTIME_DIR = projects
