@@ -44,6 +44,34 @@ done
 echo "control User: $(systemctl show -p User --value vplay-control.service 2>/dev/null || true)"
 echo "agent User:   $(systemctl show -p User --value vplay-agent.service 2>/dev/null || true)"
 
+echo "== agent replay state =="
+AGENT_STATE="${LAB}/agent-state"
+if [ -d "$AGENT_STATE" ]; then
+  MODE=$(stat -c '%a %U %G' "$AGENT_STATE" 2>/dev/null || true)
+  case "$MODE" in
+    "700 vplay-agent vplay-agent") ok "agent-state mode/owner correct" ;;
+    *) bad "agent-state must be 700 vplay-agent:vplay-agent (got ${MODE:-n/a})" ;;
+  esac
+  if [ -f "$AGENT_STATE/replay-state.json" ]; then
+    MODE=$(stat -c '%a %U %G' "$AGENT_STATE/replay-state.json" 2>/dev/null || true)
+    case "$MODE" in
+      "600 vplay-agent vplay-agent") ok "replay-state 0600" ;;
+      *) bad "replay-state must be 600 (got ${MODE:-n/a})" ;;
+    esac
+  else
+    bad "replay-state.json missing (start agent once)"
+  fi
+else
+  bad "agent-state directory missing"
+fi
+
+echo "== rollback operator unit =="
+if [ -f /etc/systemd/system/vplay-rollback@.service ]; then
+  ok "vplay-rollback@.service installed"
+else
+  bad "vplay-rollback@.service missing"
+fi
+
 echo "== IPC probe (control identity) =="
 if runuser -u vplay-control -- env \
   VPLAY_AGENT_SOCKET="$SOCK" \

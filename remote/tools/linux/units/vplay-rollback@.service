@@ -1,0 +1,15 @@
+[Unit]
+Description=Vplay operator rollback for %i (root oneshot, explicit grant)
+ConditionPathExists=/srv/vplay-lab/state/rollback-request-%i.json
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/srv/vplay-lab/vplay.env
+Environment=VPLAY_ROLLBACK_OPERATOR=1
+ExecStart=/usr/bin/node /srv/vplay-lab/repo/remote/tools/rollback-operator.cjs --request /srv/vplay-lab/state/rollback-request-%i.json
+ReadWritePaths=/srv/vplay-lab/workspace /srv/vplay-lab/state
+ReadOnlyPaths=/srv/vplay-lab/repo
+
+[Install]
+WantedBy=multi-user.target

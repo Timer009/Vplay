@@ -15,14 +15,15 @@ EnvironmentFile=/srv/vplay-lab/vplay.env
 ExecStart=/usr/bin/node /srv/vplay-lab/repo/remote/agent/agent-daemon.cjs \
   --socket /run/vplay/agent.sock \
   --cli /srv/vplay-lab/repo/dist/cli.js \
-  --allowed-root /srv/vplay-lab/workspace
+  --allowed-root /srv/vplay-lab/workspace \
+  --state-dir /srv/vplay-lab/agent-state
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/srv/vplay-lab/workspace /srv/vplay-lab/home /srv/vplay-lab/tmp /srv/vplay-lab/evidence-staging
+ReadWritePaths=/srv/vplay-lab/workspace /srv/vplay-lab/home /srv/vplay-lab/tmp /srv/vplay-lab/evidence-staging /srv/vplay-lab/agent-state
 ReadOnlyPaths=/srv/vplay-lab/repo /srv/vplay-lab/state
 IPAddressAllow=127.0.0.1/32
 IPAddressDeny=any

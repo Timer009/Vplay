@@ -46,9 +46,20 @@ function socketPathFor(root) {
 
 async function startAgent(root, options = {}) {
   const socketPath = options.socketPath || socketPathFor(root);
+  const stateDir = options.stateDir || path.join(root, 'agent-state');
   const child = spawn(
     process.execPath,
-    [AGENT, '--socket', socketPath, '--cli', STUB, '--allowed-root', root],
+    [
+      AGENT,
+      '--socket',
+      socketPath,
+      '--cli',
+      STUB,
+      '--allowed-root',
+      root,
+      '--state-dir',
+      stateDir,
+    ],
     {
       env: { ...process.env, VPLAY_IPC_HMAC_KEY: options.ipcKey || IPC_KEY },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -79,6 +90,7 @@ async function startAgent(root, options = {}) {
   });
   return {
     socketPath,
+    stateDir,
     child,
     output: () => output,
     async stop() {
@@ -370,6 +382,174 @@ test('B23-approval: exhausted approval cannot be replayed after state tamper', a
       worker.stop();
     }
   } finally {
+    removeWorkspace(root);
+  }
+});
+
+test('B23-FINAL: runId replay is still blocked after agent restart', async () => {
+  const root = makeWorkspace('vplay-b23-final-restart-');
+  const stateDir = path.join(root, 'agent-state');
+  let first;
+  let second;
+  try {
+    first = await startAgent(root, { stateDir });
+    const client = createAgentClient({ socketPath: first.socketPath, ipcKey: IPC_KEY });
+    await client.connect();
+    const run = client.run({
+      runId: 'run_persist_1',
+      taskId: 'task_persist_1',
+      prompt: 'persist once',
+      cwd: root,
+      deadlineMs: 8000,
+      env: { PATH: process.env.PATH },
+    });
+    assert.equal((await run.promise).exitCode, 0);
+    await first.stop();
+    first = null;
+
+    second = await startAgent(root, { stateDir });
+    const raw = await rawConnect(second.socketPath, IPC_KEY);
+    const prompt = 'persist once';
+    raw.send(
+      baseEnvelope('run', IPC_KEY, {
+        runId: 'run_persist_1',
+        taskId: 'task_persist_1',
+        prompt,
+        restricted: true,
+        cwd: root,
+        deadlineMs: 5000,
+        env: { PATH: process.env.PATH },
+        payloadHash: require('../lib/ipc-protocol.cjs').runPayloadHash(
+          'task_persist_1',
+          'run_persist_1',
+          prompt,
+        ),
+      }),
+    );
+    const error = await waitForFrame(raw.frames, 'error');
+    assert.equal(error.code, 'RUN_REPLAYED');
+    raw.socket.destroy();
+  } finally {
+    if (first) await first.stop();
+    if (second) await second.stop();
+    removeWorkspace(root);
+  }
+});
+
+test('B23-FINAL: cwd escape and junction traversal are rejected', async () => {
+  const root = makeWorkspace('vplay-b23-final-cwd-');
+  let agent;
+  try {
+    agent = await startAgent(root);
+    const { runPayloadHash } = require('../lib/ipc-protocol.cjs');
+
+    const outside = await rawConnect(agent.socketPath, IPC_KEY);
+    const p1 = 'escape';
+    outside.send(
+      baseEnvelope('run', IPC_KEY, {
+        runId: 'run_escape_1',
+        taskId: 'task_escape_1',
+        prompt: p1,
+        restricted: true,
+        cwd: path.join(root, '..'),
+        deadlineMs: 5000,
+        env: { PATH: process.env.PATH },
+        payloadHash: runPayloadHash('task_escape_1', 'run_escape_1', p1),
+      }),
+    );
+    assert.equal((await waitForFrame(outside.frames, 'error')).code, 'IPC_CWD_ESCAPE');
+    outside.socket.destroy();
+
+    const target = path.join(root, '..', `vplay-outside-${Date.now()}`);
+    fs.mkdirSync(target, { recursive: true });
+    const link = path.join(root, 'link-out');
+    let linked = true;
+    try {
+      fs.symlinkSync(target, link, 'junction');
+    } catch {
+      linked = false;
+    }
+    if (!linked) return;
+    const viaLink = await rawConnect(agent.socketPath, IPC_KEY);
+    const p2 = 'junction';
+    viaLink.send(
+      baseEnvelope('run', IPC_KEY, {
+        runId: 'run_escape_2',
+        taskId: 'task_escape_2',
+        prompt: p2,
+        restricted: true,
+        cwd: link,
+        deadlineMs: 5000,
+        env: { PATH: process.env.PATH },
+        payloadHash: runPayloadHash('task_escape_2', 'run_escape_2', p2),
+      }),
+    );
+    assert.equal((await waitForFrame(viaLink.frames, 'error')).code, 'IPC_CWD_ESCAPE');
+    viaLink.socket.destroy();
+  } finally {
+    if (agent) await agent.stop();
+    removeWorkspace(root);
+  }
+});
+
+test('B23-FINAL: oversized IPC frames fail closed before parsing', () => {
+  const { createFrameReader } = require('../lib/ipc-protocol.cjs');
+  let failure = null;
+  const feed = createFrameReader(
+    () => {
+      throw new Error('should not parse');
+    },
+    (error) => {
+      failure = error;
+    },
+  );
+  feed(Buffer.alloc(1024 * 1024 + 32, 0x61));
+  assert.ok(failure);
+  assert.equal(failure.code, 'IPC_MESSAGE_TOO_LARGE');
+});
+
+test('B23-FINAL: split mode refuses rollback and code_change at the control plane', async () => {
+  const root = makeWorkspace('vplay-b23-final-guards-');
+  const { createProjectRegistry } = require('../lib/projects.cjs');
+  const home = path.join(root, 'home');
+  const registry = createProjectRegistry({ home });
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'index.html'), '<!doctype html><html></html>\n');
+  registry.importProject({ sourceDir: path.join(root, 'src'), id: 'dummy-lab', entry: 'index.html' });
+  const token = 'b23-final-token-0123456789';
+  let agent;
+  let server;
+  try {
+    agent = await startAgent(root);
+    server = await startServer({
+      workspace: path.join(root, 'workspace'),
+      home,
+      token,
+      env: {
+        VPLAY_AGENT_SOCKET: agent.socketPath,
+        VPLAY_IPC_HMAC_KEY: IPC_KEY,
+        VPLAY_RESTRICTED_DEPLOYMENT: '1',
+        REMOTE_ALLOW_TEST_SEAM: '0',
+        VPLAY_CODE_CHANGE_PROJECTS: 'dummy-lab',
+      },
+    });
+    const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    const change = await request(server.port, 'POST', '/projects/dummy-lab/code-change', {
+      headers,
+      body: JSON.stringify({ files: [{ path: 'index.html', content: '<html></html>\n' }] }),
+    });
+    assert.equal(change.status, 409);
+    assert.equal(change.json.code, 'CODE_CHANGE_REQUIRES_AGENT_APPLY');
+
+    const rollback = await request(server.port, 'POST', '/projects/dummy-lab/rollback', {
+      headers,
+      body: JSON.stringify({ seq: 1 }),
+    });
+    assert.equal(rollback.status, 409);
+    assert.equal(rollback.json.code, 'ROLLBACK_OPERATOR_REQUIRED');
+  } finally {
+    if (server) await server.stop();
+    if (agent) await agent.stop();
     removeWorkspace(root);
   }
 });

@@ -1606,6 +1606,15 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 404, { ok: false, error: 'projects mode is not enabled' });
         return;
       }
+      if (AGENT_SOCKET) {
+        sendJson(res, 409, {
+          ok: false,
+          code: 'CODE_CHANGE_REQUIRES_AGENT_APPLY',
+          error:
+            'code_change is disabled in split mode until the agent exposes an approved apply operation',
+        });
+        return;
+      }
       const projectId = pathname.split('/')[2];
       let record;
       try {
@@ -1815,6 +1824,16 @@ const server = http.createServer(async (req, res) => {
       if (!requireAuth(req, res)) return;
       if (!projects) {
         sendJson(res, 404, { ok: false, error: 'projects mode is not enabled' });
+        return;
+      }
+      // B23-FINAL：分离模式下 control 不持 workspace 写权限；回滚只能由
+      // root operator oneshot 执行，禁止为方便回滚长期扩大 control/agent 权限。
+      if (AGENT_SOCKET) {
+        sendJson(res, 409, {
+          ok: false,
+          code: 'ROLLBACK_OPERATOR_REQUIRED',
+          error: 'rollback in split mode requires the root operator unit (vplay-rollback)',
+        });
         return;
       }
       const projectId = pathname.split('/')[2];

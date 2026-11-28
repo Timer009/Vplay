@@ -41,12 +41,17 @@ const argv = process.argv.slice(2);
 const socketPath = readFlag(argv, 'socket');
 const cliPath = readFlag(argv, 'cli');
 const allowedRoot = readFlag(argv, 'allowed-root');
+const stateDir = readFlag(argv, 'state-dir');
 const ipcKey = String(process.env.VPLAY_IPC_HMAC_KEY || '').trim();
 const agentVersion = String(process.env.VPLAY_AGENT_VERSION || 'b23-1');
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 
 if (!socketPath || !cliPath || !allowedRoot) {
   console.error('[agent] --socket, --cli and --allowed-root are required');
+  process.exit(2);
+}
+if (!stateDir) {
+  console.error('[agent] --state-dir is required (agent-owned replay state)');
   process.exit(2);
 }
 if (ipcKey.length < 32) {
@@ -62,6 +67,102 @@ if (!fs.existsSync(root)) {
   console.error(`[agent] allowed root not found: ${root}`);
   process.exit(2);
 }
+const replayStateDir = path.resolve(stateDir);
+fs.mkdirSync(replayStateDir, { recursive: true, mode: 0o700 });
+const replayStateFile = path.join(replayStateDir, 'replay-state.json');
+const REPLAY_RUN_TTL_MS = Number(process.env.VPLAY_AGENT_REPLAY_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const NONCE_TTL_MS = 10 * 60 * 1000;
+
+function loadReplayState() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(replayStateFile, 'utf-8'));
+    const now = Date.now();
+    const runs = {};
+    for (const [runId, ts] of Object.entries(parsed.runs || {})) {
+      if (Number(ts) && now - Number(ts) <= REPLAY_RUN_TTL_MS) runs[runId] = Number(ts);
+    }
+    const taskRuns = {};
+    for (const [taskId, runId] of Object.entries(parsed.taskRuns || {})) {
+      if (runs[runId]) taskRuns[taskId] = runId;
+    }
+    const nonces = {};
+    for (const [nonce, ts] of Object.entries(parsed.nonces || {})) {
+      if (Number(ts) && now - Number(ts) <= NONCE_TTL_MS) nonces[nonce] = Number(ts);
+    }
+    return { runs, taskRuns, nonces };
+  } catch {
+    return { runs: {}, taskRuns: {}, nonces: {} };
+  }
+}
+
+const replayState = loadReplayState();
+let replayDirty = false;
+
+function saveReplayState() {
+  if (!replayDirty) return;
+  try {
+    const tmp = `${replayStateFile}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ schemaVersion: 1, ...replayState }, null, 2), {
+      encoding: 'utf-8',
+      mode: 0o600,
+    });
+    fs.renameSync(tmp, replayStateFile);
+    replayDirty = false;
+  } catch (error) {
+    console.error(`[agent] failed to persist replay state: ${error.message}`);
+  }
+}
+
+function rememberNonce(nonce) {
+  if (replayState.nonces[nonce]) return false;
+  replayState.nonces[nonce] = Date.now();
+  replayDirty = true;
+  return true;
+}
+
+function pruneReplayState() {
+  const now = Date.now();
+  for (const [nonce, ts] of Object.entries(replayState.nonces)) {
+    if (now - Number(ts) > NONCE_TTL_MS) delete replayState.nonces[nonce];
+  }
+  for (const [runId, ts] of Object.entries(replayState.runs)) {
+    if (now - Number(ts) > REPLAY_RUN_TTL_MS) {
+      delete replayState.runs[runId];
+      for (const [taskId, bound] of Object.entries(replayState.taskRuns)) {
+        if (bound === runId) delete replayState.taskRuns[taskId];
+      }
+    }
+  }
+  replayDirty = true;
+  saveReplayState();
+}
+
+function assertCwdInsideRoot(cwd) {
+  const realRoot = fs.realpathSync.native(root);
+  let realCwd;
+  try {
+    realCwd = fs.realpathSync.native(cwd);
+  } catch {
+    throw new IpcError('cwd does not exist', 'IPC_CWD_ESCAPE');
+  }
+  if (realCwd !== realRoot && !realCwd.startsWith(`${realRoot}${path.sep}`)) {
+    throw new IpcError('cwd resolves outside the agent workspace root', 'IPC_CWD_ESCAPE');
+  }
+}
+
+function verifySocketDirectory() {
+  if (process.platform === 'win32') return;
+  const dir = path.dirname(socketPath);
+  const stat = fs.lstatSync(dir);
+  if (stat.isSymbolicLink()) {
+    console.error(`[agent] socket directory must not be a symlink: ${dir}`);
+    process.exit(1);
+  }
+  if ((stat.mode & 0o007) !== 0) {
+    console.error(`[agent] socket directory must not grant world access: ${dir}`);
+    process.exit(1);
+  }
+}
 
 const isWindowsPipe = process.platform === 'win32' && socketPath.startsWith('\\\\.\\pipe\\');
 if (process.platform !== 'win32' && !path.isAbsolute(socketPath)) {
@@ -74,8 +175,6 @@ if (process.platform === 'win32' && !isWindowsPipe) {
 }
 
 let activeRun = null;
-const usedRunIds = new Set();
-const usedTaskRuns = new Map();
 
 function log(line) {
   console.log(`[agent] ${new Date().toISOString()} ${line}`);
@@ -122,8 +221,9 @@ function runTask(socket, request, connection) {
   let run;
   try {
     run = validateRunRequest(request, { allowedRoot: root });
-    if (usedRunIds.has(run.runId)) throw new IpcError('runId already used', 'RUN_REPLAYED');
-    const previous = usedTaskRuns.get(run.taskId);
+    assertCwdInsideRoot(run.cwd);
+    if (replayState.runs[run.runId]) throw new IpcError('runId already used', 'RUN_REPLAYED');
+    const previous = replayState.taskRuns[run.taskId];
     if (previous && previous !== run.runId) {
       throw new IpcError('task already has a run in this agent lifetime', 'TASK_REBOUND');
     }
@@ -132,8 +232,10 @@ function runTask(socket, request, connection) {
     sendError(socket, request && request.runId, error);
     return;
   }
-  usedRunIds.add(run.runId);
-  usedTaskRuns.set(run.taskId, run.runId);
+  replayState.runs[run.runId] = Date.now();
+  replayState.taskRuns[run.taskId] = run.runId;
+  replayDirty = true;
+  saveReplayState();
 
   const startedAt = new Date().toISOString();
   const args = [
@@ -283,7 +385,6 @@ function handleCancel(socket, message) {
 }
 
 function handleConnection(socket) {
-  const seenNonces = new Set();
   let authenticated = false;
   let closed = false;
   const close = () => {
@@ -298,13 +399,18 @@ function handleConnection(socket) {
 
   const reader = createFrameReader(
     (message) => {
-      const check = verifyEnvelope(message, ipcKey, { seenNonces });
+      const check = verifyEnvelope(message, ipcKey);
       if (!check.ok) {
         sendError(socket, message && message.runId, new IpcError(check.reason, check.reason));
         if (!authenticated) close();
         return;
       }
-      seenNonces.add(message.nonce);
+      if (!rememberNonce(message.nonce)) {
+        sendError(socket, message && message.runId, new IpcError('nonce already used', 'IPC_NONCE_REPLAYED'));
+        if (!authenticated) close();
+        return;
+      }
+      saveReplayState();
       if (!authenticated) {
         if (message.type !== 'hello' || message.role !== 'control') {
           sendError(socket, null, new IpcError('hello required', 'HELLO_REQUIRED'));
@@ -347,6 +453,7 @@ function handleConnection(socket) {
 }
 
 function start() {
+  verifySocketDirectory();
   if (process.platform !== 'win32' && fs.existsSync(socketPath)) {
     try {
       fs.rmSync(socketPath, { force: true });
@@ -364,12 +471,19 @@ function start() {
     if (process.platform !== 'win32') {
       try {
         fs.chmodSync(socketPath, 0o660);
+        const stat = fs.statSync(socketPath);
+        if ((stat.mode & 0o777) !== 0o660) {
+          console.error('[agent] socket mode must be 0660');
+          process.exit(1);
+        }
       } catch (error) {
-        console.error(`[agent] failed to chmod socket: ${error.message}`);
+        console.error(`[agent] failed to secure socket: ${error.message}`);
         process.exit(1);
       }
     }
     log(`listening uid=${typeof process.getuid === 'function' ? process.getuid() : 'n/a'} socket=${socketPath}`);
+    const prune = setInterval(pruneReplayState, 10 * 60 * 1000);
+    prune.unref?.();
   });
 
   const shutdown = (signal) => {

@@ -158,3 +158,44 @@ OpenGame/remote/tools/linux/vplay.env.example
 - SO_PEERCRED：Node 核心不支持，当前以 FS 权限 + HMAC 代替；需 native shim 才可宣称。
 - 回滚写 workspace 仍属 control 临时例外。
 - Vision 0.2.3：等待 E16-HASH 权威确认，未集成。
+
+## 10. B23-FINAL 加固（已实现）
+
+### 10.1 防重放跨重启
+
+- agent 新增 `--state-dir`（必填，agent 专属 0700），持久化
+  `<state-dir>/replay-state.json`（0600）：
+  `{runs:{runId:ts}, taskRuns:{taskId:runId}, nonces:{nonce:ts}}`。
+- 启动装载并清洗：runId 默认保留 7 天（`VPLAY_AGENT_REPLAY_TTL_MS`），
+  nonce 保留 10 分钟；每次 run / 每条消息原子落盘。
+- 重启后同一 `runId` 仍 `RUN_REPLAYED`；跨连接 nonce 重放 `IPC_NONCE_REPLAYED`。
+
+### 10.2 socket 目录与权限
+
+- agent 启动检查 socket 目录不是 symlink 且无 world 权限（`mode & 0o007 == 0`）。
+- listen 后 `chmod 0660` 并复核，失败即退出。
+- 控制面仍以 `probeAgent` 启动探测；不可达拒绝启动。
+
+### 10.3 路径穿越
+
+- `cwd` 先 `path.resolve` 再 `realpathSync`，必须落在 `--allowed-root` 的 realpath 内；
+  junction/symlink 指向外部 → `IPC_CWD_ESCAPE`。
+- 帧缓冲 >1 MB 直接失败（`IPC_MESSAGE_TOO_LARGE`）；单帧上限 512 KB。
+
+### 10.4 回滚写入权限
+
+- 分离模式（`VPLAY_AGENT_SOCKET`）下 `POST /projects/:id/rollback` 返回
+  `409 ROLLBACK_OPERATOR_REQUIRED`；control/agent 都不长期持有 workspace 写权限。
+- 回滚由 root oneshot `vplay-rollback@<project>.service` 执行
+  `remote/tools/rollback-operator.cjs`，需要 `VPLAY_ROLLBACK_OPERATOR=1` 与
+  `/srv/vplay-lab/state/rollback-request-<project>.json`（operator 创建）。
+- 该操作是一次性、显式授权，不改变 server/agent 的长期 unit 权限。
+
+### 10.5 code_change 与隔离浏览器
+
+- 分离模式下 `POST /projects/:id/code-change` 返回
+  `409 CODE_CHANGE_REQUIRES_AGENT_APPLY`：在 agent 提供受审批的 apply 操作前，
+  不允许 control 直接写 workspace。
+- 浏览器验证必须在隔离环境（agent netns/UID + `chromiumSandbox:true`）执行；
+  当前受限部署的 code_change 浏览器门禁代码在 control 路径，**分离模式不启用**。
+- 真实模型 change-set 仍由 Harness 代理产生并调用管理员 API；产品不直接调用模型。
