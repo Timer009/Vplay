@@ -245,7 +245,7 @@ test('B10-A4: worker settle is exception-safe — failure still finalizes and re
   const runtimeDir = path.join(root, 'runtime');
   try {
     write(path.join(root, 'src', 'index.html'), '<h1>settle</h1>\n');
-    const task = { id: 'task_settle', text: 'noop', projectId: 'demo' };
+    const task = { id: 'task_settle', text: 'noop', projectId: 'demo', status: 'queued', restricted: false };
     let queued = task;
     const transitions = [];
     const store = {

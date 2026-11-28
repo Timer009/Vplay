@@ -1,0 +1,37 @@
+{
+  "name": "@vplay/vision",
+  "version": "0.2.3",
+  "description": "E16 security candidate: explicit Chromium chromiumSandbox:true in the real launch path; sandbox-bypass launchArgs/env rejected; no no-sandbox fallback. Vision 0.2.2 semantics unchanged.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./adapters/spacer": "./src/verification/adapters/spacer.mjs",
+    "./adapters/dom": "./src/verification/adapters/dom.mjs",
+    "./events": "./src/events.mjs"
+  },
+  "files": [
+    "src",
+    "examples",
+    "scripts",
+    "docs",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check:runtime": "node scripts/check-runtime.mjs"
+  },
+  "peerDependencies": {
+    "playwright-core": ">=1.40.0"
+  },
+  "peerDependenciesMeta": {
+    "playwright-core": {
+      "optional": true
+    }
+  },
+  "sideEffects": false,
+  "license": "Apache-2.0"
+}

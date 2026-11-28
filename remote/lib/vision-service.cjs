@@ -33,7 +33,66 @@ const { createDeltaPolicy } = require('./vision-policy-delta.cjs');
 const { parseBrowserArgs } = require('./linux-config.cjs');
 const { hashTree, compareManifests, sha256File } = require('./paths.cjs');
 
-const VENDOR_ENTRY = path.join(__dirname, '..', '..', 'vendor', 'vision', 'src', 'index.mjs');
+const VENDOR_ROOT = path.join(__dirname, '..', '..', 'vendor');
+
+/**
+ * B23-ADD：Vision vendor 版本选择 + 产物身份校验。
+ * - 默认 0.2.3（E17 阶段 A 权威哈希 415cae0e…）；
+ * - 0.2.2 冻结证据保留在 vendor/vision，可显式回退；
+ * - 未知版本或 tgz 哈希不符 → 失败关闭，不 import。
+ */
+const VISION_VENDORS = Object.freeze({
+  '0.2.2': {
+    dir: 'vision',
+    tgz: 'vplay-vision-0.2.2.tgz',
+    tgzSha256: 'c7679c021082824bb30f6fe7a06573d83ead945361efd60c37ac2bff10b5f74e',
+  },
+  '0.2.3': {
+    dir: 'vision-0.2.3',
+    tgz: 'vplay-vision-0.2.3.tgz',
+    tgzSha256: '415cae0ec26687f2c2804a4f0954ce9ac0affd581aa33c9a8efca2903d17d91d',
+  },
+});
+
+function resolveVisionVendor(env = process.env) {
+  const version = String(env.VPLAY_VISION_VERSION || '0.2.3').trim();
+  const selected = VISION_VENDORS[version];
+  if (!selected) {
+    const error = new Error(`unsupported VPLAY_VISION_VERSION: ${version}`);
+    error.code = 'VISION_VERSION_UNSUPPORTED';
+    throw error;
+  }
+  const dir = path.join(VENDOR_ROOT, selected.dir);
+  return {
+    version,
+    dir,
+    entry: path.join(dir, 'src', 'index.mjs'),
+    tgz: path.join(dir, selected.tgz),
+    expectedSha256: selected.tgzSha256,
+  };
+}
+
+function verifyVisionVendor(vendor = resolveVisionVendor()) {
+  if (!fs.existsSync(vendor.entry)) {
+    const error = new Error(`vision vendor entry missing: ${vendor.entry}`);
+    error.code = 'VISION_VENDOR_MISSING';
+    throw error;
+  }
+  if (!fs.existsSync(vendor.tgz)) {
+    const error = new Error(`vision vendor tgz missing: ${vendor.tgz}`);
+    error.code = 'VISION_VENDOR_TGZ_MISSING';
+    throw error;
+  }
+  const actual = crypto.createHash('sha256').update(fs.readFileSync(vendor.tgz)).digest('hex');
+  if (actual !== vendor.expectedSha256) {
+    const error = new Error(
+      `vision vendor integrity mismatch: ${actual} != ${vendor.expectedSha256}`,
+    );
+    error.code = 'VISION_VENDOR_INTEGRITY';
+    throw error;
+  }
+  return { ok: true, version: vendor.version, tgzSha256: actual, entry: vendor.entry };
+}
 
 const SAFE_FILE = /\.(html?|css)$/i;
 
@@ -66,8 +125,10 @@ function createVisionService(options = {}) {
 
   async function loadVision() {
     if (deps.vision) return deps.vision;
-    // 可复现 vendoring：仓库内相对路径，不依赖本机绝对路径或 npm registry
-    return import(pathToFileURL(VENDOR_ENTRY).href);
+    // 可复现 vendoring：仓库内相对路径；导入前校验 tgz 身份（0.2.3/0.2.2）。
+    const vendor = resolveVisionVendor(process.env);
+    verifyVisionVendor(vendor);
+    return import(pathToFileURL(vendor.entry).href);
   }
 
   function emit(taskId, projectId, type, payload) {
@@ -558,4 +619,11 @@ function recoverVisionApplies({ home, logger = () => {} } = {}) {
   return results;
 }
 
-module.exports = { createVisionService, isSafeAllowedFile, recoverVisionApplies };
+module.exports = {
+  createVisionService,
+  isSafeAllowedFile,
+  recoverVisionApplies,
+  resolveVisionVendor,
+  verifyVisionVendor,
+  VISION_VENDORS,
+};
