@@ -1,5 +1,5 @@
 ﻿param(
-  [string]$LabRoot = "$env:USERPROFILE\vplay-lab",
+  [string]$LabRoot = 'G:\vplay-lab',
   [int]$ControlPort = 18787,
   [int]$PreviewPort = 18788,
   [switch]$Approve

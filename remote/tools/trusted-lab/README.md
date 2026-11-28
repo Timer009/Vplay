@@ -14,6 +14,16 @@
   （`VPLAY_PUBLIC_MODE=0`）一致；不再提供无法启动的配置样例。
 - 未创建真实 lab、未执行真实清理；负对照只用 G 盘临时虚拟目录验证。
 
+## B16 变更（C15 P3-01/P3-02 + G1 工具面）
+
+- 修复 `isolation-check.ps1` / `recover-lab.ps1` 的 `$home` 与只读自动变量 `$HOME`
+  冲突：改用 `$vplayHome = <labRoot>\home`，检查/恢复对象不再误指向用户主目录。
+- 默认 lab 根移出正式工作区：`G:\vplay-lab`（Spacer 副本 `G:\vplay-lab\spacer`）。
+- `cleanup-lab.ps1` 增加拒绝：正式工程及其子目录、`G:\AI_GAME` 及其子目录、
+  用户主目录及其子目录、磁盘根、路径穿越段（`..`）、父链/树内重解析点；
+  仍要求配置精确 `labRoot` + marker，默认 DryRun。
+- 未改变隔离状态：`OS_ISOLATION=NOT_IMPLEMENTED`；未创建账号/ACL/防火墙规则。
+
 ## 文件
 
 | 文件                      | 作用                                                                      | 是否修改系统 |

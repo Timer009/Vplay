@@ -45,6 +45,28 @@ const LOCK_RETRY_MS = 15;
 const LOCK_HARD_TTL_MS = 5 * 60 * 1000;
 const LOCK_EMPTY_GRACE_MS = 5000;
 
+// B16 / C15 G1：租约与写入标记的“所有权 + 心跳”证据。
+// 进程身份（pid）、操作所有权（owner token）、租约有效性（心跳）与实际活跃
+// （目录/租约状态）分开判断；无法证明不再使用时保守保留（不破坏性删除）。
+const LEASE_HEARTBEAT_MS = 30 * 1000;
+const WRITER_HEARTBEAT_MS = 30 * 1000;
+const WRITER_HEARTBEAT_STALE_MS = 5 * 60 * 1000;
+const WRITER_MAX_UNPROVEN_MS = 12 * 60 * 60 * 1000;
+const PROCESS_OWNER = Object.freeze({
+  token: crypto.randomBytes(16).toString('hex'),
+  pid: process.pid,
+  startedAt: Date.now(),
+});
+
+function timestampMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return NaN;
+}
+
 function sleepSync(ms) {
   const buffer = new SharedArrayBuffer(4);
   Atomics.wait(new Int32Array(buffer), 0, 0, ms);
@@ -569,13 +591,37 @@ function createProjectRegistry(options = {}) {
       dir,
       `${id}.${uid}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.lease`,
     );
+    const record = {
+      pid: process.pid,
+      uid,
+      label,
+      owner: PROCESS_OWNER.token,
+      startedAt: PROCESS_OWNER.startedAt,
+      at: Date.now(),
+    };
     try {
-      writeJson(file, { pid: process.pid, uid, label, at: Date.now() });
+      writeJson(file, record);
     } catch {
       return () => {};
     }
-    return () => {
+    // 长时 diff/rollback：心跳只证明“仍在活跃”，不用于缩短保护期。
+    const timer = setInterval(() => {
       try {
+        writeJson(file, { ...record, at: Date.now() });
+      } catch {
+        // 忽略：租约文件所在磁盘暂时不可写
+      }
+    }, LEASE_HEARTBEAT_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      clearInterval(timer);
+      try {
+        const info = readJson(file, null);
+        if (info && info.owner && info.owner !== PROCESS_OWNER.token) return;
+        if (info && Number(info.pid) !== process.pid) return;
         fs.rmSync(file, { force: true });
       } catch {
         // 忽略
@@ -596,11 +642,11 @@ function createProjectRegistry(options = {}) {
       if (!name.startsWith(`${id}.`) || !name.endsWith('.lease')) continue;
       const file = path.join(dir, name);
       const info = readJson(file, null);
-      const stale =
-        !info ||
-        !pidAlive(Number(info.pid)) ||
-        Date.now() - Number(info.at || 0) > 10 * 60 * 1000;
-      if (stale) {
+      // 进程死亡才是明确的“租约失效”；活 pid 一律保守视为有效，绝不因时间
+      // 超过 10 分钟就删除正在被 diff/rollback 使用的快照（B16 / S06）。
+      const pid = Number(info && info.pid);
+      const dead = !info || !Number.isFinite(pid) || !pidAlive(pid);
+      if (dead) {
         try {
           fs.rmSync(file, { force: true });
         } catch {
@@ -613,21 +659,64 @@ function createProjectRegistry(options = {}) {
     return set;
   }
 
-  /** 正在写入的目录（marker pid 仍存活或文件很新）不得被回收。 */
+  /**
+   * 正在写入的目录保护（B16 / S14）。
+   *
+   * - 新代码写入的 marker 带 owner token + startedAt + 心跳 `at`：
+   *   心跳新鲜 → 活跃；心跳过期但目录年龄未超过保守上限 → 仍保留；
+   *   超过上限且无法证明所有权 → 交给 reaper 隔离（只移动、不删除）。
+   * - 旧版 marker（无 owner）：仅 pid 存活 + 目录年龄上限，避免 PID 复用后永久占用。
+   */
   function isActiveWriter(dir) {
     const marker = writingMarkerOf(dir);
-    let stat;
+    let markerStat;
     try {
-      stat = fs.statSync(marker);
+      markerStat = fs.statSync(marker);
+    } catch {
+      return false;
+    }
+    let dirStat;
+    try {
+      dirStat = fs.statSync(dir);
     } catch {
       return false;
     }
     const info = readJson(marker, null);
-    if (info && Number.isFinite(Number(info.pid))) {
-      // pid 明确死亡：即使 marker 很新，也是崩溃残留，可安全隔离
-      return pidAlive(Number(info.pid));
+    const pid = Number(info && info.pid);
+    if (!Number.isFinite(pid) || !pidAlive(pid)) return false;
+    const now = Date.now();
+    const dirAge = now - dirStat.mtimeMs;
+    const hasOwner = Boolean(
+      info &&
+        typeof info.owner === 'string' &&
+        info.owner.length >= 8 &&
+        Number.isFinite(Number(info.startedAt)),
+    );
+    if (hasOwner) {
+      const heartbeat = timestampMs(info.at);
+      const fresh = Number.isFinite(heartbeat) && now - heartbeat < WRITER_HEARTBEAT_STALE_MS;
+      if (fresh) return true;
+      // 心跳过期但目录仍在保守窗口内：无法证明已结束，保留（不破坏性回收）。
+      return dirAge < WRITER_MAX_UNPROVEN_MS;
     }
-    return Date.now() - stat.mtimeMs < 10000;
+    // 旧版 marker：pid 可能被复用，只按目录年龄做有界保留。
+    void markerStat;
+    return dirAge < WRITER_MAX_UNPROVEN_MS;
+  }
+
+  function startWriterHeartbeat(dir) {
+    const marker = writingMarkerOf(dir);
+    const timer = setInterval(() => {
+      try {
+        const info = readJson(marker, null);
+        if (!info) return;
+        writeJson(marker, { ...info, at: Date.now() });
+      } catch {
+        // 忽略：目录可能已被隔离/删除
+      }
+    }, WRITER_HEARTBEAT_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    return () => clearInterval(timer);
   }
 
   function list() {
@@ -1317,9 +1406,18 @@ function createProjectRegistry(options = {}) {
     }
 
     let entry = null;
+    let stopWriterHeartbeat = () => {};
     try {
-      // B12：写入标记，供运行时 GC 识别“正在写入”的目录，绝不误隔离
-      writeJson(writingMarkerOf(dir), { pid: process.pid, at: new Date().toISOString() });
+      // B12：写入标记，供运行时 GC 识别“正在写入”的目录，绝不误隔离。
+      // B16：附带 owner/startedAt/心跳，区分进程身份、所有权与实际活跃状态。
+      writeJson(writingMarkerOf(dir), {
+        pid: process.pid,
+        owner: PROCESS_OWNER.token,
+        startedAt: PROCESS_OWNER.startedAt,
+        at: Date.now(),
+        op: 'snapshot',
+      });
+      stopWriterHeartbeat = startWriterHeartbeat(dir);
       const links = findLinks(record.srcDir);
       copyTree(record.srcDir, dir);
       // 兜底：某些平台 cpSync 会把链接本身复制过去，这里只删链接、不跟随目标
@@ -1426,6 +1524,7 @@ function createProjectRegistry(options = {}) {
         writeGc(id, gc);
       }
       try {
+        stopWriterHeartbeat();
         fs.rmSync(writingMarkerOf(dir), { force: true });
       } catch {
         // 忽略
@@ -1434,6 +1533,11 @@ function createProjectRegistry(options = {}) {
       validateSnapshot(id, entry.uid);
       return entry;
     } catch (error) {
+      try {
+        stopWriterHeartbeat();
+      } catch {
+        // 忽略
+      }
       // NEW-03：失败时清理半成品目录，避免累积并挤占配额
       fs.rmSync(dir, { recursive: true, force: true });
       fs.rmSync(manifestFile(id, entry || { seq }), { force: true });

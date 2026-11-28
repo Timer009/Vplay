@@ -1,6 +1,6 @@
-param(
+﻿param(
   [string]$Source = 'G:\AI_GAME\Vplay-Vision-POC\e05\spacer-latest',
-  [string]$LabRoot = 'G:\AI_GAME\vplay-labs\b12-spacer',
+  [string]$LabRoot = 'G:\vplay-lab\spacer',
   [switch]$Approve
 )
 

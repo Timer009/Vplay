@@ -26,7 +26,7 @@ const { makeWorkspace, removeWorkspace } = require('./helpers.cjs');
 
 const VENDOR = path.join(__dirname, '..', '..', 'vendor', 'vision');
 const LAB_SCRIPT = path.join(__dirname, '..', 'tools', 'trusted-lab', 'cleanup-lab.ps1');
-const LAB_BASE = 'G:\\AI_GAME\\VPLAY-B14-WORK\\lab-tests';
+const LAB_BASE = 'G:\\vplay-lab-b14-tests';
 
 function sha256(text) {
   return crypto.createHash('sha256').update(text).digest('hex');

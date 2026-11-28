@@ -4,14 +4,32 @@
   [switch]$Approve
 )
 
-# B14 / C13 L-1：只允许清理「配置中精确声明的 labRoot」。
-# 额外要求 .vplay-lab-marker 与路径规范化；任何重解析点（symlink/junction）一律拒绝。
-# 默认 DryRun；-Approve 才删除，且删除前先调用 stop-lab.ps1。
+# B16 / C15 L05：只允许清理「配置中精确声明且被授权的专用 labRoot」。
+# 额外要求 .vplay-lab-marker、路径规范化；拒绝正式工程及子目录、用户主目录、
+# 磁盘根、路径穿越与任何重解析点（symlink/junction）。默认 DryRun。
 $ErrorActionPreference = 'Stop'
 
 function Normalize-Dir([string]$value) {
   if (-not $value) { return '' }
   return [System.IO.Path]::GetFullPath($value).TrimEnd('\', '/')
+}
+
+function Assert-NoTraversal([string]$value, [string]$what) {
+  if (-not $value) { return }
+  $segments = $value -split '[\\/]'
+  if ($segments -contains '..') {
+    throw "refuse to clean: path traversal segment in $what ($value)"
+  }
+}
+
+function Assert-Outside([string]$root, [string]$parent, [string]$what) {
+  if (-not $parent) { return }
+  $p = Normalize-Dir $parent
+  if ($root -eq $p) { throw "refuse to clean: labRoot equals $what ($p)" }
+  if ($root.StartsWith($p + '\', [System.StringComparison]::OrdinalIgnoreCase) -or
+      $root.StartsWith($p + '/', [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "refuse to clean: labRoot is inside $what ($p)"
+  }
 }
 
 if (-not (Test-Path -LiteralPath $Config)) {
@@ -22,6 +40,9 @@ if (-not $cfg.labRoot) {
   throw "lab config must define labRoot: $Config"
 }
 
+Assert-NoTraversal ([string]$cfg.labRoot) 'config.labRoot'
+Assert-NoTraversal $LabRoot 'LabRoot'
+
 $configured = Normalize-Dir ([string]$cfg.labRoot)
 $requested = if ($LabRoot) { Normalize-Dir $LabRoot } else { $configured }
 if (-not [string]::Equals($requested, $configured, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -31,9 +52,15 @@ if (-not [string]::Equals($requested, $configured, [System.StringComparison]::Or
 $root = $requested
 $userHome = Normalize-Dir $env:USERPROFILE
 $driveRoot = Normalize-Dir ([System.IO.Path]::GetPathRoot($root))
-if ($root -eq $userHome -or $root -eq $driveRoot -or $root -eq (Normalize-Dir 'G:\AI_GAME')) {
+$formalWorkspace = Normalize-Dir (Join-Path $PSScriptRoot '..\..\..')
+$formalParent = Normalize-Dir 'G:\AI_GAME'
+
+if ($root -eq $userHome -or $root -eq $driveRoot) {
   throw "refuse to clean broad root: $root"
 }
+Assert-Outside $root $userHome 'user home'
+Assert-Outside $root $formalWorkspace 'formal workspace'
+Assert-Outside $root $formalParent 'formal workspace root'
 
 function Assert-NoReparse([string]$target) {
   $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop

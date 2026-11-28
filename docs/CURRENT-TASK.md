@@ -1,38 +1,37 @@
 # Vplay Studio · 当前任务
 
-> Sprint 03C — Vision 0.2.2 集成与最终演示门禁收口（B14）
-> 分支：`sprint-03-b14-candidate`　基线：`65d4875`（B13 候选）
+> Sprint 03C — 最终定点修复与发布候选冻结（B16）
+> 分支：`sprint-03-b16-candidate`　基线：`792d11c`（B14 冻结运行代码）
 > 负责人：唯一开发 Agent（Trae）
 
 ## 1. 本轮目标
 
-以 B13 候选为唯一基线，读取 B13 / C13 / E10 与 E10 `B13-INTEGRATION-GUIDE.md`：
-采用 `@vplay/vision@0.2.2`，统一 strict-repair 语义；关闭 C13-P1-01..05 与
-trusted-lab L-1/L-2；完成演示前开发方预检。不新增产品功能、不调用真实模型。
+读取 B15 / C15 / E12 / D19，仅修复 C15 唯一阻塞 G1（S06/S14）与最小实验工具缺陷
+（`$home`、默认 labRoot、cleanup 授权范围），纳入 B15 发布文档。不修改
+vendor/vision、guard、strict-repair、模型协议与控制面功能；不新增功能、不实现 land-pin。
 
 ## 2. 任务清单
 
-| #   | 任务                                                                                                             | 状态 |
-| --- | ---------------------------------------------------------------------------------------------------------------- | ---- |
-| 1   | 校验 0.2.2 tgz/source 哈希，vendor 0.2.2 并保留 0.2.1 回退                                                       | ✅   |
-| 2   | 对照 B13 补丁：compare 删除（原生）、guard 统一为 CDP 全资源类型补丁                                             | ✅   |
-| 3   | 统一 strict-repair / defectAssertionIds / missingAssertions / newFailures / repair_verified / repair_unconfirmed | ✅   |
-| 4   | 删除宿主第二套修复判定 `strictRepairVerification`                                                                | ✅   |
-| 5   | 保留独立宿主安全校验、operations/digest/path、锁/快照/journal/原子发布/回退                                      | ✅   |
-| 6   | 保留服务端项目绑定与非 admin Vision 票据                                                                         | ✅   |
-| 7   | 重定向矩阵：document / 子资源 / fetch / 同源跨项目 / 跨源多跳                                                    | ✅   |
-| 8   | C13-P1-01 锁活锁与 deadline（S24 106ms）                                                                         | ✅   |
-| 9   | C13-P1-02/03/04 证据链 anchor 收养/算法降级/缺失签名/无 key                                                      | ✅   |
-| 10  | C13-P1-05 独立预检（B34/B35b/E09 B-1）                                                                           | ✅   |
-| 11  | trusted-lab L-1/L-2：cleanup 精确 labRoot/marker/重解析点；配置一致                                              | ✅   |
-| 12  | 最小隔离实施方案（文档提案，未执行）                                                                             | ✅   |
+| #   | 任务                                                                   | 状态        |
+| --- | ---------------------------------------------------------------------- | ----------- |
+| 1   | 复现 S06/S14（B14 基线）并保留修复前证据                               | ✅          |
+| 2   | S06：活进程长租约不因 >10min 被判定失效；死 pid 才失效                 | ✅          |
+| 3   | S14：旧版活 pid 标记有界回收；新标记用 owner + 心跳 + 目录年龄区分     | ✅          |
+| 4   | 保留 owner token、原子写、OCC、journal、恢复与并发保护                 | ✅          |
+| 5   | S24 released 后写入 <1000ms                                            | ✅（103ms） |
+| 6   | 专项测试：长租约、死进程、PID 复用、并发回收、异常退出                 | ✅          |
+| 7   | 修复 isolation-check/recover-lab `$home` 冲突；默认 labRoot 移出工作区 | ✅          |
+| 8   | cleanup 精确授权 labRoot，拒绝正式工程/用户目录/磁盘根/穿越/reparse    | ✅          |
+| 9   | 纳入 B15 ATTRIBUTION、README 指引、修改声明；更新清单                  | ✅          |
+| 10  | 全量 remote、lint/build/bundle、S06/S14/S24、推送与报告                | ✅          |
 
 ## 3. 验收边界
 
-- 未调用真实模型；未启用 Serve/Funnel；未合并 main；未修改系统权限/防火墙。
-- 隔离状态仍为 `NOT_IMPLEMENTED`；0.2.2 不是沙箱。
-- 所有新增大型数据与预检沙箱位于 G 盘。
+- 冻结：vendor/vision、guard、strict-repair、模型协议、控制面功能未改。
+- 未调用真实模型；未启用 Serve/Funnel；未安装组件；未修改系统权限/账号/ACL/防火墙。
+- 未合并 main、未打正式 tag；`OS_ISOLATION=NOT_IMPLEMENTED`。
+- 未修复 C15 其他 P2/P3；未实现 land-pin。
 
 ## 4. 完成后
 
-见 `G:\AI_GAME\VPLAY-SPRINT03-B14-REPORT.md`。停止，等待 Qoder 独立验收。
+见 `G:\AI_GAME\VPLAY-SPRINT03-B16-REPORT.md`。停止，等待 C16/E13 独立复验。

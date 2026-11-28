@@ -1,5 +1,5 @@
-param(
-  [string]$LabRoot = "$env:USERPROFILE\vplay-lab",
+﻿param(
+  [string]$LabRoot = 'G:\vplay-lab',
   [string]$AgentUser = ""
 )
 
@@ -38,8 +38,8 @@ Section "lab root acl"
 if (Test-Path $LabRoot) { icacls $LabRoot } else { Write-Output "lab root missing: $LabRoot" }
 
 Section "vplay home acl"
-$home = Join-Path $env:USERPROFILE '.vplay'
-if (Test-Path $home) { icacls $home } else { Write-Output "vplay home missing: $home" }
+$vplayHome = Join-Path $LabRoot 'home'
+if (Test-Path $vplayHome) { icacls $vplayHome } else { Write-Output "vplay home missing: $vplayHome" }
 
 if ($AgentUser) {
   Section "agent user groups"
