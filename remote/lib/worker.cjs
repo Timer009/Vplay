@@ -21,7 +21,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { hashTree, compareManifests } = require('./paths.cjs');
-const { spawnDetachedOptions, killProcessGroup } = require('./linux-config.cjs');
+const { spawnDetachedOptions, killProcessGroup, restrictedCliArgs } = require('./linux-config.cjs');
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const STATUS_POLL_MS = 1000;
@@ -317,6 +317,10 @@ function createWorker(options) {
     ];
     if (useContinue) {
       args.push('--continue', '--chat-recording');
+    }
+    // C18 P-1：受限模式只读工具白名单；同时排除危险工具作为纵深防御。
+    if (task.restricted === true) {
+      args.push(...restrictedCliArgs());
     }
     return spawn(process.execPath, args, spawnDetachedOptions({
       cwd: dir,
