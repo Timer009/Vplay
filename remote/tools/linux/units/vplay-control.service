@@ -1,0 +1,30 @@
+[Unit]
+Description=Vplay control plane (HTTP, approvals, task state, trusted scheduling)
+After=network.target vplay-agent.service
+Requires=vplay-agent.service
+
+[Service]
+Type=simple
+User=vplay-control
+Group=vplay-control
+EnvironmentFile=/srv/vplay-lab/vplay.env
+ExecStart=/usr/bin/node /srv/vplay-lab/repo/remote/server.cjs
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# Control owns task/approval state and preview/snapshot output under state/.
+# Workspace is read-only from control; rollback must go through a dedicated
+# root oneshot unit (see docs/IPC-CONTRACT-B23.md §5).
+ReadWritePaths=/srv/vplay-lab/state
+ReadOnlyPaths=/srv/vplay-lab/repo /srv/vplay-lab/workspace /srv/vplay-lab/home /srv/vplay-lab/evidence-staging
+IPAddressAllow=127.0.0.1/32
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX AF_INET
+KillMode=control-group
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

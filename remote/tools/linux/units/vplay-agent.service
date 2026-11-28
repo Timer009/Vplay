@@ -1,0 +1,36 @@
+[Unit]
+Description=Vplay restricted agent executor (independent UID)
+After=network.target vplay-relay.service
+Requires=vplay-relay.service
+# The agent only receives restricted tasks over a local socket.
+
+[Service]
+Type=simple
+User=vplay-agent
+Group=vplay-control
+# /run/vplay must be traversable by the control group; socket itself 0660.
+RuntimeDirectory=vplay
+RuntimeDirectoryMode=0750
+EnvironmentFile=/srv/vplay-lab/vplay.env
+ExecStart=/usr/bin/node /srv/vplay-lab/repo/remote/agent/agent-daemon.cjs \
+  --socket /run/vplay/agent.sock \
+  --cli /srv/vplay-lab/repo/dist/cli.js \
+  --allowed-root /srv/vplay-lab/workspace
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/vplay-lab/workspace /srv/vplay-lab/home /srv/vplay-lab/tmp /srv/vplay-lab/evidence-staging
+ReadOnlyPaths=/srv/vplay-lab/repo /srv/vplay-lab/state
+IPAddressAllow=127.0.0.1/32
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX AF_INET
+KillMode=control-group
+TasksMax=128
+# After memcg is enabled (RP03-B checkpoint A):
+# MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target

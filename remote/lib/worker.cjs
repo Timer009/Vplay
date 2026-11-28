@@ -19,6 +19,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const { hashTree, compareManifests } = require('./paths.cjs');
 const { spawnDetachedOptions, killProcessGroup, restrictedCliArgs, evaluateSpawnPolicy } = require('./linux-config.cjs');
@@ -36,6 +37,8 @@ const {
   computeTreeHash,
   renderDiff,
 } = require('./code-change.cjs');
+const { createAgentClient } = require('./agent-client.cjs');
+const { RUN_ENV_ALLOW } = require('./ipc-protocol.cjs');
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const STATUS_POLL_MS = 1000;
@@ -267,9 +270,14 @@ function createWorker(options) {
     options.approvalModel || resolveApprovalModel(process.env);
   const approvalTtlMs = Number(options.approvalTtlMs || 30 * 60 * 1000);
   const restrictedProxy = options.restrictedProxy || null;
+  // B23：执行器分离（Unix socket / Windows 命名管道）。设置后不再本地 spawn CLI。
+  const agentSocket = options.agentSocket || null;
+  const ipcKey = options.ipcKey || null;
+  const agentConnectTimeoutMs = Number(options.agentConnectTimeoutMs || 5000);
 
   let current = null;
   let currentChild = null;
+  let currentAgentRun = null;
   let loopTimer = null;
   let stopped = false;
 
@@ -536,6 +544,150 @@ function createWorker(options) {
         !post.stale &&
         (!post.summary || post.summary.issues === 0),
     };
+  }
+
+  /**
+   * B23 P0：通过受限 IPC 把受限任务交给独立 UID 的 agent daemon。
+   * 控制面只发送任务绑定 + 最小环境；审批密钥不出控制面。
+   */
+  async function runAgentTask(task, target, restrictedRuntime) {
+    const { project, dir, projectId } = target;
+    let lockToken = null;
+    let snapshotSeq = null;
+    if (project) {
+      try {
+        lockToken = projects.acquireLock(projectId, { taskId: task.id }).token;
+      } catch (error) {
+        finish(task.id, 'failed', {
+          error: { code: error.code || 'PROJECT_LOCKED', message: error.message },
+        });
+        current = null;
+        return;
+      }
+      try {
+        snapshotSeq = projects.snapshot(projectId, `pre-task-${task.id}`).seq;
+      } catch (error) {
+        projects.releaseLock(projectId, lockToken);
+        finish(task.id, 'failed', { error: { code: 'SNAPSHOT_FAILED', message: error.message } });
+        current = null;
+        return;
+      }
+    }
+
+    const runId = `run_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+    const client = createAgentClient({
+      socketPath: agentSocket,
+      ipcKey,
+      connectTimeoutMs: agentConnectTimeoutMs,
+    });
+    let cancelRequested = false;
+    currentAgentRun = {
+      runId,
+      cancel: () => {
+        cancelRequested = true;
+        client.cancel(runId);
+      },
+    };
+
+    try {
+      store.transition(task.id, 'running', {
+        startedAt: new Date().toISOString(),
+        pid: null,
+        projectId,
+        snapshotSeq,
+      });
+      emitEvent('task.running', task, { status: 'running', data: { kind: 'agent' } });
+      store.appendLog(task.id, `[agent] ipc start run=${runId} socket=${agentSocket}\n`);
+
+      await client.connect();
+      const fullEnv = childEnvFor(task, restrictedRuntime);
+      const env = {};
+      for (const [key, value] of Object.entries(fullEnv)) {
+        if (RUN_ENV_ALLOW.has(key)) env[key] = value;
+      }
+      const prompt = buildPrompt(task, project);
+      const approvalDigest = task.approval && task.approval.proof
+        ? sha256Hex(JSON.stringify(task.approval.proof))
+        : null;
+      const outcome = await client.run({
+        runId,
+        taskId: task.id,
+        prompt,
+        cwd: dir,
+        env,
+        deadlineMs: timeoutMs,
+        model: approvalModel,
+        approvalDigest,
+        onStarted: (message) => {
+          store.appendLog(task.id, `[agent] started pid=${message.pid} at=${message.startedAt}\n`);
+        },
+        onStdout: (data) => store.appendLog(task.id, data),
+        onStderr: (data) => store.appendLog(task.id, data),
+      }).promise;
+
+      const ok = outcome.exitCode === 0 && !outcome.cancelled && !outcome.timedOut;
+      const result = {
+        ok,
+        verified: false,
+        outcome: ok ? 'agent_run' : outcome.timedOut ? 'agent_timeout' : outcome.cancelled ? 'agent_cancelled' : 'agent_failed',
+        exitCode: outcome.exitCode,
+        agent: {
+          runId,
+          spawnPid: outcome.spawnPid,
+          startedAt: outcome.startedAt,
+          endedAt: outcome.endedAt,
+          cancelled: outcome.cancelled === true,
+          timedOut: outcome.timedOut === true,
+        },
+      };
+      const evidence = persistEvidence(task, result, ok ? 'succeeded' : 'failed', projectId);
+      result.versionId = evidence ? evidence.versionId : latestVersionId(projectId);
+      result.artifactId = evidence ? evidence.artifactId : null;
+      result.evidenceDir = evidence ? evidence.dir : null;
+
+      if (!ok) {
+        const code = outcome.timedOut
+          ? 'AGENT_TIMEOUT'
+          : outcome.cancelled || cancelRequested
+            ? 'AGENT_CANCELLED'
+            : 'AGENT_EXIT_CODE';
+        finish(task.id, 'failed', {
+          pid: null,
+          error: { code, message: `agent run finished with code ${outcome.exitCode}` },
+          result,
+        });
+        emitEvent('task.failed', task, { status: 'failed', data: { kind: 'agent' } });
+      } else {
+        finish(task.id, 'succeeded', { pid: null, error: null, result });
+        emitEvent('task.succeeded', task, { status: 'succeeded', data: { kind: 'agent' } });
+      }
+      store.appendLog(task.id, `[agent] ipc done code=${outcome.exitCode}\n`);
+      log(`[remote] agent task ${task.id} ${ok ? 'succeeded' : 'failed'}`);
+    } catch (error) {
+      const message = scrub(error.message, dir);
+      const result = {
+        ok: false,
+        verified: false,
+        outcome: 'agent_ipc_failed',
+        agent: { runId, error: { code: error.code || 'AGENT_IPC_FAILED', message } },
+      };
+      const evidence = persistEvidence(task, result, 'failed', projectId);
+      result.versionId = evidence ? evidence.versionId : latestVersionId(projectId);
+      result.artifactId = evidence ? evidence.artifactId : null;
+      result.evidenceDir = evidence ? evidence.dir : null;
+      finish(task.id, 'failed', {
+        error: { code: error.code || 'AGENT_IPC_FAILED', message },
+        result,
+      });
+      emitEvent('task.failed', task, { status: 'failed', data: { kind: 'agent' } });
+      store.appendLog(task.id, `[agent] ipc failed: ${message}\n`);
+      log(`[remote] agent task ${task.id} failed: ${message}`);
+    } finally {
+      if (lockToken) projects.releaseLock(projectId, lockToken);
+      currentAgentRun = null;
+      current = null;
+      tick();
+    }
   }
 
   async function runVisionTaskFlow(task, target) {
@@ -890,6 +1042,17 @@ function createWorker(options) {
       }
     }
 
+    // B23：执行器分离时，受限任务只走 IPC，控制面不再本地 spawn CLI。
+    if (agentSocket) {
+      if (task.restricted !== true) {
+        blockTask(task, 'RESTRICTED_DEPLOYMENT_REQUIRED', 'agent IPC only accepts restricted tasks');
+        current = null;
+        return;
+      }
+      runAgentTask(task, target, restrictedRuntime);
+      return;
+    }
+
     if (!executorScript && !fs.existsSync(cliPath)) {
       finish(task.id, 'failed', {
         error: {
@@ -1217,6 +1380,14 @@ function createWorker(options) {
       loopTimer = null;
     }
     // P1-5：停止时杀掉正在运行的 CLI 进程树，避免留下孤儿
+    if (currentAgentRun) {
+      try {
+        currentAgentRun.cancel();
+      } catch {
+        // 忽略
+      }
+      currentAgentRun = null;
+    }
     if (currentChild) {
       killTaskTree(currentChild, current ? current.id : null);
       currentChild = null;

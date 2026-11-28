@@ -70,6 +70,7 @@ const {
   computeTreeHash,
   renderDiff,
 } = require('./lib/code-change.cjs');
+const { probeAgent } = require('./lib/agent-client.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
@@ -117,9 +118,13 @@ const PUBLIC_MODE =
 // B21：部署级强制受限。未设置=完整开发模式；显式 0/false/off/full 关闭；
 // 其它任何值（含拼写错误）一律按受限处理（fail-closed）。
 // 受限部署下，所有任务入口都强制 restricted=true，缺省/传 false/旧任务都不能绕过审批。
-const RESTRICTED_DEPLOYMENT = parseRestrictedDeployment(
-  process.env.VPLAY_RESTRICTED_DEPLOYMENT,
-);
+// B23：执行器分离。设置 VPLAY_AGENT_SOCKET 后，受限任务必须交给独立 UID 的
+// agent daemon；控制面不再本地 spawn CLI，且强制进入受限部署。
+const AGENT_SOCKET = String(process.env.VPLAY_AGENT_SOCKET || '').trim() || null;
+const IPC_KEY = String(process.env.VPLAY_IPC_HMAC_KEY || '').trim();
+const AGENT_CONNECT_TIMEOUT_MS = Number(process.env.VPLAY_AGENT_CONNECT_TIMEOUT_MS || 5000);
+const RESTRICTED_DEPLOYMENT =
+  parseRestrictedDeployment(process.env.VPLAY_RESTRICTED_DEPLOYMENT) || Boolean(AGENT_SOCKET);
 // B22：审批签名密钥只存在于控制面进程；缺失即拒绝启动（受限部署）。
 const APPROVAL_KEY = resolveApprovalKey(process.env);
 const APPROVAL_MODEL = resolveApprovalModel(process.env);
@@ -208,6 +213,16 @@ if (RESTRICTED_DEPLOYMENT) {
       problems.push('VPLAY_MODEL_PROXY_URL is not a valid URL');
     }
   }
+  if (AGENT_SOCKET) {
+    if (IPC_KEY.length < 32) {
+      problems.push('VPLAY_IPC_HMAC_KEY (>=32 chars) is required when VPLAY_AGENT_SOCKET is set');
+    }
+    if (process.env.REMOTE_EXECUTOR_CMD || process.env.REMOTE_ALLOW_TEST_SEAM === '1') {
+      problems.push(
+        'agent IPC must not be combined with test seams (REMOTE_EXECUTOR_CMD/REMOTE_ALLOW_TEST_SEAM)',
+      );
+    }
+  }
   if (problems.length) {
     console.error(`[remote] refuse to start (restricted deployment fail-closed):\n- ${problems.join('\n- ')}`);
     process.exit(1);
@@ -288,7 +303,7 @@ const worker = createWorker({
   workspaceDir: WORKSPACE,
   runtimeDir: RUNTIME_DIR,
   cliPath: CLI_PATH,
-  executorScript: resolveExecutorScript(process.env),
+  executorScript: AGENT_SOCKET ? null : resolveExecutorScript(process.env),
   timeoutMs: TASK_TIMEOUT_MS,
   publicMode: PUBLIC_MODE,
   allowYolo: process.env.VPLAY_ALLOW_YOLO === '1',
@@ -297,6 +312,10 @@ const worker = createWorker({
   approvalKey: APPROVAL_KEY || null,
   approvalModel: APPROVAL_MODEL,
   approvalTtlMs: APPROVAL_TTL_MS,
+  // B23：受限执行器 IPC（独立 UID daemon）。
+  agentSocket: AGENT_SOCKET,
+  ipcKey: IPC_KEY || null,
+  agentConnectTimeoutMs: AGENT_CONNECT_TIMEOUT_MS,
   secrets: TOKEN ? [TOKEN] : [],
   visionService,
   eventStore,
@@ -744,6 +763,17 @@ function publicTask(task) {
                 browserVerification: task.result.codeChange.browserVerification || null,
                 rolledBack: task.result.codeChange.rolledBack === true,
                 error: task.result.codeChange.error || null,
+              }
+            : null,
+          agent: task.result.agent
+            ? {
+                runId: task.result.agent.runId || null,
+                spawnPid: task.result.agent.spawnPid || null,
+                startedAt: task.result.agent.startedAt || null,
+                endedAt: task.result.agent.endedAt || null,
+                cancelled: task.result.agent.cancelled === true,
+                timedOut: task.result.agent.timedOut === true,
+                error: task.result.agent.error || null,
               }
             : null,
         }
@@ -1982,11 +2012,33 @@ try {
   console.error(`[remote] vision journal recovery failed: ${error.message}`);
 }
 
-server.listen(PORT, HOST, () => {
-  console.log(`[remote] Vplay remote bridge listening on http://${HOST}:${PORT}`);
-  console.log(`[remote] mode: ${projects ? `projects (${projects.home})` : 'workspace'}`);
-  console.log(`[remote] workspace: ${projects ? projects.home : WORKSPACE}`);
-  console.log(`[remote] cli: ${CLI_PATH}`);
+async function startServerProcess() {
+  if (AGENT_SOCKET) {
+    try {
+      const info = await probeAgent({
+        socketPath: AGENT_SOCKET,
+        ipcKey: IPC_KEY,
+        timeoutMs: AGENT_CONNECT_TIMEOUT_MS,
+      });
+      console.log(
+        `[remote] agent IPC ready: version=${info.agentVersion} platform=${info.platform} socket=${AGENT_SOCKET}`,
+      );
+    } catch (error) {
+      console.error(
+        `[remote] refuse to start: agent IPC unavailable (${error.code || 'IPC_ERROR'}): ${error.message}`,
+      );
+      process.exit(1);
+    }
+  }
+
+  server.listen(PORT, HOST, () => {
+    console.log(`[remote] Vplay remote bridge listening on http://${HOST}:${PORT}`);
+    console.log(`[remote] mode: ${projects ? `projects (${projects.home})` : 'workspace'}`);
+    console.log(`[remote] workspace: ${projects ? projects.home : WORKSPACE}`);
+    console.log(`[remote] cli: ${CLI_PATH}`);
+    console.log(
+      `[remote] executor: ${AGENT_SOCKET ? `agent IPC (${AGENT_SOCKET})` : 'in-process CLI'}`,
+    );
   console.log(`[remote] public mode: ${PUBLIC_MODE ? 'yes (yolo disabled)' : 'no'}`);
   console.log(
     `[remote] restricted deployment: ${
@@ -2042,7 +2094,10 @@ server.listen(PORT, HOST, () => {
   previewServer.listen(PREVIEW_PORT, HOST, () => {
     console.log(`[preview] game preview on http://${HOST}:${PREVIEW_PORT} (read-only, no control API)`);
   });
-});
+  });
+}
+
+startServerProcess();
 
 function shutdown(signal) {
   console.log(`[remote] ${signal} received, shutting down`);

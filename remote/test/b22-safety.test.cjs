@@ -139,6 +139,10 @@ test('B22-A2: signed approval binds task/content/model/base/expiry/runs', () => 
       'APPROVAL_CONTENT_MISMATCH',
     );
     assert.equal(
+      verifyApprovalProof(approval, { ...ctx, task: { ...task, id: 'task_other' } }).reason,
+      'APPROVAL_TASK_MISMATCH',
+    );
+    assert.equal(
       verifyApprovalProof(approval, { ...ctx, model: 'other-model' }).reason,
       'APPROVAL_MODEL_MISMATCH',
     );
