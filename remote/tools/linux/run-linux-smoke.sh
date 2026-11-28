@@ -37,6 +37,7 @@ node --test remote/test/b19-linux-config.test.cjs
 node --test remote/test/b20-restricted.test.cjs
 node --test remote/test/b21-restricted-deployment.test.cjs
 node --test remote/test/b22-safety.test.cjs
+node --test remote/test/b22-code-change.test.cjs
 node --test remote/test/b10-correctness.test.cjs
 node --test remote/test/b12-snapshot-gc.test.cjs
 

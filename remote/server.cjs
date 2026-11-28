@@ -61,7 +61,15 @@ const {
   resolveApprovalKey,
   resolveApprovalModel,
   createApprovalProof,
+  sha256Hex,
 } = require('./lib/approval.cjs');
+const {
+  CodeChangeError,
+  parseProjectAllowlist,
+  validateChangeSet,
+  computeTreeHash,
+  renderDiff,
+} = require('./lib/code-change.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
@@ -680,6 +688,20 @@ function publicTask(task) {
     approval: task.approval || null,
     visionMode: task.kind === 'vision' ? task.visionMode || 'analyze' : null,
     allowedFiles: task.kind === 'vision' ? task.allowedFiles || [] : null,
+    codeChange: task.codeChange
+      ? {
+          projectId: task.codeChange.projectId || task.projectId || 'default',
+          baseHash: task.codeChange.baseHash || null,
+          diff: task.codeChange.diff || '',
+          diffSha256: task.codeChange.diffSha256 || null,
+          summary: task.codeChange.summary || '',
+          files: (task.codeChange.files || []).map((file) => ({
+            path: file.path,
+            sha256: file.sha256,
+            bytes: file.bytes,
+          })),
+        }
+      : null,
     status: task.status,
     text: task.text,
     createdAt: task.createdAt,
@@ -709,6 +731,19 @@ function publicTask(task) {
                 reportFile: task.result.vision.reportFile || null,
                 artifactId: task.result.vision.artifactId || null,
                 error: task.result.vision.error || null,
+              }
+            : null,
+          codeChange: task.result.codeChange
+            ? {
+                files: task.result.codeChange.files || [],
+                baseHash: task.result.codeChange.baseHash || null,
+                diffSha256: task.result.codeChange.diffSha256 || null,
+                checks: task.result.codeChange.checks || [],
+                published: task.result.codeChange.published === true,
+                publishError: task.result.codeChange.publishError || null,
+                browserVerification: task.result.codeChange.browserVerification || null,
+                rolledBack: task.result.codeChange.rolledBack === true,
+                error: task.result.codeChange.error || null,
               }
             : null,
         }
@@ -1507,6 +1542,98 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         throw error;
+      }
+      return;
+    }
+
+    // B22-C：受控代码变更通道（仅管理员创建；始终需要独立审批）。
+    if (pathname.startsWith('/projects/') && pathname.endsWith('/code-change') && method === 'POST') {
+      if (!requireAuth(req, res)) return;
+      const auth = authState(req);
+      if (!auth || auth.kind !== 'admin') {
+        sendJson(res, 403, { ok: false, error: 'code_change requires administrator token' });
+        return;
+      }
+      if (!projects) {
+        sendJson(res, 404, { ok: false, error: 'projects mode is not enabled' });
+        return;
+      }
+      const projectId = pathname.split('/')[2];
+      let record;
+      try {
+        record = projects.get(projectId);
+      } catch {
+        sendJson(res, 404, { ok: false, error: `unknown projectId: ${projectId}` });
+        return;
+      }
+      const raw = await readBody(req);
+      if (raw === null) return;
+      let payload;
+      try {
+        payload = JSON.parse(raw || '{}');
+      } catch {
+        sendJson(res, 400, { ok: false, error: 'body must be valid JSON' });
+        return;
+      }
+      try {
+        const allowlist = parseProjectAllowlist(process.env.VPLAY_CODE_CHANGE_PROJECTS);
+        const files = validateChangeSet({ projectId, files: payload.files, allowlist });
+        const baseHash = computeTreeHash(record.srcDir);
+        const diff = renderDiff({ root: record.srcDir, files });
+        const diffSha256 = sha256Hex(diff);
+        const summary = String(payload.summary || 'code change').slice(0, 200);
+        const { task, duplicate } = store.create({
+          text: `code_change · ${projectId} · ${summary}`,
+          idempotencyKey: payload.idempotencyKey,
+          source: 'remote',
+          projectId,
+          kind: 'code_change',
+          codeChange: {
+            projectId,
+            baseHash,
+            diff,
+            diffSha256,
+            summary,
+            files: files.map((file) => ({
+              path: file.path,
+              sha256: file.sha256,
+              bytes: file.bytes,
+              content: file.content,
+            })),
+          },
+          createdBy: auth.deviceId || 'admin',
+          restricted: true,
+          allowYolo: false,
+        });
+        if (!duplicate) {
+          eventStore.append({
+            type: 'task.created',
+            taskId: task.id,
+            projectId,
+            status: task.status,
+            data: { kind: 'code_change', diffSha256, files: files.length },
+          });
+        }
+        sendJson(res, duplicate ? 200 : 202, { ok: true, duplicate, task: publicTask(task) });
+      } catch (error) {
+        if (error instanceof CodeChangeError) {
+          sendJson(res, 400, { ok: false, error: error.message, code: error.code });
+          return;
+        }
+        if (error instanceof IdempotencyConflictError) {
+          sendJson(res, 409, { ok: false, error: error.message, code: 'IDEMPOTENCY_CONFLICT' });
+          return;
+        }
+        if (error instanceof DuplicateTaskError) {
+          sendJson(res, 409, { ok: false, error: error.message, existingTask: publicTask(error.existing) });
+          return;
+        }
+        if (error instanceof ValidationError) {
+          sendJson(res, 400, { ok: false, error: error.message });
+          return;
+        }
+        console.error(`[remote] failed to create code_change: ${error.message}`);
+        sendJson(res, 500, { ok: false, error: 'failed to create code_change' });
       }
       return;
     }

@@ -27,7 +27,15 @@ const {
   resolveApprovalModel,
   verifyApprovalProof,
   consumeApprovalProof,
+  sha256Hex,
 } = require('./approval.cjs');
+const {
+  applyChangeSet,
+  rollbackChangeSet,
+  runFixedChecks,
+  computeTreeHash,
+  renderDiff,
+} = require('./code-change.cjs');
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const STATUS_POLL_MS = 1000;
@@ -636,6 +644,178 @@ function createWorker(options) {
     }
   }
 
+  /**
+   * C：受控代码变更执行流。
+   * 基线/内容/diff 哈希全部复核 → 原子写入 + journal → 固定检查 →
+   * 失败自动回滚；浏览器验证等待 E16 0.2.3 接入（当前 BLOCKED）。
+   */
+  async function runCodeChangeFlow(task, target) {
+    const { project, dir, projectId } = target;
+    let lockToken = null;
+    try {
+      lockToken = projects.acquireLock(projectId, { taskId: task.id }).token;
+    } catch (error) {
+      finish(task.id, 'failed', {
+        error: { code: error.code || 'PROJECT_LOCKED', message: error.message },
+      });
+      current = null;
+      return;
+    }
+    const journalFile = path.join(runtimeDir, 'code-change-journal', `${task.id}.json`);
+    const change = task.codeChange || {};
+    let applied = false;
+    let rolledBack = false;
+    try {
+      store.transition(task.id, 'running', {
+        startedAt: new Date().toISOString(),
+        pid: null,
+        projectId,
+      });
+      emitEvent('task.running', task, { status: 'running', data: { kind: 'code_change' } });
+      store.appendLog(
+        task.id,
+        `[code_change] start files=${(change.files || []).length} base=${change.baseHash || '-'}\n`,
+      );
+
+      const currentHash = computeTreeHash(dir);
+      if (!change.baseHash || currentHash !== change.baseHash) {
+        const error = new Error('baseline tree changed since approval');
+        error.code = 'CODE_CHANGE_BASE_MISMATCH';
+        throw error;
+      }
+      const files = (change.files || []).map((file) => {
+        if (typeof file.content !== 'string' || sha256Hex(file.content) !== file.sha256) {
+          const error = new Error(`file content hash mismatch: ${file.path}`);
+          error.code = 'CODE_CHANGE_CONTENT_MISMATCH';
+          throw error;
+        }
+        return { path: file.path, content: file.content };
+      });
+      if (files.length === 0) {
+        const error = new Error('empty change set');
+        error.code = 'CODE_CHANGE_EMPTY';
+        throw error;
+      }
+      const diff = renderDiff({ root: dir, files });
+      if (!change.diffSha256 || sha256Hex(diff) !== change.diffSha256) {
+        const error = new Error('diff hash mismatch');
+        error.code = 'CODE_CHANGE_DIFF_MISMATCH';
+        throw error;
+      }
+
+      applyChangeSet({ root: dir, files, journalFile, taskId: task.id });
+      applied = true;
+      const checks = runFixedChecks({ root: dir, files });
+      if (!checks.ok) {
+        rollbackChangeSet({ journalFile, root: dir });
+        applied = false;
+        rolledBack = true;
+        const error = new Error(
+          `fixed checks failed: ${checks.checks
+            .filter((check) => !check.ok)
+            .map((check) => check.path)
+            .join(', ')}`,
+        );
+        error.code = 'CODE_CHANGE_CHECK_FAILED';
+        error.checks = checks.checks;
+        throw error;
+      }
+
+      let published = false;
+      let publishError = null;
+      try {
+        const root = projects.buildPreview(projectId);
+        const check = projects.verifyPreview(projectId);
+        published = Boolean(root && check.ok);
+        if (!published) publishError = check.reason;
+      } catch (error) {
+        publishError = error.message;
+      }
+
+      const result = {
+        ok: true,
+        verified: false,
+        outcome: 'code_change_unverified',
+        codeChange: {
+          files: files.map((file) => file.path),
+          baseHash: change.baseHash,
+          diffSha256: change.diffSha256,
+          checks: checks.checks,
+          published,
+          publishError,
+          browserVerification: 'BLOCKED_E16_SANDBOX',
+        },
+      };
+      try {
+        projects.appendRound(projectId, {
+          taskId: task.id,
+          prompt: task.text.slice(0, 200),
+          changedFiles: files.length,
+          verified: false,
+          status: 'succeeded',
+        });
+      } catch (error) {
+        store.appendLog(task.id, `[code_change] bookkeeping failed: ${error.message}\n`);
+      }
+      if (onFinished) {
+        try {
+          onFinished({ taskId: task.id, projectId, status: 'succeeded', verified: false });
+        } catch {
+          // 忽略
+        }
+      }
+      const evidence = persistEvidence(task, result, 'succeeded', projectId);
+      result.versionId = evidence ? evidence.versionId : latestVersionId(projectId);
+      result.artifactId = evidence ? evidence.artifactId : null;
+      result.evidenceDir = evidence ? evidence.dir : null;
+      finish(task.id, 'succeeded', { result });
+      emitEvent('task.succeeded', task, {
+        status: 'succeeded',
+        data: { kind: 'code_change', verified: false },
+      });
+      store.appendLog(task.id, '[code_change] applied; static checks passed\n');
+      log(`[remote] code_change task ${task.id} succeeded (browser verification blocked)`);
+    } catch (error) {
+      const message = scrub(error.message, dir);
+      if (applied) {
+        try {
+          rollbackChangeSet({ journalFile, root: dir });
+          rolledBack = true;
+        } catch (rollbackError) {
+          log(`[remote] code_change rollback failed: ${rollbackError.message}`);
+        }
+      }
+      const result = {
+        ok: false,
+        verified: false,
+        outcome: 'code_change_failed',
+        codeChange: {
+          error: { code: error.code || 'CODE_CHANGE_FAILED', message },
+          checks: error.checks || null,
+          rolledBack,
+        },
+      };
+      const evidence = persistEvidence(task, result, 'failed', projectId);
+      result.versionId = evidence ? evidence.versionId : latestVersionId(projectId);
+      result.artifactId = evidence ? evidence.artifactId : null;
+      result.evidenceDir = evidence ? evidence.dir : null;
+      finish(task.id, 'failed', {
+        error: { code: error.code || 'CODE_CHANGE_FAILED', message },
+        result,
+      });
+      emitEvent('task.failed', task, {
+        status: 'failed',
+        data: { kind: 'code_change', verified: false, rolledBack },
+      });
+      store.appendLog(task.id, `[code_change] failed: ${message}\n`);
+      log(`[remote] code_change task ${task.id} failed: ${message}`);
+    } finally {
+      if (lockToken) projects.releaseLock(projectId, lockToken);
+      current = null;
+      tick();
+    }
+  }
+
   function run(task) {
     current = task;
     let target;
@@ -651,15 +831,19 @@ function createWorker(options) {
 
     const { project, dir, projectId } = target;
 
-    // C：code_change 通道由独立功能 commit 提供；安全候选内一律失败关闭。
+    // C：受控代码变更通道（独立功能候选；安全候选内该类型会被拒绝）。
     if (task.kind === 'code_change') {
-      finish(task.id, 'failed', {
-        error: {
-          code: 'CODE_CHANGE_UNAVAILABLE',
-          message: 'code_change channel is not enabled in the safety candidate',
-        },
-      });
-      current = null;
+      if (!projects) {
+        finish(task.id, 'failed', {
+          error: {
+            code: 'CODE_CHANGE_REQUIRES_PROJECT',
+            message: 'code_change requires projects mode and an isolated lab project',
+          },
+        });
+        current = null;
+        return;
+      }
+      runCodeChangeFlow(task, target);
       return;
     }
 
