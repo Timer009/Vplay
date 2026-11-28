@@ -34,6 +34,8 @@ echo "== targeted tests =="
 node --test remote/test/b16-lock-writer.test.cjs
 node --test remote/test/b14-vision-022.test.cjs
 node --test remote/test/b19-linux-config.test.cjs
+node --test remote/test/b20-restricted.test.cjs
+node --test remote/test/b21-restricted-deployment.test.cjs
 node --test remote/test/b10-correctness.test.cjs
 node --test remote/test/b12-snapshot-gc.test.cjs
 
@@ -52,6 +54,7 @@ export PREVIEW_PORT="$PREVIEW_PORT"
 export REMOTE_AUTORUN=0
 export VPLAY_MAX_SNAPSHOTS=20
 export VPLAY_UMASK=027
+export VPLAY_RESTRICTED_DEPLOYMENT=1
 export PREVIEW_ACCESS_KEY="${PREVIEW_ACCESS_KEY:-smoke-preview-key-0123456789}"
 export EVIDENCE_HMAC_KEY="${EVIDENCE_HMAC_KEY:-smoke-hmac-key-0123456789}"
 export VPLAY_BROWSER_HEADLESS=true
@@ -68,6 +71,8 @@ for _ in $(seq 1 50); do
 done
 curl -fsS "http://127.0.0.1:$PORT/health"
 echo
+grep -q 'restricted deployment: yes' "$LAB/smoke-server.log" \
+  || { echo "restricted deployment flag not enforced"; exit 1; }
 curl -fsS "http://127.0.0.1:$PORT/status" -H "Authorization: Bearer smoke" >/dev/null 2>&1 && {
   echo "unexpected: /status accepted smoke token"; exit 1; } || true
 echo "loopback health OK; server log: $LAB/smoke-server.log"

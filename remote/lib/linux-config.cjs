@@ -49,13 +49,96 @@ const RESTRICTED_EXCLUDED_TOOLS = Object.freeze([
   'save_memory',
 ]);
 
+// B21：MCP 与扩展工具不能靠 --core-tools 拦住（它们在注册表之外单独发现）。
+// 空 allowlist = 不加载任何 MCP server；extensions=none = 不加载任何扩展。
+// 两者都是 CLI 的显式关闭值（config.ts allowedMcpServers / ExtensionEnablementManager）。
+const RESTRICTED_MCP_ARGS = Object.freeze([
+  '--allowed-mcp-server-names=',
+  '--extensions=none',
+]);
+
 function restrictedCliArgs() {
   return [
     '--core-tools',
     RESTRICTED_CORE_TOOLS.join(','),
     '--exclude-tools',
     RESTRICTED_EXCLUDED_TOOLS.join(','),
+    ...RESTRICTED_MCP_ARGS,
   ];
+}
+
+// ---- B21：部署级强制受限策略 ----------------------------------------------
+// 语义（fail-closed）：
+//  - 未设置 / 空值：完整开发模式（向后兼容，非受限部署）。
+//  - 显式 0/false/off/no/full/dev：完整开发模式。
+//  - 其它任何非空值（含拼写错误、'yes'、'true'、'2'）：一律视为受限部署。
+// 受限部署内，任务缺省即 restricted=true，且只有 approval.state==='approved'
+// 的任务才允许 spawn；非 restricted 的旧/恢复任务一律失败关闭。
+const RESTRICTED_DEPLOYMENT_ENV = 'VPLAY_RESTRICTED_DEPLOYMENT';
+const RESTRICTED_DEPLOYMENT_OFF = new Set(['0', 'false', 'off', 'no', 'full', 'dev', 'development']);
+
+function parseRestrictedDeployment(value) {
+  if (value === undefined || value === null) return false;
+  const raw = String(value).trim().toLowerCase();
+  if (!raw) return false;
+  return !RESTRICTED_DEPLOYMENT_OFF.has(raw);
+}
+
+/**
+ * spawn 前的最终策略判定（纯函数，worker 与测试共用）。
+ * 返回 { ok: true } 或 { ok: false, code, message }。
+ */
+function evaluateSpawnPolicy(task, options = {}) {
+  const restrictedDeployment = options.restrictedDeployment === true;
+  if (!task || typeof task !== 'object') {
+    return { ok: false, code: 'TASK_MISSING', message: 'no queued task to run' };
+  }
+  if (task.status !== 'queued') {
+    return {
+      ok: false,
+      code: 'TASK_NOT_QUEUED',
+      message: `task ${task.id} is not queued (status=${task.status})`,
+    };
+  }
+  if (restrictedDeployment && task.restricted !== true) {
+    return {
+      ok: false,
+      code: 'RESTRICTED_DEPLOYMENT_REQUIRED',
+      message: 'restricted deployment refuses non-restricted tasks (omitted or false)',
+    };
+  }
+  if (task.restricted === true) {
+    const approval = task.approval;
+    if (!approval || approval.state !== 'approved') {
+      return {
+        ok: false,
+        code: 'APPROVAL_REQUIRED',
+        message: `restricted task ${task.id} has no administrator approval`,
+      };
+    }
+    if (task.kind === 'vision') {
+      const files = Array.isArray(task.allowedFiles) ? task.allowedFiles : [];
+      if (files.length === 0) {
+        return {
+          ok: false,
+          code: 'VISION_SCOPE_REQUIRED',
+          message: 'vision task has no allowedFiles scope',
+        };
+      }
+      const scope = approval.scope && Array.isArray(approval.scope.allowedFiles)
+        ? approval.scope.allowedFiles
+        : [];
+      const normalize = (list) => [...new Set(list.map(String))].sort().join('\n');
+      if (scope.length === 0 || normalize(scope) !== normalize(files)) {
+        return {
+          ok: false,
+          code: 'VISION_SCOPE_MISMATCH',
+          message: 'vision task scope differs from the approved file set',
+        };
+      }
+    }
+  }
+  return { ok: true };
 }
 
 const FORBIDDEN_BROWSER_ARG = /--no-sandbox|--disable-setuid-sandbox|--single-process|--disable-web-security|--allow-running-insecure-content|--remote-debugging|--disable-features=.*(site-per-process|IsolateOrigins)|--no-zygote/i;
@@ -148,5 +231,9 @@ module.exports = {
   killProcessGroup,
   RESTRICTED_CORE_TOOLS,
   RESTRICTED_EXCLUDED_TOOLS,
+  RESTRICTED_MCP_ARGS,
+  RESTRICTED_DEPLOYMENT_ENV,
+  parseRestrictedDeployment,
+  evaluateSpawnPolicy,
   restrictedCliArgs,
 };

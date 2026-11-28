@@ -56,7 +56,7 @@ const { createEvidenceStore } = require('./lib/evidence.cjs');
 const { createDeviceStore } = require('./lib/devices.cjs');
 const { createVisionService, recoverVisionApplies } = require('./lib/vision-service.cjs');
 const { createPreviewTicketStore } = require('./lib/preview-tickets.cjs');
-const { parseMaxSnapshots, parseUmask } = require('./lib/linux-config.cjs');
+const { parseMaxSnapshots, parseUmask, parseRestrictedDeployment } = require('./lib/linux-config.cjs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(REPO_ROOT, 'dist', 'cli.js');
@@ -101,6 +101,12 @@ const TRUST_PROXY = process.env.REMOTE_TRUST_PROXY === '1';
 const SERVE_MODE = process.env.VPLAY_PUBLIC_MODE === '1' || TRUST_PROXY;
 const PUBLIC_MODE =
   SERVE_MODE || HOST === '0.0.0.0' || HOST === '::';
+// B21：部署级强制受限。未设置=完整开发模式；显式 0/false/off/full 关闭；
+// 其它任何值（含拼写错误）一律按受限处理（fail-closed）。
+// 受限部署下，所有任务入口都强制 restricted=true，缺省/传 false/旧任务都不能绕过审批。
+const RESTRICTED_DEPLOYMENT = parseRestrictedDeployment(
+  process.env.VPLAY_RESTRICTED_DEPLOYMENT,
+);
 const AUTHORUN = process.env.REMOTE_AUTORUN !== '0';
 const TASK_TIMEOUT_MS = Number(process.env.REMOTE_TASK_TIMEOUT_MS || 15 * 60 * 1000);
 const PROMPT_RATE_LIMIT = Number(process.env.REMOTE_RATE_LIMIT || 10);
@@ -239,6 +245,8 @@ const worker = createWorker({
   timeoutMs: TASK_TIMEOUT_MS,
   publicMode: PUBLIC_MODE,
   allowYolo: process.env.VPLAY_ALLOW_YOLO === '1',
+  // B21：部署级强制受限（fail-closed），worker 在 spawn 前再次校验。
+  restrictedDeployment: RESTRICTED_DEPLOYMENT,
   secrets: TOKEN ? [TOKEN] : [],
   visionService,
   eventStore,
@@ -628,6 +636,8 @@ function publicTask(task) {
     createdBy: task.createdBy || 'admin',
     restricted: task.restricted === true,
     approval: task.approval || null,
+    visionMode: task.kind === 'vision' ? task.visionMode || 'analyze' : null,
+    allowedFiles: task.kind === 'vision' ? task.allowedFiles || [] : null,
     status: task.status,
     text: task.text,
     createdAt: task.createdAt,
@@ -897,7 +907,11 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/status' && method === 'GET') {
       if (!requireAuth(req, res)) return;
-      sendJson(res, 200, computeStatus(authState(req)));
+      // B21：部署模式只对已鉴权调用方可见（/health 保持最小信息）。
+      sendJson(res, 200, {
+        ...computeStatus(authState(req)),
+        restrictedDeployment: RESTRICTED_DEPLOYMENT,
+      });
       return;
     }
 
@@ -1059,14 +1073,23 @@ const server = http.createServer(async (req, res) => {
       }
       const action = approvalMatch[2];
       const at = new Date().toISOString();
+      // B21：审批时固化范围（项目/类型/模式/Vision 文件集），worker 会逐项比对，
+      // 审批后任务字段无法被 API 改写，因此范围不可绕过。
+      const scope = {
+        projectId: task.projectId || 'default',
+        kind: task.kind || 'prompt',
+        visionMode: task.kind === 'vision' ? task.visionMode || 'analyze' : null,
+        allowedFiles:
+          task.kind === 'vision' && Array.isArray(task.allowedFiles) ? [...task.allowedFiles] : null,
+      };
       const updated = store.transition(
         task.id,
         action === 'approve' ? 'queued' : 'rejected',
         {
           approval:
             action === 'approve'
-              ? { state: 'approved', approvedAt: at, approvedBy: 'admin', rejectedAt: null }
-              : { state: 'rejected', approvedAt: null, approvedBy: null, rejectedAt: at },
+              ? { state: 'approved', approvedAt: at, approvedBy: 'admin', rejectedAt: null, scope }
+              : { state: 'rejected', approvedAt: null, approvedBy: null, rejectedAt: at, scope: null },
         },
       );
       eventStore.append({
@@ -1134,11 +1157,13 @@ const server = http.createServer(async (req, res) => {
           source: 'remote',
           projectId,
           createdBy: (auth && auth.deviceId) || 'admin',
-          allowYolo: requestedYolo && via === 'token',
-          restricted: payload.restricted === true,
+          allowYolo: !RESTRICTED_DEPLOYMENT && requestedYolo && via === 'token',
+          // B21：受限部署强制 restricted，缺省或显式 false 都不能降级为完整模式。
+          restricted: RESTRICTED_DEPLOYMENT || payload.restricted === true,
         });
         console.log(
-          `[remote] task ${task.id} ${duplicate ? 'already exists (idempotent)' : 'queued'} project=${projectId}`,
+          `[remote] task ${task.id} ${duplicate ? 'already exists (idempotent)' : 'created'} project=${projectId} ` +
+            `restricted=${task.restricted === true} status=${task.status}`,
         );
         if (!duplicate) {
           eventStore.append({
@@ -1395,9 +1420,39 @@ const server = http.createServer(async (req, res) => {
       const mode = ['analyze', 'verify', 'repair'].includes(payload.mode)
         ? payload.mode
         : 'analyze';
-      const allowedFiles = (Array.isArray(payload.allowedFiles) ? payload.allowedFiles : [])
+      const requestedAllowedFiles = Array.isArray(payload.allowedFiles) ? payload.allowedFiles : [];
+      let allowedFiles = requestedAllowedFiles
         .filter((item) => typeof item === 'string' && /\.(html?|css)$/i.test(item))
         .slice(0, 5);
+      // B21：受限部署下 Vision 写入必须有明确、非空、仅 HTML/CSS 的范围；
+      // 不能靠省略 allowedFiles 或混入 JS 让范围静默漂移（审批范围 = 实际写入范围）。
+      if (RESTRICTED_DEPLOYMENT) {
+        const trimmed = requestedAllowedFiles.slice(0, 5);
+        if (requestedAllowedFiles.length > 0 && allowedFiles.length !== trimmed.length) {
+          sendJson(res, 400, {
+            ok: false,
+            error: 'restricted vision only allows .html/.css allowedFiles',
+          });
+          return;
+        }
+        if (allowedFiles.length === 0) {
+          let entry = 'index.html';
+          try {
+            entry = String(projects.get(projectId).entry || 'index.html').replace(/\\/g, '/');
+          } catch {
+            sendJson(res, 404, { ok: false, error: `unknown projectId: ${projectId}` });
+            return;
+          }
+          if (!/\.(html?|css)$/i.test(entry)) {
+            sendJson(res, 400, {
+              ok: false,
+              error: 'vision requires explicit .html/.css allowedFiles for this project',
+            });
+            return;
+          }
+          allowedFiles = [entry];
+        }
+      }
       const defectId =
         typeof payload.defectId === 'string' && /^[A-Za-z0-9._:-]{1,64}$/.test(payload.defectId)
           ? payload.defectId
@@ -1421,14 +1476,16 @@ const server = http.createServer(async (req, res) => {
           defectAssertionIds,
           createdBy: (auth && auth.deviceId) || 'admin',
           allowYolo: false,
+          // B21：受限部署下 Vision 写入与 prompt 任务一样必须管理员审批。
+          restricted: RESTRICTED_DEPLOYMENT,
         });
         if (!duplicate) {
           eventStore.append({
             type: 'task.created',
             taskId: task.id,
             projectId,
-            status: 'queued',
-            data: { kind: 'vision', mode },
+            status: task.status,
+            data: { kind: 'vision', mode, restricted: task.restricted === true },
           });
         }
         sendJson(res, duplicate ? 200 : 202, {
@@ -1689,6 +1746,13 @@ server.listen(PORT, HOST, () => {
   console.log(`[remote] workspace: ${projects ? projects.home : WORKSPACE}`);
   console.log(`[remote] cli: ${CLI_PATH}`);
   console.log(`[remote] public mode: ${PUBLIC_MODE ? 'yes (yolo disabled)' : 'no'}`);
+  console.log(
+    `[remote] restricted deployment: ${
+      RESTRICTED_DEPLOYMENT
+        ? 'yes (all tasks require administrator approval)'
+        : 'no (full development mode)'
+    }`,
+  );
   if (!REMOTE_ENABLED) {
     console.warn(
       '[remote] REMOTE_TOKEN is not set — remote control is DISABLED (all control endpoints return 503).',

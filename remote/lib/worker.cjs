@@ -21,7 +21,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { hashTree, compareManifests } = require('./paths.cjs');
-const { spawnDetachedOptions, killProcessGroup, restrictedCliArgs } = require('./linux-config.cjs');
+const { spawnDetachedOptions, killProcessGroup, restrictedCliArgs, evaluateSpawnPolicy } = require('./linux-config.cjs');
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const STATUS_POLL_MS = 1000;
@@ -200,6 +200,8 @@ function createWorker(options) {
   const timeoutMs = Number(options.timeoutMs || DEFAULT_TIMEOUT_MS);
   const publicMode = Boolean(options.publicMode);
   const allowYolo = options.allowYolo === true;
+  // B21：部署级强制受限。为 true 时，任何非 restricted 或未获批的任务都不得 spawn。
+  const restrictedDeployment = options.restrictedDeployment === true;
   const log = options.logger || ((line) => console.log(line));
   const secrets = (options.secrets || []).filter((secret) => typeof secret === 'string' && secret.length >= 6);
   const onFinished = typeof options.onFinished === 'function' ? options.onFinished : null;
@@ -791,7 +793,30 @@ function createWorker(options) {
   function tick() {
     if (stopped || current) return;
     const task = store.nextQueued();
-    if (task) run(task);
+    if (!task) return;
+    // B21：spawn 前最后一道门。旧任务/恢复任务/被篡改的 tasks.json 都过不去。
+    const policy = evaluateSpawnPolicy(task, { restrictedDeployment });
+    if (!policy.ok) {
+      current = task;
+      try {
+        store.appendLog(task.id, `[remote] blocked before spawn: ${policy.code} ${policy.message}\n`);
+      } catch {
+        // 日志失败不影响拦截
+      }
+      finish(task.id, 'failed', {
+        pid: null,
+        error: { code: policy.code, message: policy.message },
+      });
+      emitEvent('task.blocked', task, {
+        status: 'failed',
+        data: { code: policy.code, restrictedDeployment },
+      });
+      log(`[remote] task ${task.id} blocked before spawn: ${policy.code}`);
+      current = null;
+      tick();
+      return;
+    }
+    run(task);
   }
 
   function start() {

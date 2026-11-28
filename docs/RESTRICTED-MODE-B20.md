@@ -1,6 +1,8 @@
 # 受限执行模式（B20 / C18 前置）
 
 > 适用：`sprint-03-b20-restricted`（基于 B19 ARM64 适配）。
+> **B21 起**：受限部署由服务端强制（`VPLAY_RESTRICTED_DEPLOYMENT`），缺省/`false`
+> 不能降级；Vision 写入需独立审批与范围；详见 `docs/RESTRICTED-DEPLOYMENT-B21.md`。
 > 本文区分 **受限修复模式** 与 **完整游戏开发模式**；不代表 OS 隔离或真实 Agent 已验收。
 
 ## 1. 两种模式
