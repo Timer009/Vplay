@@ -1,4 +1,4 @@
-# ARM64 Linux 最小部署（B19）
+﻿# ARM64 Linux 最小部署（B19）
 
 > 适用：Raspberry Pi 5 / 4GB / 64-bit Debian/Ubuntu；冻结源码 `sprint-03-b16-candidate` @ `7d38f8e…` + B19 适配提交。
 > 本文件是部署与接口说明，不代表真实 Agent/OS 隔离已验收。
@@ -85,7 +85,7 @@ KillMode=control-group
 
 - 代理进程 `vplay-proxy`（独立 UID，唯一可读真实 Key）；只允许白名单模型端点/路径。
 - Vplay 环境只设置：
-  `OPENAI_BASE_URL=http://127.0.0.1:18900/v1`、`OPENAI_API_KEY=<dummy>`。
+  `OPENAI_BASE_URL=http://127.0.0.1:18790/v1`、`OPENAI_API_KEY=<dummy>`。
 - 当前代码已支持自定义 `OPENAI_BASE_URL`（C18 P-5 结论）；**无需改产品代码**。
 - 未部署代理前，不要把真实 key 放进 Vplay/Agent 环境；真实 Agent 仍 DENIED。
 
